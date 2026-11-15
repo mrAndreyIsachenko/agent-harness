@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import secrets
+import struct
 import threading
 import time
 import urllib.error
@@ -147,24 +148,117 @@ class HarnessTracer:
             otlp_span['parentSpanId'] = span['parent_span_id']
         return otlp_span
 
-    def flush_otlp(self, *, endpoint: str | None = None, timeout: float = 1.5) -> bool:
-        """POST the current spans as OTLP/HTTP JSON; True on 2xx, never raises."""
-        target = endpoint or self.otlp_endpoint
-        if not target:
-            return False
-        headers = {'Content-Type': 'application/json'}
+    @staticmethod
+    def _pb_varint(n: int) -> bytes:
+        if n < 0:
+            n &= (1 << 64) - 1
+        out = bytearray()
+        while n > 0x7F:
+            out.append((n & 0x7F) | 0x80)
+            n >>= 7
+        out.append(n & 0x7F)
+        return bytes(out)
+
+    @classmethod
+    def _pb_ld(cls, field: int, payload: bytes) -> bytes:
+        return cls._pb_varint((field << 3) | 2) + cls._pb_varint(len(payload)) + payload
+
+    @classmethod
+    def _pb_any_value(cls, val) -> bytes:
+        if isinstance(val, bool):
+            return cls._pb_varint((2 << 3) | 0) + cls._pb_varint(1 if val else 0)
+        if isinstance(val, int):
+            return cls._pb_varint((3 << 3) | 0) + cls._pb_varint(val)
+        if isinstance(val, float):
+            return cls._pb_varint((4 << 3) | 1) + struct.pack('<d', val)
+        text = val if isinstance(val, str) else json.dumps(val, sort_keys=True, default=str)
+        return cls._pb_ld(1, text.encode('utf-8'))
+
+    @classmethod
+    def _pb_kv(cls, key: str, val) -> bytes:
+        return cls._pb_ld(1, key.encode('utf-8')) + cls._pb_ld(2, cls._pb_any_value(val))
+
+    @staticmethod
+    def _pb_hex_bytes(hex_str: str, nbytes: int) -> bytes:
+        try:
+            raw = bytes.fromhex(hex_str)
+            if len(raw) == nbytes:
+                return raw
+        except ValueError:
+            pass
+        return hex_str.encode('utf-8')[:nbytes].ljust(nbytes, b'\x00')
+
+    @classmethod
+    def _span_to_otlp_pb(cls, span: dict) -> bytes:
+        attrs = span.get('attributes') or {}
+        out = bytearray()
+        out += cls._pb_ld(1, cls._pb_hex_bytes(str(span.get('trace_id', '')), 16))
+        out += cls._pb_ld(2, cls._pb_hex_bytes(str(span.get('span_id', '')), 8))
+        if span.get('parent_span_id'):
+            out += cls._pb_ld(4, cls._pb_hex_bytes(str(span['parent_span_id']), 8))
+        out += cls._pb_ld(5, str(span.get('name', '')).encode('utf-8'))
+        kind = _OTLP_SPAN_KINDS.get(attrs.get('openinference.span.kind'), 1)
+        out += cls._pb_varint((6 << 3) | 0) + cls._pb_varint(kind)
+        out += cls._pb_varint((7 << 3) | 1) + struct.pack('<Q', max(0, int(span.get('start_time_ns', 0))))
+        out += cls._pb_varint((8 << 3) | 1) + struct.pack('<Q', max(0, int(span.get('end_time_ns', 0))))
+        for k, v in attrs.items():
+            out += cls._pb_ld(9, cls._pb_kv(str(k), v))
+        code = _OTLP_STATUS_CODES.get(span.get('status', 'OK'), 0)
+        out += cls._pb_ld(15, cls._pb_varint((2 << 3) | 0) + cls._pb_varint(code))
+        return bytes(out)
+
+    def to_otlp_protobuf(self) -> bytes:
+        """Serialize recorded spans as wire-format OTLP Protobuf ExportTraceServiceRequest."""
+        with self._lock:
+            spans = list(self.spans)
+        res = (self._pb_ld(1, self._pb_kv('service.name', self.service_name))
+               + self._pb_ld(1, self._pb_kv('openinference.project.name', self.project_name)))
+        scope = (self._pb_ld(1, _SCOPE_NAME.encode('utf-8'))
+                 + self._pb_ld(2, _SCOPE_VERSION.encode('utf-8')))
+        scope_spans = self._pb_ld(1, scope) + b''.join(
+            self._pb_ld(2, self._span_to_otlp_pb(s)) for s in spans
+        )
+        res_spans = self._pb_ld(1, res) + self._pb_ld(2, scope_spans)
+        return self._pb_ld(1, res_spans)
+
+    def _post_otlp(self, target: str, body: bytes, content_type: str, timeout: float) -> int:
+        headers = {'Content-Type': content_type}
         if self.arize_api_key:
             headers['api_key'] = self.arize_api_key
             headers['x-arize-api-key'] = self.arize_api_key
         if self.arize_space_id:
             headers['space_id'] = self.arize_space_id
             headers['x-arize-space-id'] = self.arize_space_id
-        request = urllib.request.Request(
-            target, data=json.dumps(self.to_otlp_payload()).encode('utf-8'),
-            headers=headers, method='POST')
+        request = urllib.request.Request(target, data=body, headers=headers, method='POST')
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(getattr(response, 'status', 200))
+
+    def flush_otlp(self, *, endpoint: str | None = None, timeout: float = 1.5) -> bool:
+        """POST the current spans as OTLP/HTTP (JSON with Protobuf fallback on 415); True on 2xx."""
+        target = endpoint or self.otlp_endpoint
+        if not target:
+            return False
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                return 200 <= getattr(response, 'status', 200) < 300
+            status = self._post_otlp(
+                target,
+                json.dumps(self.to_otlp_payload()).encode('utf-8'),
+                'application/json',
+                timeout,
+            )
+            return 200 <= status < 300
+        except urllib.error.HTTPError as exc:
+            if exc.code == 415:
+                try:
+                    status = self._post_otlp(
+                        target,
+                        self.to_otlp_protobuf(),
+                        'application/x-protobuf',
+                        timeout,
+                    )
+                    return 200 <= status < 300
+                except (urllib.error.URLError, OSError, ValueError):
+                    return False
+            return False
         except (urllib.error.URLError, OSError, ValueError):
             return False
 

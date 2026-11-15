@@ -720,6 +720,43 @@ class TestTelemetry(HarnessTestCase):
         spans = received['body']['resourceSpans'][0]['scopeSpans'][0]['spans']
         self.assertEqual(spans[0]['name'], 'gen_ai.chat')
 
+    def test_flush_otlp_falls_back_to_protobuf_on_http_415(self):
+        attempts = []
+
+        class _PhoenixCollector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                body = self.rfile.read(length)
+                ctype = self.headers.get('Content-Type') or ''
+                attempts.append((ctype, body))
+                if ctype == 'application/json':
+                    err = b'Unsupported content type: application/json'
+                    self.send_response(415)
+                    self.send_header('Content-Type', 'text/plain')
+                    self.send_header('Content-Length', str(len(err)))
+                    self.end_headers()
+                    self.wfile.write(err)
+                    return
+                self.send_response(200)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PhoenixCollector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        tracer = HarnessTracer(service_name='harness-tests', project_name='agent-harness')
+        tracer.record_span('gen_ai.chat', kind='LLM', attributes={'gen_ai.request.model': GLM, 'cost': 0.01, 'ok': True})
+        try:
+            ok = tracer.flush_otlp(endpoint='http://127.0.0.1:%d/v1/traces' % server.server_port)
+        finally:
+            server.shutdown(); server.server_close()
+        self.assertTrue(ok)
+        self.assertEqual([c for c, _ in attempts], ['application/json', 'application/x-protobuf'])
+        self.assertIn(b'agent-harness', attempts[1][1])
+        self.assertIn(b'gen_ai.chat', attempts[1][1])
+
 
 class TestH9StateStatsAndCLI(HarnessTestCase):
     def _make_state_dir(self, name):

@@ -6,5 +6,7 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+.idea/
+uv.lock
 *.jsonl
 .coverage
