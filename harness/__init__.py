@@ -1,0 +1,73 @@
+"""Agent Harness toolkit: L7 OpenRouter control-plane proxy, routing, and static/runtime guards."""
+
+__version__ = '0.1.0'
+
+from .finops import (DB, LIMITS, STATE,
+                     _reconcile_locked, auto_reconcile_from_proxy,
+                     build_unexposed_settlement_evidence, can_settle_from_proxy_local,
+                     capture_requests, connect, event, fetch_generation,
+                     fetch_generation_settled, metrics, number, prior_cost,
+                     private_log, private_write, reconcile_run, request_records,
+                     resolved_cost, snapshot, verify_db, violation)
+from .guards import (
+    _message_text,
+    _sql_skeleton_lines,
+    build_file_skeletons,
+    check_allowed_files_syntax,
+    check_sql_syntax,
+    collect_python_top_symbols,
+    compact_stale_reads,
+    detect_duplicate_tool_calls,
+    extract_compact_test_failure,
+)
+from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
+                    STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
+from .report import (aggregate_benchmark_runs, format_benchmark_markdown,
+                     format_state_stats_markdown, scan_state_runs, summarize_run)
+from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
+                      DEFAULT_REASONING_MAX_TOKENS, ERROR_RECOVERY_REASONING_MAX_TOKENS,
+                      ERROR_SIGNAL_SUBSTRINGS, FP8_PROVIDER_ROUTING, GLM_51_PROVIDER_ROUTING,
+                      GLM_53_FLASH_PROVIDER_ROUTING, LATE_TURN_REASONING_MAX_TOKENS,
+                      LATE_TURN_START, MODELS, MODEL_PROVIDER_PREFS, MODEL_REQUEST_CAPS,
+                      QUIET_LATE_TURN_REASONING_MAX_TOKENS, ProviderHealthStore,
+                      apply_provider_routing)
+from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
+                        HarnessTracer, format_trace_tree,
+                        sync_state_traces_to_phoenix, synthesize_spans_from_run_dir)
+from .sandbox import (
+    CLI, DB, LIMITS, STATE,
+    _reconcile_locked, auto_reconcile_from_proxy, build_unexposed_settlement_evidence,
+    can_settle_from_proxy_local, capture_files, capture_requests, check_patch, config_for,
+    connect, event, execute, executable_argv, fetch_generation, fetch_generation_settled,
+    file_hashes, interruptions, isolated_worktree, locks, main, metrics, model_run,
+    number, owned_process, preflight, prior_cost, private_log, private_write,
+    reconcile_run, request_records, resolved_cost, run_task, snapshot, stop_group,
+    validate_task, verify_db, verify_permissions, violation,
+)
+
+__all__ = [
+    '__version__',
+    'check_allowed_files_syntax', 'check_sql_syntax', 'collect_python_top_symbols',
+    '_message_text', 'detect_duplicate_tool_calls', '_sql_skeleton_lines',
+    'build_file_skeletons', 'extract_compact_test_failure', 'compact_stale_reads',
+    'OPENROUTER_UPSTREAM', 'GEN_ID_RE', 'STREAM_COST_RE', 'PROVIDER_LATENCY_THRESHOLD_SECONDS',
+    'GuardError', 'OpenRouterGuardProxy', 'openrouter_proxy',
+    'DEFAULT_MODEL', 'MODELS', 'FP8_PROVIDER_ROUTING', 'GLM_53_FLASH_PROVIDER_ROUTING',
+    'GLM_51_PROVIDER_ROUTING', 'MODEL_PROVIDER_PREFS', 'DEFAULT_REASONING_MAX_TOKENS',
+    'LATE_TURN_REASONING_MAX_TOKENS', 'LATE_TURN_START', 'QUIET_LATE_TURN_REASONING_MAX_TOKENS',
+    'ERROR_RECOVERY_REASONING_MAX_TOKENS', 'ERROR_SIGNAL_SUBSTRINGS', 'DEFAULT_MAX_TOKENS_CAP',
+    'MODEL_REQUEST_CAPS', 'apply_provider_routing', 'ProviderHealthStore',
+    'DEFAULT_PROVIDER_HEALTH_TTL_SECONDS',
+    'summarize_run', 'aggregate_benchmark_runs', 'format_benchmark_markdown',
+    'scan_state_runs', 'format_state_stats_markdown',
+    'DEFAULT_PHOENIX_ENDPOINT', 'OPENINFERENCE_SPAN_KINDS', 'HarnessTracer',
+    'format_trace_tree', 'synthesize_spans_from_run_dir', 'sync_state_traces_to_phoenix',
+    'DB', 'LIMITS', 'STATE', 'CLI',
+    '_reconcile_locked', 'auto_reconcile_from_proxy', 'build_unexposed_settlement_evidence',
+    'can_settle_from_proxy_local', 'capture_files', 'capture_requests', 'check_patch', 'config_for',
+    'connect', 'event', 'execute', 'executable_argv', 'fetch_generation', 'fetch_generation_settled',
+    'file_hashes', 'interruptions', 'isolated_worktree', 'locks', 'main', 'metrics', 'model_run',
+    'number', 'owned_process', 'preflight', 'prior_cost', 'private_log', 'private_write',
+    'reconcile_run', 'request_records', 'resolved_cost', 'run_task', 'snapshot', 'stop_group',
+    'validate_task', 'verify_db', 'verify_permissions', 'violation',
+]

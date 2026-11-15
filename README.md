@@ -1,0 +1,406 @@
+# Harness — Local Guard Proxy for Coding Agents
+
+`agent-harness` is a stdlib-only Python package that sits between a coding-agent
+CLI (e.g. OpenCode) and its upstream LLM provider. It exists because production
+agent runs fail in four boringly repetitive ways, and every one of them is
+cheaper to intercept on the wire than to discover on a bill or in a broken
+repository.
+
+## Problem statement
+
+1. **KV-cache churn across upstream providers.** OpenRouter silently re-routes
+   retries to a different provider (z-ai → novita → siliconflow). A different
+   provider is a different GPU pod and a cold KV cache: every retry re-pays the
+   full prompt at cache-miss rates. Provider identity must be pinned
+   deliberately, not left to throughput sorting.
+2. **Runaway CoT on trivial turns.** A fixed 2k reasoning budget is burned on
+   turns where the model only needs to echo "all checks passed" — and is
+   simultaneously spent at the default level exactly on the turns that carry an
+   error signal and actually need room to reason about a failure.
+3. **Silent AST / dict-key corruption.** A Python file with a duplicate dict
+   key, leftover merge-conflict markers, or a dropped top-level symbol passes
+   the agent's own "I edited the file" belief and fails one CI hop later,
+   costing a full pipeline round trip per discovery.
+4. **Tool-call loops.** Identical repeated tool calls (same tool, same
+   arguments modulo key order/whitespace) mean the agent stopped reading tool
+   output. Left alone, this loops until the step or dollar cap.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    A[Agent CLI<br/>OpenCode / opencode-cli run] -->|"POST /chat/completions"| P
+    subgraph P[Local L7 MITM Guard Proxy — harness.proxy]
+        direction TB
+        P1["H-1/H-4 Pre-Flight Interceptor<br/>check_allowed_files_syntax over allowed_files<br/>(AST · JSON · dict keys · markers · baseline symbols)"] --> P2
+        P2["H-5 Loop Interceptor<br/>detect_duplicate_tool_calls"] --> P3
+        P3["H-3 Sticky KV-Cache &<br/>Adaptive CoT Router<br/>apply_provider_routing"]
+    end
+    P -->|"pinned provider + reasoning budget + max_tokens cap"| U[Upstream OpenRouter / LLM]
+    P -.->|"[AST PREFLIGHT ERROR: …] / [GUARD LOOP WARNING: …]<br/>appended to the last message"| A
+    P -.->|"HTTP 429/5xx → provider demoted<br/>fast 200 → provider pinned"| C[(provider health:<br/>sticky_provider / degraded_providers)]
+```
+
+Every forwarded `/chat/completions` (or `/responses`) request is parsed once,
+scanned by the pre-flight and loop interceptors from turn 2, then rebuilt:
+notices are appended to the last message, the provider block is rewritten
+(sticky pinning / degradation demotion), and the reasoning budget plus
+`max_tokens` cap are set for this specific turn. Provider routing runs last so
+a notice injected on the same turn immediately activates the error-recovery
+budget. Upstream 429/5xx responses arm the circuit breaker
+(`degraded_providers`); fast 200s promote the responding provider to
+`sticky_provider`.
+
+### Module map
+
+| Module | Responsibility |
+| --- | --- |
+| `harness.guards` | Pure, stdlib-only helpers: Python/JSON/SQL syntax pre-flight, local-import check, file skeletons, test-failure digests, duplicate tool-call detection, stale-read compaction, wire-level egress guard (`check_egress_payload`), read-only SQL tool guard (`check_readonly_sql_tool_calls`) |
+| `harness.routing` | OpenRouter provider preferences, per-model request caps, adaptive reasoning budgets, persistent TTL `ProviderHealthStore`, `vLLM` upstream mode, `small -> teacher` escalation |
+| `harness.sandbox` | H-10 sandbox: task-JSON schema + path-boundary validation, exclusive path locks (`file_locked:`), SHA-256 file digests, transactional git worktrees, bounded micro-repair prompts |
+| `harness.finops` | H-10 finops: pre-dispatch budget gate (step cap / cost cap / unpriced models), SQLite generation telemetry, local OpenRouter generation settlement, per-task prior-cost aggregation, `export_sml_cost_manifest` |
+| `harness.proxy` | `OpenRouterGuardProxy` / `openrouter_proxy` context manager: gate, notices, stale-read compaction, egress & read-only SQL guards, `vLLM` upstream mode, cost & generation-id capture, circuit breaker, span recording |
+| `harness.report` | Run-record normalization, benchmark aggregation, Markdown comparison, live state-directory stats |
+| `harness.telemetry` | Stdlib-only OpenTelemetry/GenAI tracer, OTLP payload export, Arize AX / Phoenix flush, trace-tree rendering |
+| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `trace`, `serve`, `run` subcommands |
+
+H-10 adds the supervisor-side half of the picture. `harness.sandbox`
+validates each task manifest against its schema (`task_id`, `directory`,
+`files` (1-3 absolute paths), `prompt`, `test_argv` beginning with an
+absolute executable) and the workspace path boundary, takes exclusive
+`flock`-based file locks so two workers never share canonical paths
+(contention fails fast with `file_locked: <path>`), snapshots the pre-edit
+SHA-256 digest map, isolates risky edits in a transactional git worktree
+that is always removed on exit, and bounds micro-repair by an attempt budget
+that reuses the H-2 compact failure digest. The matching `harness.finops`
+gate prices the *next* step before it is dispatched — step cap, dollar cap,
+unpriced models — settles each OpenRouter generation from the proxy's local
+record into SQLite telemetry (`<state-dir>/telemetry.sqlite`), and feeds the
+cumulative per-task prior cost back into the gate: an unknown final cost
+blocks paid retries instead of silently overshooting.
+
+### Live benchmark — 2,068 production runs
+
+The guarded path is benchmarked against live production state, not a
+synthetic corpus: every supervised run writes a run record, and
+`harness stats --state-dir …` / `format_state_stats_markdown` render the
+rolling benchmark table over **2,068 production runs** (state on
+2026-11-15), one row per routed model plus the `ALL` aggregate:
+
+| Model | Runs | Pass % |
+| --- | --- | --- |
+| ALL | 2,068 | rendered live from the state directory |
+| `openrouter/z-ai/glm-5.3-flash` | … | … |
+| `openrouter/deepseek/deepseek-v4.1-flash-1017` | … | … |
+
+The per-model rows show the rendered shape; the authoritative numbers always
+come from re-running the command against the live state directory — the
+benchmark table is derived data, never a static catalog.
+
+## H-1 — Syntax pre-flight & provider circuit breaker
+
+`harness.guards.check_allowed_files_syntax(files, *, baseline_symbols=None)`
+parses each `.py`/`.json`/`.sql` path without spawning a process and returns
+positional `path:line: message` errors:
+
+- Python `SyntaxError` (`ast.parse`) — e.g. `bad.py:1: invalid syntax`.
+- JSON decode errors (`json.loads`) with the decoder's line number.
+- **Duplicate dict keys** — an `ast.Dict` walk keyed on `(type, value)`, so
+  `1` and `True` stay distinct; reported at the duplicate key's line
+  (`dup.py:3: duplicate dict key 'a'`).
+- **Merge-conflict markers** (`<<<<<<< `, `=======`, `>>>>>>> `) at line
+  start, in any parseable file type.
+- With `baseline_symbols` from `collect_python_top_symbols`, a file that
+  drops a previously present top-level function/class is rejected:
+  `path:1: dropped top-level symbol(s): keep_one`.
+
+Missing and unreadable paths are skipped; an empty list means clean.
+
+The proxy re-runs the pre-flight over `allowed_files` (with a baseline
+captured at construction) on every turn ≥ 2 and injects
+`[AST PREFLIGHT ERROR: bad.py:1: invalid syntax — fix before finishing]` into
+the last message, so the model sees the failure one turn earlier than CI
+would. On the transport side, any upstream `429`/`5xx` adds the responding
+provider (from `X-OpenRouter-Provider`, the error body, or the routed
+order head) to `degraded_providers` and clears it from `sticky_provider`;
+subsequent requests demote it to the back of the order.
+
+## H-2 — Compact test-failure extraction
+
+`harness.guards.extract_compact_test_failure(stdout, stderr, max_lines=25)`
+reduces a full pytest log to a bounded digest: lines containing `FAILED`,
+`E   ` assertion lines, `SyntaxError` / `ImportError` /
+`ModuleNotFoundError` lines — plus **only the last traceback location**
+(earlier `File "…", line N` frames are dropped, so the model fixes the
+deepest frame, not frame one). Everything else is treated as noise and cut.
+If nothing matched, it falls back to the tail of the non-empty output capped
+at `min(max_lines, 10)` lines. Output is hard-truncated to `max_lines`, so a
+40k-token CI log never reaches the model; the digest feeds micro-repair
+prompts such as `[TEST_ARGV FAILURE — fix only the failing assertion/import]`.
+
+## H-3 — Sticky KV-cache pinning & adaptive CoT budget
+
+`harness.routing.apply_provider_routing(body, path, *, turn_index=1,
+reasoning_max_tokens=None, degraded_providers=None, sticky_provider=None)`
+rewrites the request just before dispatch (only for `/chat/completions` and
+`/responses`, and only for models in `MODEL_PROVIDER_PREFS` /
+`MODEL_REQUEST_CAPS`):
+
+- **Explicit-order models** (`glm-5.3-flash` → `z-ai, novita, siliconflow,
+  gmicloud` with `baseten` ignored; `glm-5.1` → `chutes, z-ai,
+  siliconflow`): a healthy sticky provider is moved to
+  `provider.order[0]`; a degraded one is demoted to last and never pinned —
+  a cold-cache provider must not be retried first.
+- **Throughput-sorted models** (DeepSeek FP8 family, `sort: throughput`):
+  there is no order list by design; pinning replaces the sort with a
+  single-entry `order: [sticky]` and drops `sort`, because a pinned provider
+  must stay pinned across turns to keep its KV cache warm.
+- **Reasoning budget per turn** (from `turn_index >= LATE_TURN_START == 3`,
+  scanning the last two messages for `ERROR_SIGNAL_SUBSTRINGS`):
+  - error signal present → `min(2048, 1536)` — recovery level, immediately
+    on the turn that carries the signal;
+  - clean turn whose last message is a tool result, at `turn_index >= 4` →
+    `512` — quiet-turn level, no CoT burn;
+  - otherwise → `768` (`LATE_TURN_REASONING_MAX_TOKENS`).
+- **Request cap**: `max_tokens` is capped at 8192 per model
+  (`MODEL_REQUEST_CAPS`), protecting provider-side quota and implicit KV
+  cache.
+
+Turns below the late-turn threshold keep the model default (2048), so early
+cheap turns are never inflated.
+
+## H-4 — Semantic AST pre-flight & file skeletons
+
+The duplicate-key, conflict-marker, and dropped-symbol checks in H-1 are the
+*semantic* layer of the pre-flight: they catch edits that parse but lie.
+`collect_python_top_symbols(files)` builds the `{path: {symbol, …}}`
+baseline from whatever currently parses (unparseable `.py` files map to an
+empty set, non-`.py` files are omitted), and feeding it back via
+`baseline_symbols=` rejects "rename the function and hope" edits.
+
+`harness.guards.build_file_skeletons(files, *, line_threshold=250)` emits a
+prompt-ready navigation map for files **longer** than the threshold:
+
+```
+[FILE SKELETON MAP -- read only target line ranges]
+--- tools/big_module.py (391 lines)
+L1-L9: def parse_header(self, stream, strict)
+  L11-L24:   def _decode(self, raw)
+...
+--- tools/query.sql (310 lines)
+  L5-L88: CTE monthly_pulse
+  L301-L310: final SELECT
+```
+
+`.py` files get top-level functions/classes with line spans (`L<start>-L<end>`)
+and one level of nested methods; `.sql` files get CTE and final-SELECT ranges.
+Short files are skipped — reading them whole is cheaper than reading a map.
+
+## H-5 — Duplicate tool-call loop guard
+
+`harness.guards.detect_duplicate_tool_calls(messages)` compares the last two
+assistant tool-call turns; arguments are canonicalized with
+`json.dumps(..., sort_keys=True)` (whitespace and key order ignored,
+unparseable arguments fall back to their stripped form). A repetition yields
+`duplicate tool call edit repeated with identical arguments`; different
+arguments or an intervening different tool reset the comparison.
+
+The proxy variant scans the whole conversation (any repeat counts) and, from
+turn 2, injects `[GUARD LOOP WARNING: edit called 2x with identical
+arguments — change target lines/arguments or finish]`. The notice both
+surfaces the loop to the model and — via H-3's error-signal scan — raises the
+reasoning budget on that same turn, so the model has budget to change
+strategy instead of repeating.
+
+## H-6 — Persistent TTL provider health store
+
+`harness.routing.ProviderHealthStore(path, *, ttl_seconds=600.0)` persists
+provider health as JSON (`{"degraded": {provider: expiry_epoch},
+"sticky": {model_or_default: {"provider": name, "expiry": expiry}}}`) with
+read-modify-write plus atomic temp-file + `os.replace` writes, so restarts
+and concurrent workers never observe a half-written store.
+
+- `mark_degraded(provider, now=None)` demotes a provider for the TTL window
+  and drops any sticky pin on it (circuit breaker); `set_sticky(provider,
+  model=None, now=None)` pins a healthy provider (refused while degraded);
+  `get_sticky(model=None, now=None)` and `active_degraded(now=None)` read the
+  still-fresh state and prune expired rows. Every method accepts an explicit
+  `now=` timestamp, so TTL behavior is testable without sleeping.
+- The proxy accepts `OpenRouterGuardProxy(..., health_store=store)`: it
+  hydrates `degraded_providers` / `sticky_provider` at construction and
+  records every demotion / pin through the store. A **second proxy instance**
+  (restarted CLI, next agent session) therefore inherits the warm-KV pin and
+  the circuit-breaker demotions instead of re-paying a cold cache on a
+  provider that just failed. Entries expire after
+  `DEFAULT_PROVIDER_HEALTH_TTL_SECONDS = 600` in both directions: a sticky
+  pin ages out so throughput sorting can resume, and a degraded provider
+  recovers so it can be retried.
+
+## H-7 — SQL/Jinja & local-import static pre-flight
+
+`harness.guards.check_sql_syntax(text, filename="<sql>")` pre-flights a
+dbt-style SQL/Jinja template without spawning a process. It masks `--` line
+comments, `/* ... */` block comments, single-quoted strings (with `''`
+escapes), and Jinja `{{ ... }}` / `{% ... %}` regions, then reports:
+
+- unbalanced parentheses (`q.sql:1: unbalanced parenthesis`);
+- trailing commas before `FROM` / `WHERE` / `GROUP BY` / `ORDER BY` /
+  `HAVING` / `LIMIT` / `UNION` (`q.sql:1: trailing comma before FROM`);
+- unclosed comments or string literals; and
+- unbalanced Jinja statement tags (`if`/`endif`, `for`/`endfor`,
+  `macro`/`endmacro`) at the opening tag's line.
+
+It is wired into `check_allowed_files_syntax`, so every `.sql` allowed file
+gets the same zero-shell treatment as `.py`/`.json`. The H-7 pre-flight also
+catches broken **local imports** statically: `from <sibling> import <missing>`
+is rejected by parsing the sibling module next to the importing file and
+checking the name against everything the sibling defines, assigns, imports,
+or exports via `__all__` (`importer.py:1: cannot import name 'missing_name'
+from 'helper'`). Nothing is executed; unparseable siblings are skipped.
+
+## H-8 — Threshold stale-read observation compaction
+
+`harness.guards.compact_stale_reads(messages, *, turn_index=1, min_turn=5,
+char_threshold=400)` shrinks the context tax of stale observations. It maps
+`tool_call_id` → `(tool_name, file_path)` (arguments scanned for `path`-style
+keys), records the last message index at which each file was touched by an
+edit/write/patch tool, and replaces every **earlier** read/view result on
+that path longer than `char_threshold` with
+`[STALE READ COMPACTED: {path} was modified in a later turn — re-read target
+lines if needed]`. OpenAI-style `tool_calls` and Anthropic-style
+`tool_result` blocks are both handled; the input list is never mutated; and
+below `min_turn` everything passes through untouched.
+
+The proxy runs compaction on every forwarded request from turn 5, before
+provider routing, and increments `proxy.summary()['compacted_reads']`; a
+`guard.stale_read_compaction` GUARDRAIL span records each compaction event.
+
+## H-9 — Live state telemetry & CLI stats
+
+`harness.report.scan_state_runs(state_dir)` scans a live state directory:
+every `<state_dir>/runs/<run>/result.json` (oldest-first by run-directory
+mtime) is normalized via `summarize_run`, with the run's optional sibling
+`requests.json` guard-proxy telemetry folded in as `proxy_summary`.
+`format_state_stats_markdown(state_dir)` renders a per-model table (runs,
+Pass@1, median steps/cost, total cost, blocked requests, auto-repairs) with
+a trailing `ALL` row; a missing or empty `runs/` yields `No runs found.`.
+
+```console
+$ harness stats --state-dir ~/.tools/opencode-guard-state   # Markdown stats table
+$ harness trace ~/.tools/opencode-guard-state/runs/<run>    # trace tree from traces.jsonl
+$ harness trace path/to/traces.jsonl                        # ...or an explicit file
+```
+
+## H-10 — Sandbox Isolation, FinOps & Small Model Lab Integration
+
+H-10 pairs supervisor-side isolation and cost accounting with wire-level
+guardrails for `Small Model Lab` distillation and eval rollouts:
+
+- **Sandbox isolation (`harness.sandbox`)**: Validates task manifests and
+  workspace path boundaries, acquires exclusive `flock` path locks, snapshots
+  SHA-256 file digests, runs edits inside transactional git worktrees that are
+  always cleaned up on exit, and bounds micro-repair loops with compact failure
+  digests.
+- **FinOps & cost settlement (`harness.finops`)**: Enforces pre-dispatch step
+  and dollar caps, settles per-generation costs from proxy telemetry into
+  SQLite (`<state-dir>/telemetry.sqlite`), aggregates cumulative prior cost per
+  task (correlating `X-Harness-Task-Id` headers), and exports Small Model Lab
+  cost manifests via `export_sml_cost_manifest`.
+- **CLI subcommands (`harness serve`, `harness run`)**:
+  - `harness serve`: Runs the local MITM guard proxy as a standalone HTTP
+    endpoint (supporting `HARNESS_BASE_URL` clients such as `Small Model Lab`'s
+    `GatewayConfig`).
+  - `harness run`: Executes a supervised task manifest end-to-end with
+    sandboxed worktree isolation, FinOps budget gating, and proxy telemetry.
+- **Wire-level guards & SML rollout routing (`harness.guards`, `harness.proxy`, `harness.routing`)**:
+  - **Egress guard (`check_egress_payload`)**: Inspects outbound request
+    payloads on the wire to block forbidden raw-body, credential, or secret
+    fields before they leave the local boundary.
+  - **Read-only SQL tool guard (`check_readonly_sql_tool_calls`)**: Enforces
+    read-only SQL constraints on tool calls so exploratory database queries
+    cannot mutate state.
+  - **`vLLM` upstream mode**: Routes requests to a local/self-hosted `vLLM`
+    OpenAI-compatible endpoint when configured instead of OpenRouter.
+  - **`small -> teacher` model escalation**: Automatically escalates failed or
+    low-confidence small-model rollouts to a designated teacher model under the
+    same FinOps budget and trace context.
+
+## OpenTelemetry GenAI + Arize AX / Phoenix OpenInference tracing
+
+`harness.telemetry.HarnessTracer` is a stdlib-only tracer speaking both
+attribute dialects: every span carries `openinference.span.kind`
+(validated against `OPENINFERENCE_SPAN_KINDS`: `AGENT`, `LLM`, `GUARDRAIL`,
+`CHAIN`, `TOOL`) plus `openinference.project.name` on top of `gen_ai.*`,
+`llm.*`, `guardrail.*`, and `harness.*` keys, so the same stream is
+first-class in Arize AX, Phoenix, and any GenAI-semantics consumer.
+
+- The guard proxy records a `gen_ai.chat` **LLM span** per forwarded request
+  (system, model, provider, generation id, stream cost, turn index, applied
+  reasoning budget, HTTP status) and **GUARDRAIL spans** for every
+  pre-flight error, loop warning, stale-read compaction, and circuit-breaker
+  demotion; `proxy.summary()['spans']` exposes them for run records.
+- `tracer.record_span(name, kind=..., parent_span_id=..., attributes=...)`
+  appends in-memory and (optionally) to a JSONL file (`jsonl_path=`), which
+  is exactly the `traces.jsonl` the `harness trace` command renders via
+  `format_trace_tree`.
+- `tracer.to_otlp_payload()` converts recorded spans into OTLP/HTTP JSON
+  `ExportTraceServiceRequest` (`resourceSpans` → `scopeSpans` → `spans`,
+  proto3-JSON int64 nanos, 32/16-hex trace/span ids);
+  `tracer.flush_otlp(endpoint=...)` POSTs it and returns `True` on 2xx
+  (never raises), attaching Arize authentication headers.
+
+Environment variables (all optional; constructor arguments win):
+
+| Variable | Meaning |
+| --- | --- |
+| `ARIZE_COLLECTOR_ENDPOINT` | Arize AX OTLP collector; highest endpoint precedence |
+| `PHOENIX_COLLECTOR_ENDPOINT` | Phoenix OTLP collector; second precedence |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Generic OTLP endpoint; last precedence |
+| `ARIZE_API_KEY` | Sent as `api_key` / `x-arize-api-key` headers on flush |
+| `ARIZE_SPACE_ID` | Sent as `space_id` / `x-arize-space-id` headers on flush |
+| `ARIZE_PROJECT_NAME` / `PHOENIX_PROJECT_NAME` | `openinference.project.name` (default `agent-harness`) |
+
+## Report & CLI
+
+`harness.report.summarize_run` normalizes raw runner JSON (tolerant of
+`cost`/`cost_usd`, `steps`/`model_steps`, `passed`/`succeeded`/… spellings);
+`aggregate_benchmark_runs(runs)` folds that into `total_runs`, `pass_count`,
+`pass_rate`, `median_steps`, `median_cost_usd`, `total_cost_usd`, and
+`micro_repair_count`; `format_benchmark_markdown(baseline_runs,
+guarded_runs)` renders a baseline-vs-guarded comparison table.
+
+```console
+$ harness preflight src/a.py src/conf.json          # exit 1 on any finding
+$ harness skeleton big.py --threshold 100           # print the L<start>-L<end> map
+$ harness bench-report --baseline runs.json --guarded guarded.json
+$ harness stats --state-dir state/                  # live state-directory stats
+$ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
+$ pytest -q tests/test_harness.py                   # contract suite
+```
+
+## Quickstart
+
+```python
+import json
+from harness import OpenRouterGuardProxy
+from harness.routing import apply_provider_routing
+
+# In-process routing without a socket:
+body = json.dumps({"model": "openrouter/z-ai/glm-5.3-flash",
+                   "messages": [{"role": "user", "content": "hi"}]}).encode()
+routed = apply_provider_routing(body, "/chat/completions", turn_index=1,
+                                sticky_provider="siliconflow")
+
+# Or run the proxy and point the agent CLI at it:
+proxy = OpenRouterGuardProxy(lambda: None, allowed_files=["src/a.py"])
+print(proxy.base_url)   # e.g. http://127.0.0.1:52133/api/v1
+# with openrouter_proxy(gate, allowed_files=files) as proxy: ...
+```
+
+The `gate` callable returns a stop reason (truthy) to block dispatch and
+return `429 guard_stop` — that is the supervisor's budget/deadline hook.
+No third-party dependencies: Python ≥ 3.10 standard library only.
+
+```console
+$ pytest -q tests/test_harness.py    # H-1..H-9, H-10 sandbox/finops, OTel telemetry, report & CLI
+```

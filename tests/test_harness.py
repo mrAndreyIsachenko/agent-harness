@@ -1,0 +1,1675 @@
+"""Contract tests for the standalone ``harness`` package (H-1..H-8, H-10 + report/CLI).
+
+Layout under test:
+- ``harness.guards``  -- H-1/H-2/H-4/H-5/H-7/H-8 pure helpers (AST/SQL preflight,
+  failure digest, duplicate tool-call detection, stale-read compaction, file
+  skeletons).
+- ``harness.routing`` -- H-3 sticky provider pinning + adaptive reasoning budgets.
+- ``harness.proxy``   -- the local L7 MITM guard proxy wiring H-1/H-5 notices,
+  provider-health circuit breaking and sticky pinning into the request path.
+- ``harness.report``  -- benchmark run aggregation and Markdown rendering.
+- ``harness.cli``     -- ``preflight`` / ``skeleton`` / ``bench-report`` subcommands.
+"""
+
+import contextlib
+import http.server
+import io
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.request
+
+from harness import OpenRouterGuardProxy
+from harness.cli import main as cli_main
+from harness.finops import (auto_reconcile_from_proxy, can_settle_from_proxy_local,
+                            capture_requests, connect, export_sml_cost_manifest,
+                            locks as finops_locks, metrics, number, prior_cost,
+                            reconcile_run, request_records, resolved_cost,
+                            snapshot, verify_db, violation)
+from harness.guards import (FORBIDDEN_EGRESS_KEYS, build_file_skeletons,
+                            check_allowed_files_syntax, check_egress_payload,
+                            check_readonly_sql_tool_calls, check_sql_syntax,
+                            collect_python_top_symbols, compact_stale_reads,
+                            detect_duplicate_tool_calls, extract_compact_test_failure)
+from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
+                            format_state_stats_markdown, scan_state_runs, summarize_run)
+from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
+                             ERROR_RECOVERY_REASONING_MAX_TOKENS, LATE_TURN_REASONING_MAX_TOKENS,
+                             LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
+                             ProviderHealthStore, apply_provider_routing,
+                             select_escalated_model)
+from harness.sandbox import (GuardError, capture_files, config_for, execute,
+                             file_hashes, isolated_worktree, locks,
+                             validate_task, verify_permissions)
+from harness.telemetry import OPENINFERENCE_SPAN_KINDS, HarnessTracer, format_trace_tree
+
+GLM = 'openrouter/z-ai/glm-5.3-flash'
+DEEPSEEK = 'openrouter/deepseek/deepseek-v4.1-flash-1017'
+
+
+def _scripted_upstream(steps):
+    """Spin up an upstream stub; ``steps`` are consumed per request."""
+    captured = []
+
+    class _Upstream(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def do_POST(self):
+            length = int(self.headers.get('Content-Length') or '0')
+            raw = self.rfile.read(length)
+            try:
+                captured.append(json.loads(raw))
+            except ValueError:
+                captured.append(None)
+            step = steps.pop(0) if steps else {'status': 200}
+            payload = json.dumps({'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}]}).encode()
+            self.send_response(step.get('status', 200))
+            self.send_header('Content-Type', 'application/json')
+            if step.get('provider'):
+                self.send_header('X-OpenRouter-Provider', step['provider'])
+            self.send_header('Content-Length', str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Upstream)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, captured
+
+
+def _post_chat(base_url, body):
+    request = urllib.request.Request(base_url + '/chat/completions', data=body,
+                                     headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urllib.request.urlopen(request, timeout=15) as resp:
+            resp.read()
+            return resp.status
+    except urllib.error.HTTPError as exc:  # expected for upstream 4xx/5xx steps
+        exc.read()
+        return exc.code
+
+
+class HarnessTestCase(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='harness-test-')
+
+    def path(self, name):
+        import os
+        return str(os.path.join(self.root, name))
+
+
+class TestH1Preflight(HarnessTestCase):
+    def test_py_syntax_error_and_json_decode_error(self):
+        bad_py = self.path('bad.py')
+        bad_json = self.path('bad.json')
+        skipped = self.path('notes.txt')
+        with open(bad_py, 'w') as fh:
+            fh.write('def broken(:\n    pass\n')
+        with open(bad_json, 'w') as fh:
+            fh.write('{"a": 1,\n')
+        with open(skipped, 'w') as fh:
+            fh.write('def not even python(((\n')
+        errors = check_allowed_files_syntax([bad_py, bad_json, skipped])
+        self.assertIn('%s:1: invalid syntax' % bad_py, errors)
+        self.assertIn("%s:2: Expecting property name enclosed in double quotes" % bad_json, errors)
+        self.assertFalse(any(skipped in err for err in errors), errors)
+        self.assertEqual(check_allowed_files_syntax([self.path('missing.py')]), [])
+
+    def test_proxy_ast_preflight_error_injection_and_immediate_budget(self):
+        bad_py = self.path('bad.py')
+        with open(bad_py, 'w') as fh:
+            fh.write('def broken(:\n')
+        upstream, captured = _scripted_upstream([{'status': 200}] * 3)
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                                     allowed_files=[bad_py])
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            body = json.dumps({'model': GLM, 'messages': [
+                {'role': 'user', 'content': 'edit the file'},
+                {'role': 'assistant', 'content': 'done'}]}).encode()
+            for _ in range(3):
+                _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 3)
+        self.assertNotIn('[AST PREFLIGHT ERROR', json.dumps(captured[0]))  # turn 1: no injection
+        notice = captured[1]['messages'][-1]['content']
+        self.assertIn('[AST PREFLIGHT ERROR: %s:1: invalid syntax' % bad_py, notice)
+        # Turn 2 carries the notice but is still below the late-turn threshold.
+        self.assertEqual(captured[1]['reasoning']['max_tokens'], DEFAULT_REASONING_MAX_TOKENS)
+        # From turn 3 the injected error signal immediately widens the CoT budget.
+        self.assertEqual(captured[2]['reasoning']['max_tokens'], ERROR_RECOVERY_REASONING_MAX_TOKENS)
+        self.assertIn('[AST PREFLIGHT ERROR', captured[2]['messages'][-1]['content'])
+
+
+class TestH2CompactFailure(HarnessTestCase):
+    STDOUT = ('Traceback (most recent call last):\n'
+              '  File "/x/test_a.py", line 10, in run\n'
+              '  File "/x/test_b.py", line 20, in helper\n'
+              'E   AssertionError: expected fixed\n'
+              'E   TypeError: bad type\n'
+              'ImportError: cannot import name\n'
+              'SyntaxError: invalid syntax\n'
+              'some noise line\n'
+              '1 failed, 2 passed in 0.1s\n'
+              'FAILED tests/test_b.py::test_one - AssertionError\n')
+
+    def test_extraction(self):
+        out = extract_compact_test_failure(self.STDOUT, '', max_lines=25)
+        self.assertIn('FAILED tests/test_b.py::test_one', out)
+        self.assertIn('E   AssertionError', out)
+        self.assertIn('E   TypeError', out)
+        self.assertIn('SyntaxError', out)
+        self.assertIn('ImportError', out)
+        self.assertIn('File "/x/test_b.py", line 20', out)  # last traceback location only
+        self.assertNotIn('File "/x/test_a.py"', out)
+        self.assertNotIn('some noise', out)
+        self.assertLessEqual(len(out.splitlines()), 25)
+
+    def test_max_lines_truncation_and_stderr_fallback(self):
+        self.assertEqual(extract_compact_test_failure(self.STDOUT, '', max_lines=2).count('\n'), 1)
+        self.assertIn('E   ValueError: from stderr',
+                      extract_compact_test_failure('', 'E   ValueError: from stderr\n', max_lines=25))
+        tail = extract_compact_test_failure('', 'line one\nline two\n', max_lines=25)
+        self.assertEqual(tail, 'line one\nline two')  # fallback: tail of non-empty output
+
+
+class TestH3StickyRouting(HarnessTestCase):
+    def _body(self, model, messages=None):
+        return json.dumps({'model': model, 'messages': messages or [{'role': 'user', 'content': 'hi'}]}).encode()
+
+    def test_sticky_pinning_explicit_order_and_deepseek_fp8(self):
+        out = json.loads(apply_provider_routing(self._body(GLM), '/chat/completions',
+                                                turn_index=1, sticky_provider='siliconflow'))
+        self.assertEqual(out['provider']['order'][0], 'siliconflow')
+        self.assertNotIn('siliconflow', out['provider']['order'][1:])
+        out = json.loads(apply_provider_routing(self._body(DEEPSEEK), '/chat/completions',
+                                                turn_index=1, sticky_provider='novita'))
+        self.assertEqual(out['provider']['order'], ['novita'])
+        self.assertNotIn('sort', out['provider'])
+
+    def test_degraded_provider_is_never_pinned(self):
+        out = json.loads(apply_provider_routing(self._body(GLM), '/chat/completions',
+                                                turn_index=1, sticky_provider='siliconflow',
+                                                degraded_providers={'siliconflow'}))
+        self.assertEqual(out['provider']['order'][0], 'z-ai')
+        self.assertEqual(out['provider']['order'][-1], 'siliconflow')
+
+    def test_adaptive_reasoning_budget(self):
+        err = self._body(GLM, [{'role': 'user', 'content': 'go'},
+                               {'role': 'assistant', 'content': 'ok'},
+                               {'role': 'tool', 'content': '[AST PREFLIGHT ERROR: bad syntax]'}])
+        quiet = self._body(GLM, [{'role': 'user', 'content': 'go'},
+                                 {'role': 'assistant', 'content': 'ok'},
+                                 {'role': 'tool', 'content': 'all checks passed'}])
+        cases = [(err, 3, ERROR_RECOVERY_REASONING_MAX_TOKENS),
+                 (quiet, 4, QUIET_LATE_TURN_REASONING_MAX_TOKENS),
+                 (quiet, 3, LATE_TURN_REASONING_MAX_TOKENS),
+                 (self._body(GLM), 1, DEFAULT_REASONING_MAX_TOKENS)]
+        for body, turn, expected in cases:
+            out = json.loads(apply_provider_routing(body, '/chat/completions', turn_index=turn))
+            self.assertEqual(out['reasoning']['max_tokens'], expected,
+                             'turn %d expected %d' % (turn, expected))
+            self.assertEqual(out['max_tokens'], 8192)  # request cap applied
+
+    def test_vllm_upstream_mode_omits_openrouter_provider_but_keeps_caps(self):
+        for model in (GLM, 'qwen/qwen3-coder'):
+            out = json.loads(apply_provider_routing(
+                self._body(model),
+                '/chat/completions',
+                turn_index=1,
+                sticky_provider='siliconflow',
+                upstream_mode='vllm',
+            ))
+            self.assertNotIn('provider', out)
+            self.assertEqual(out['max_tokens'], 8192)
+            self.assertEqual(out['reasoning']['max_tokens'], DEFAULT_REASONING_MAX_TOKENS)
+
+
+class TestH4SemanticPreflight(HarnessTestCase):
+    def test_duplicate_keys_conflict_markers_dropped_symbols(self):
+        dup, conflicted, clean = self.path('dup.py'), self.path('query.sql'), self.path('clean.py')
+        with open(dup, 'w') as fh:
+            fh.write('config = {\n    "a": 1,\n    "a": 2,\n}\n')
+        with open(conflicted, 'w') as fh:
+            fh.write('select 1;\n<<<<<<< HEAD\nselect 2;\n=======\nselect 3;\n>>>>>>> other\n')
+        with open(clean, 'w') as fh:
+            fh.write('def keep_one():\n    return 1\n')
+        errors = check_allowed_files_syntax([dup, conflicted, clean])
+        self.assertIn("%s:3: duplicate dict key 'a'" % dup, errors)
+        self.assertIn('%s:2: merge conflict marker left in file' % conflicted, errors)
+        self.assertIn('%s:4: merge conflict marker left in file' % conflicted, errors)
+        self.assertIn('%s:6: merge conflict marker left in file' % conflicted, errors)
+        self.assertFalse(any(clean in err for err in errors), errors)
+
+    def test_baseline_symbol_drift(self):
+        clean, conflicted = self.path('clean.py'), self.path('query.sql')
+        with open(clean, 'w') as fh:
+            fh.write('def keep_one():\n    return 1\n')
+        with open(conflicted, 'w') as fh:
+            fh.write('<<<<<<< HEAD\n')
+        baseline = collect_python_top_symbols([clean, conflicted])
+        self.assertEqual(baseline, {clean: {'keep_one'}})  # .sql not inventoried
+        self.assertEqual(check_allowed_files_syntax([clean], baseline_symbols=baseline), [])
+        with open(clean, 'w') as fh:
+            fh.write('def renamed():\n    return 2\n')
+        errors = check_allowed_files_syntax([clean], baseline_symbols=baseline)
+        self.assertIn('%s:1: dropped top-level symbol(s): keep_one' % clean, errors)
+
+    def test_build_file_skeletons_range_map(self):
+        big, small = self.path('big.py'), self.path('small.py')
+        with open(big, 'w') as fh:
+            fh.write('x = 0\n')
+            for i in range(130):
+                fh.write('def fn_%d():\n    return %d\n\n' % (i, i))
+        with open(small, 'w') as fh:
+            fh.write('a = 1\n')
+        skeleton = build_file_skeletons([big, small], line_threshold=100)
+        self.assertTrue(skeleton.startswith('[FILE SKELETON MAP -- read only target line ranges]'))
+        self.assertIn('--- %s (391 lines)' % big, skeleton)
+        self.assertIn('L5-L6: def fn_1()', skeleton)  # L<start>-L<end> map
+        self.assertNotIn(small, skeleton)  # short files are skipped
+        self.assertEqual(build_file_skeletons([small]), '')
+
+
+class TestH7AndH8(HarnessTestCase):
+    def test_sql_trailing_comma_and_parens(self):
+        self.assertEqual(check_sql_syntax('select a, from t', 'q.sql'),
+                         ['q.sql:1: trailing comma before FROM'])
+        grouped = 'select id\nfrom t\ngroup by id,\norder by id\n'
+        self.assertEqual(check_sql_syntax(grouped),
+                         ['<sql>:3: trailing comma before ORDER BY'])
+        self.assertEqual(check_sql_syntax('select (1 + (2\n'), ['<sql>:1: unbalanced parenthesis'])
+        self.assertEqual(check_sql_syntax('select 1\n)\n'), ['<sql>:2: unbalanced parenthesis'])
+        self.assertEqual(check_sql_syntax('select 1))\n'), ['<sql>:1: unbalanced parenthesis'])
+        # Parens/commas inside strings, comments and Jinja never reach the checks.
+        clean = ("select 'a,(b)' as s,\n"
+                 "       b -- , from (comment\n"
+                 "from {{ ref('m') }}\n"
+                 "where a = 'it''s'\n")
+        self.assertEqual(check_sql_syntax(clean), [])
+
+    def test_sql_jinja_and_comment_string_balance(self):
+        self.assertEqual(check_sql_syntax('{% if x %}\nselect 1\n'),
+                         ['<sql>:1: unbalanced Jinja tag'])
+        self.assertEqual(check_sql_syntax('{% for x in y %}\nselect 1\n{% endif %}\n'),
+                         ['<sql>:3: unbalanced Jinja tag'])
+        self.assertEqual(check_sql_syntax("select {{ ref('"), ['<sql>:1: unbalanced Jinja tag'])
+        self.assertEqual(check_sql_syntax('select 1 %}'), ['<sql>:1: unbalanced Jinja tag'])
+        self.assertEqual(check_sql_syntax("select 'abc\nfrom t"),
+                         ['<sql>:1: unclosed SQL comment or string literal'])
+        self.assertEqual(check_sql_syntax('select 1\n/* dangling\ntext'),
+                         ['<sql>:2: unclosed SQL comment or string literal'])
+        clean = ('{% if enabled %}\n'
+                 "select * from {{ ref('model_x') }}\n"
+                 "where ds = '{{ ds }}'  -- it''s (fine\n"
+                 '{% endif %}\n')
+        self.assertEqual(check_sql_syntax(clean), [])
+
+    def test_broken_local_sibling_import(self):
+        sibling, importer = self.path('helper.py'), self.path('importer.py')
+        with open(sibling, 'w') as fh:
+            fh.write('def real_fn():\n    return 1\n\n'
+                     'class RealClass:\n    pass\n\n'
+                     'CONST = 2\n__all__ = ["CONST"]\n')
+        with open(importer, 'w') as fh:
+            fh.write('from helper import real_fn, missing_name\n'
+                     'from helper import CONST\n'
+                     'from helper import *\n'
+                     'from .helper import RealClass\n'
+                     'import json\n')
+        self.assertEqual(check_allowed_files_syntax([importer]),
+                         ["%s:1: cannot import name 'missing_name' from 'helper'" % importer])
+        # Unparseable sibling is skipped rather than guessed at.
+        broken, bad_import = self.path('broken.py'), self.path('bad_import.py')
+        with open(broken, 'w') as fh:
+            fh.write('def broken(:\n')
+        with open(bad_import, 'w') as fh:
+            fh.write('from broken import anything\n')
+        self.assertEqual(check_allowed_files_syntax([bad_import]), [])
+        # Wired into the pre-flight for both .sql and .py.
+        sql = self.path('wired.sql')
+        with open(sql, 'w') as fh:
+            fh.write('select a,\nfrom t\n')
+        errors = check_allowed_files_syntax([sql, importer])
+        self.assertIn('%s:1: trailing comma before FROM' % sql, errors)
+        self.assertIn("%s:1: cannot import name 'missing_name' from 'helper'" % importer, errors)
+
+    def test_compact_stale_reads(self):
+        long_a, long_b = 'x' * 500, 'y' * 500
+        msgs = [{'role': 'user', 'content': 'go'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'r1', 'function': {'name': 'read_file',
+                                              'arguments': json.dumps({'path': 'a.py'})}},
+                    {'id': 'r2', 'function': {'name': 'view',
+                                              'arguments': json.dumps({'file_path': 'b.py'})}}]},
+                {'role': 'tool', 'tool_call_id': 'r1', 'content': long_a},
+                {'role': 'tool', 'tool_call_id': 'r2', 'content': long_b},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'e1', 'function': {'name': 'multi_edit',
+                                              'arguments': json.dumps({'path': 'a.py'})}},
+                    {'id': 'e2', 'function': {'name': 'write',
+                                              'arguments': json.dumps({'target_file': 'b.py'})}}]},
+                {'role': 'tool', 'tool_call_id': 'e1', 'content': 'ok'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'r3', 'function': {'name': 'read',
+                                              'arguments': json.dumps({'path': 'a.py'})}}]},
+                {'role': 'tool', 'tool_call_id': 'r3', 'content': 'z' * 500}]
+        new, count = compact_stale_reads(msgs, turn_index=5)
+        self.assertEqual(count, 2)
+        self.assertIsNot(new, msgs)
+        self.assertIn('[STALE READ COMPACTED: a.py was modified in a later turn', new[2]['content'])
+        self.assertIn('[STALE READ COMPACTED: b.py was modified in a later turn', new[3]['content'])
+        self.assertNotIn(long_a, new[2]['content'])
+        self.assertEqual(msgs[2]['content'], long_a)  # original list untouched
+        # Reads after the edit, edit results and short reads stay intact.
+        self.assertTrue(new[7] is msgs[7] and new[7]['content'] == 'z' * 500)
+        self.assertTrue(new[5] is msgs[5] and new[5]['content'] == 'ok')
+        self.assertEqual(compact_stale_reads(msgs, turn_index=4), (msgs, 0))
+        self.assertEqual(compact_stale_reads(msgs, turn_index=5, min_turn=6), (msgs, 0))
+        self.assertEqual(compact_stale_reads('nope', turn_index=5), ('nope', 0))
+        # Anthropic-style tool_result content blocks are compacted per block.
+        blocks = [{'role': 'user', 'content': 'go'},
+                  {'role': 'assistant', 'content': [
+                      {'type': 'tool_use', 'id': 'u1', 'name': 'read_file',
+                       'input': {'path': 'c.py'}}]},
+                  {'role': 'user', 'content': [
+                      {'type': 'tool_result', 'tool_use_id': 'u1', 'content': 'w' * 500},
+                      {'type': 'text', 'text': 'summary'}]},
+                  {'role': 'assistant', 'content': [
+                      {'type': 'tool_use', 'id': 'u2', 'name': 'edit',
+                       'input': {'path': 'c.py'}}]},
+                  {'role': 'user', 'content': [
+                      {'type': 'tool_result', 'tool_use_id': 'u2', 'content': 'done'}]}]
+        new_blocks, count = compact_stale_reads(blocks, turn_index=6)
+        self.assertEqual(count, 1)
+        self.assertIn('[STALE READ COMPACTED: c.py', new_blocks[2]['content'][0]['content'])
+        self.assertEqual(new_blocks[2]['content'][1]['text'], 'summary')
+        self.assertEqual(new_blocks[4]['content'][0]['content'], 'done')
+
+
+class TestH5LoopGuard(HarnessTestCase):
+    def test_detect_duplicate_tool_calls(self):
+        msgs = [{'role': 'user', 'content': 'fix it'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'function': {'name': 'edit',
+                                  'arguments': '{"path": "a.py", "old": "x"}'}}]},
+                {'role': 'tool', 'content': 'ok'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'function': {'name': 'edit',
+                                  'arguments': '{ "old" : "x" , "path":"a.py" }'}}]}]
+        self.assertEqual(detect_duplicate_tool_calls(msgs),
+                         ['duplicate tool call edit repeated with identical arguments'])
+        msgs[3]['tool_calls'][0]['function']['arguments'] = '{"path": "a.py", "old": "y"}'
+        self.assertEqual(detect_duplicate_tool_calls(msgs), [])
+        spaced = [{'role': 'user', 'content': 'go'},
+                  {'role': 'assistant', 'tool_calls': [
+                      {'function': {'name': 'edit', 'arguments': '{"path": "a.py"}'}}]},
+                  {'role': 'tool', 'content': 'ok'},
+                  {'role': 'assistant', 'tool_calls': [
+                      {'function': {'name': 'read', 'arguments': '{"path": "a.py"}'}}]},
+                  {'role': 'tool', 'content': 'ok'},
+                  {'role': 'assistant', 'tool_calls': [
+                      {'function': {'name': 'edit', 'arguments': '{"path": "a.py"}'}}]}]
+        self.assertEqual(detect_duplicate_tool_calls(spaced), [])
+
+    def test_proxy_injects_guard_loop_warning(self):
+        upstream, captured = _scripted_upstream([{'status': 200}] * 2)
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            dup_msgs = [{'role': 'user', 'content': 'fix it'},
+                        {'role': 'assistant', 'tool_calls': [
+                            {'function': {'name': 'edit', 'arguments': '{"path": "a.py"}'}}]},
+                        {'role': 'tool', 'content': 'ok'},
+                        {'role': 'assistant', 'tool_calls': [
+                            {'function': {'name': 'edit', 'arguments': '{ "path" : "a.py" }'}}]}]
+            body = json.dumps({'model': GLM, 'messages': dup_msgs}).encode()
+            for _ in range(2):
+                _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 2)
+        self.assertNotIn('GUARD LOOP WARNING', json.dumps(captured[0]))
+        warning = captured[1]['messages'][-1]['content']
+        self.assertIn('[GUARD LOOP WARNING: duplicate tool call edit repeated with identical arguments', warning)
+
+
+class TestProxyCircuitBreaker(HarnessTestCase):
+    def test_sticky_reset_and_demotion_on_upstream_500(self):
+        upstream, captured = _scripted_upstream([
+            {'status': 200, 'provider': 'z-ai'},
+            {'status': 500, 'provider': 'z-ai'},
+            {'status': 200, 'provider': 'z-ai'},
+        ])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            body = json.dumps({'model': GLM, 'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+            _post_chat(proxy.base_url, body)          # healthy turn -> provider pinned
+            self.assertEqual(proxy.sticky_provider, 'z-ai')
+            _post_chat(proxy.base_url, body)          # 500 -> circuit breaker demotes
+            self.assertEqual(proxy.degraded_providers, {'z-ai'})
+            self.assertIsNone(proxy.sticky_provider)  # degradation resets the pin
+            _post_chat(proxy.base_url, body)          # next request routes around it
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(captured[2]['provider']['order'][-1], 'z-ai')  # demoted to last
+        self.assertEqual(captured[2]['provider']['order'][0], 'novita')
+
+
+class TestReportAndCLI(HarnessTestCase):
+    RUNS = [{'task_id': 't1', 'status': 'succeeded', 'model': GLM, 'steps': 3, 'cost': 0.02},
+            {'task_id': 't2', 'status': 'succeeded', 'model': GLM, 'steps': 4, 'cost': 0.03,
+             'micro_repair_used': True},
+            {'task_id': 't3', 'status': 'validation_failed', 'model': DEEPSEEK, 'steps': 2,
+             'cost_usd': 0.01}]
+
+    def test_aggregate_benchmark_runs(self):
+        report = aggregate_benchmark_runs(self.RUNS)
+        self.assertEqual(report['total_runs'], 3)
+        self.assertEqual(report['pass_count'], 2)
+        self.assertAlmostEqual(report['pass_rate'], 2 / 3)
+        self.assertAlmostEqual(report['total_cost_usd'], 0.06)
+        self.assertEqual(report['median_steps'], 3.0)
+        self.assertEqual(report['micro_repair_count'], 1)
+        normalized = summarize_run({'status': 'Succeeded', 'cost': '0.02', 'steps': '3'})
+        self.assertEqual(normalized['status'], 'succeeded')
+        self.assertEqual(normalized['cost_usd'], 0.02)
+
+    def test_format_benchmark_markdown(self):
+        md = format_benchmark_markdown([], self.RUNS)
+        self.assertIn('# Benchmark Comparison: Baseline vs Guarded Harness', md)
+        self.assertIn('| Pass@1 (%) | 0.0 | 66.7 |', md)
+        self.assertIn('| Total Cost (USD) | 0.0000 | 0.0600 |', md)
+        self.assertIn('Runs compared: baseline 0, guarded 3.', md)
+
+    def test_cli_preflight(self):
+        clean, bad = self.path('ok.py'), self.path('nope.py')
+        with open(clean, 'w') as fh:
+            fh.write('a = 1\n')
+        with open(bad, 'w') as fh:
+            fh.write('def x(:\n')
+        self.assertEqual(cli_main(['preflight', clean]), 0)
+        self.assertEqual(cli_main(['preflight', bad]), 1)
+
+    def test_cli_skeleton(self):
+        big = self.path('big.py')
+        with open(big, 'w') as fh:
+            fh.write('x = 0\n')
+            for i in range(20):
+                fh.write('def fn_%d():\n    return %d\n\n' % (i, i))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli_main(['skeleton', big, '--threshold', '10']), 0)
+        self.assertIn('FILE SKELETON MAP', buf.getvalue())
+        self.assertIn('L5-L6: def fn_1()', buf.getvalue())
+
+    def test_cli_bench_report(self):
+        baseline = self.path('baseline.json')
+        guarded = self.path('guarded.json')
+        with open(baseline, 'w') as fh:
+            json.dump(self.RUNS, fh)
+        with open(guarded, 'w') as fh:
+            json.dump(self.RUNS[:1], fh)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli_main(['bench-report', '--baseline', baseline, '--guarded', guarded]), 0)
+        self.assertIn('# Benchmark Comparison: Baseline vs Guarded Harness', buf.getvalue())
+
+
+class TestH6ProviderHealthStore(HarnessTestCase):
+    def test_store_persistence_ttl_and_custom_clock(self):
+        self.assertEqual(DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, 600.0)
+        path = self.path('provider_health.json')
+        clock = {'now': 1000.0}
+        store = ProviderHealthStore(path, ttl_seconds=300)
+        store.set_sticky('z-ai', now=clock['now'])
+        self.assertEqual(store.get_sticky(now=clock['now']), 'z-ai')
+        store.mark_degraded('z-ai', now=clock['now'])
+        self.assertEqual(store.active_degraded(now=clock['now']), {'z-ai'})
+        self.assertIsNone(store.get_sticky(now=clock['now']))  # degraded is never pinned
+        # A second instance over the same file inherits the persisted state.
+        reloaded = ProviderHealthStore(path, ttl_seconds=300)
+        self.assertEqual(reloaded.active_degraded(now=clock['now']), {'z-ai'})
+        self.assertIsNone(reloaded.get_sticky(now=clock['now']))
+        # TTL expiration driven by custom now timestamps.
+        clock['now'] = 1301.0  # 301s after mark_degraded(1000) > ttl 300
+        self.assertEqual(reloaded.active_degraded(now=clock['now']), set())
+        self.assertIsNone(reloaded.get_sticky(now=clock['now']))
+        reloaded.set_sticky('novita', now=clock['now'])
+        self.assertEqual(reloaded.get_sticky(now=clock['now']), 'novita')
+        clock['now'] = 1602.0  # 301s after set_sticky(1301): sticky expired too
+        self.assertIsNone(reloaded.get_sticky(now=clock['now']))
+        self.assertEqual(reloaded.active_degraded(now=clock['now']), set())
+
+    def test_second_proxy_instance_inherits_store_state(self):
+        path = self.path('provider_health.json')
+        upstream, captured = _scripted_upstream([
+            {'status': 200, 'provider': 'z-ai'},
+            {'status': 500, 'provider': 'z-ai'},
+            {'status': 200, 'provider': 'novita'},
+        ])
+        url = 'http://127.0.0.1:%d' % upstream.server_port
+        body = json.dumps({'model': GLM, 'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+
+        def serve(proxy):
+            threading.Thread(target=proxy.serve_forever, daemon=True).start()
+
+        first = OpenRouterGuardProxy(lambda: None, upstream_url=url,
+                                     health_store=ProviderHealthStore(path))
+        serve(first)
+        try:
+            _post_chat(first.base_url, body)  # healthy turn -> pinned in memory and store
+            self.assertEqual(first.sticky_provider, 'z-ai')
+            self.assertEqual(ProviderHealthStore(path).get_sticky(), 'z-ai')
+            _post_chat(first.base_url, body)  # 500 -> demoted and persisted
+            self.assertEqual(first.degraded_providers, {'z-ai'})
+            peek = ProviderHealthStore(path)
+            self.assertEqual(peek.active_degraded(), {'z-ai'})
+            self.assertIsNone(peek.get_sticky())  # degradation cleared the pin on disk too
+        finally:
+            first.shutdown(); first.server_close()
+
+        second = OpenRouterGuardProxy(lambda: None, upstream_url=url,
+                                      health_store=ProviderHealthStore(path))
+        serve(second)
+        try:
+            # The second instance hydrates degraded + sticky state from the store.
+            self.assertEqual(second.degraded_providers, {'z-ai'})
+            self.assertIsNone(second.sticky_provider)
+            _post_chat(second.base_url, body)  # inherited degradation steers routing
+            self.assertEqual(captured[2]['provider']['order'][0], 'novita')
+            self.assertEqual(captured[2]['provider']['order'][-1], 'z-ai')
+            self.assertEqual(second.sticky_provider, 'novita')  # healthy fallback gets pinned
+        finally:
+            second.shutdown(); second.server_close()
+            upstream.shutdown(); upstream.server_close()
+
+        # A third instance inherits BOTH persisted facts: degraded z-ai and the
+        # sticky novita pin recorded while z-ai was demoted.
+        third_store = ProviderHealthStore(path)
+        self.assertEqual(third_store.active_degraded(), {'z-ai'})
+        self.assertEqual(third_store.get_sticky(), 'novita')
+        third = OpenRouterGuardProxy(lambda: None, upstream_url=url, health_store=third_store)
+        self.assertEqual(third.degraded_providers, {'z-ai'})
+        self.assertEqual(third.sticky_provider, 'novita')
+        third.server_close()
+
+
+class TestH8ProxyStaleReadCompaction(HarnessTestCase):
+    def test_proxy_compacts_stale_reads_from_turn_5(self):
+        upstream, captured = _scripted_upstream([{'status': 200}] * 5)
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        long_read = 'x' * 600
+        msgs = [{'role': 'user', 'content': 'update the file'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'r1', 'function': {'name': 'read_file',
+                                              'arguments': json.dumps({'path': 'a.py'})}}]},
+                {'role': 'tool', 'tool_call_id': 'r1', 'content': long_read},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'e1', 'function': {'name': 'edit',
+                                              'arguments': json.dumps({'path': 'a.py'})}}]},
+                {'role': 'tool', 'tool_call_id': 'e1', 'content': 'ok'}]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            for _ in range(5):
+                _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 5)
+        self.assertEqual(proxy.summary()['compacted_reads'], 1)  # only the turn >= 5 pass
+        self.assertNotIn('STALE READ COMPACTED', json.dumps(captured[3]))  # turn 4 untouched
+        self.assertNotIn('[STALE READ COMPACTED', json.dumps(captured[0]))
+        forwarded = captured[4]['messages'][2]['content']
+        self.assertIn('[STALE READ COMPACTED: a.py was modified in a later turn', forwarded)
+        self.assertNotIn(long_read, json.dumps(captured[4]))
+        # Later messages (edit result) pass through untouched.
+        self.assertEqual(captured[4]['messages'][4]['content'], 'ok')
+
+
+class TestTelemetry(HarnessTestCase):
+    def test_proxy_records_openinference_and_genai_spans(self):
+        self.assertIn('LLM', OPENINFERENCE_SPAN_KINDS)
+        self.assertIn('GUARDRAIL', OPENINFERENCE_SPAN_KINDS)
+        bad_py = self.path('bad.py')
+        with open(bad_py, 'w') as fh:
+            fh.write('def broken(:\n')
+        upstream, captured = _scripted_upstream([{'status': 200}] * 2)
+        tracer = HarnessTracer(service_name='harness-tests')
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                                     allowed_files=[bad_py], tracer=tracer)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            body = json.dumps({'model': GLM, 'messages': [{'role': 'user', 'content': 'go'}]}).encode()
+            for _ in range(2):
+                _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        spans = proxy.summary()['spans']
+        kinds = {span['attributes']['openinference.span.kind'] for span in spans}
+        self.assertEqual(kinds, {'LLM', 'GUARDRAIL'})
+        llm = next(s for s in spans if s['attributes']['openinference.span.kind'] == 'LLM')
+        self.assertEqual(llm['attributes']['gen_ai.system'], 'openrouter')
+        self.assertEqual(llm['attributes']['gen_ai.request.model'], GLM)
+        self.assertIn('gen_ai.response.id', llm['attributes'])
+        guard = next(s for s in spans if s['attributes']['openinference.span.kind'] == 'GUARDRAIL')
+        self.assertEqual(guard['attributes']['guardrail.name'], 'ast_preflight')
+        # The recorded spans convert into valid OTLP/HTTP JSON resourceSpans.
+        payload = tracer.to_otlp_payload()
+        json.dumps(payload)  # must be JSON-serializable end to end
+        resource = payload['resourceSpans']
+        self.assertEqual(len(resource), 1)
+        otlp_spans = resource[0]['scopeSpans'][0]['spans']
+        self.assertEqual(len(otlp_spans), len(spans))
+        for otlp_span in otlp_spans:
+            self.assertEqual(len(otlp_span['traceId']), 32)
+            self.assertEqual(len(otlp_span['spanId']), 16)
+            self.assertIsInstance(otlp_span['startTimeUnixNano'], str)
+        by_name = {s['name']: {a['key']: next(iter(a['value'].values()))
+                               for a in s['attributes']} for s in otlp_spans}
+        self.assertEqual(by_name['gen_ai.chat']['openinference.span.kind'], 'LLM')
+        self.assertEqual(by_name['gen_ai.chat']['gen_ai.request.model'], GLM)
+        tree = format_trace_tree(tracer.spans)
+        self.assertIn('trace %s' % tracer.trace_id, tree)
+        self.assertIn('[LLM] gen_ai.chat', tree)
+        self.assertIn('[GUARDRAIL] guard.ast_preflight', tree)
+
+    def test_flush_otlp_sends_arize_headers_to_stub_collector(self):
+        received = {}
+
+        class _Collector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                received['body'] = json.loads(self.rfile.read(length))
+                received['api_key'] = self.headers.get('api_key')
+                received['space_id'] = self.headers.get('space_id')
+                payload = b'{}'
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        tracer = HarnessTracer(service_name='harness-tests', arize_api_key='k-test',
+                               arize_space_id='s-test')
+        tracer.record_span('gen_ai.chat', kind='LLM', attributes={'gen_ai.request.model': GLM})
+        try:
+            ok = tracer.flush_otlp(endpoint='http://127.0.0.1:%d' % server.server_port)
+        finally:
+            server.shutdown(); server.server_close()
+        self.assertTrue(ok)
+        self.assertEqual(received['api_key'], 'k-test')
+        self.assertEqual(received['space_id'], 's-test')
+        spans = received['body']['resourceSpans'][0]['scopeSpans'][0]['spans']
+        self.assertEqual(spans[0]['name'], 'gen_ai.chat')
+
+
+class TestH9StateStatsAndCLI(HarnessTestCase):
+    def _make_state_dir(self, name):
+        state = self.path(name)
+        run1 = os.path.join(state, 'runs', 'r1')
+        run2 = os.path.join(state, 'runs', 'r2')
+        os.makedirs(run1)
+        os.makedirs(run2)
+        with open(os.path.join(run1, 'result.json'), 'w') as fh:
+            json.dump({'task_id': 'r1', 'status': 'succeeded', 'model': GLM,
+                       'steps': 3, 'cost': 0.02}, fh)
+        with open(os.path.join(run2, 'result.json'), 'w') as fh:
+            json.dump({'task_id': 'r2', 'status': 'validation_failed', 'model': DEEPSEEK,
+                       'steps': 2, 'cost_usd': 0.01, 'micro_repair_used': True}, fh)
+        return state, run1, run2
+
+    def test_scan_state_runs_and_stats_markdown(self):
+        state, _, _ = self._make_state_dir('state')
+        scanned = scan_state_runs(state)
+        self.assertEqual(len(scanned), 2)
+        self.assertEqual({run['task_id'] for run in scanned}, {'r1', 'r2'})
+        first = next(run for run in scanned if run['task_id'] == 'r1')
+        self.assertEqual(first['status'], 'succeeded')
+        self.assertEqual(first['cost_usd'], 0.02)
+        md = format_state_stats_markdown(state)
+        self.assertIn('# Live State Directory Stats', md)
+        self.assertIn(GLM, md)
+        self.assertIn(DEEPSEEK, md)
+        self.assertIn('| ALL | 2 | 50.0 |', md)
+        self.assertEqual(format_state_stats_markdown(self.path('missing')), 'No runs found.')
+
+    def test_cli_stats_and_trace_on_temp_state(self):
+        state, run1, _ = self._make_state_dir('state-cli')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli_main(['stats', '--state-dir', state]), 0)
+        self.assertIn('# Live State Directory Stats', buf.getvalue())
+        self.assertIn('| ALL | 2 | 50.0 |', buf.getvalue())
+
+        trace_id = 'b' * 32
+        spans = [
+            {'name': 'gen_ai.chat', 'span_id': 'a' * 16, 'trace_id': trace_id,
+             'parent_span_id': None, 'start_time_ns': 1000, 'end_time_ns': 2500,
+             'status': 'OK',
+             'attributes': {'openinference.span.kind': 'LLM',
+                            'gen_ai.request.model': GLM}},
+            {'name': 'guard.ast_preflight', 'span_id': 'c' * 16, 'trace_id': trace_id,
+             'parent_span_id': 'a' * 16, 'start_time_ns': 1200, 'end_time_ns': 1400,
+             'status': 'ERROR',
+             'attributes': {'openinference.span.kind': 'GUARDRAIL',
+                            'guardrail.name': 'ast_preflight'}},
+        ]
+        traces_path = os.path.join(run1, 'traces.jsonl')
+        with open(traces_path, 'w') as fh:
+            for span in spans:
+                fh.write(json.dumps(span) + '\n')
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli_main(['trace', run1]), 0)  # run-dir form finds traces.jsonl
+        self.assertIn('trace %s' % trace_id, buf.getvalue())
+        self.assertIn('[LLM] gen_ai.chat', buf.getvalue())
+        self.assertIn('[GUARDRAIL] guard.ast_preflight', buf.getvalue())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(cli_main(['trace', '--no-sync', traces_path]), 0)  # explicit file form
+        self.assertIn('[LLM] gen_ai.chat', buf.getvalue())
+
+        # Verify automatic Phoenix backfill sync on `harness trace` against a stub collector.
+        received = []
+
+        class _PhoenixStub(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                received.append(json.loads(self.rfile.read(length)))
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(b'{}')
+
+        collector = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PhoenixStub)
+        threading.Thread(target=collector.serve_forever, daemon=True).start()
+        endpoint = 'http://127.0.0.1:%d/v1/traces' % collector.server_port
+        try:
+            buf1 = io.StringIO()
+            with contextlib.redirect_stdout(buf1):
+                self.assertEqual(cli_main(['trace', '--state-dir', state, '--endpoint', endpoint]), 0)
+            self.assertIn('newly_synced=2 already_synced=0 pending=0', buf1.getvalue())
+            self.assertEqual(len(received), 2)
+
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                self.assertEqual(cli_main(['trace', '--state-dir', state, '--endpoint', endpoint]), 0)
+            self.assertIn('newly_synced=0 already_synced=2 pending=0', buf2.getvalue())
+            self.assertEqual(len(received), 2)
+        finally:
+            collector.shutdown()
+            collector.server_close()
+
+
+class TestH10SandboxAndFinops(HarnessTestCase):
+    """H-10: sandbox validation/locks/hashes + finops budget gate & settlement."""
+
+    def _task(self, **overrides):
+        task = {
+            'task_id': 'h10',
+            'directory': self.root,
+            'files': [self.path('target.py')],
+            'prompt': 'Change target.py to the required content.',
+            'test_argv': [sys.executable, '-c', 'pass'],
+        }
+        task.update(overrides)
+        return task
+
+    # ---- finops ----------------------------------------------------
+
+    def test_finops_number_validation(self):
+        self.assertEqual(number(16, 'max_steps'), 16)
+        self.assertEqual(number(0.15, 'max_cost_usd'), 0.15)
+        for bad in ('0.5', None, True, float('nan'), float('inf'), -0.01):
+            with self.assertRaisesRegex(GuardError, 'invalid_max_cost_usd'):
+                number(bad, 'max_cost_usd')
+
+    def test_finops_violation_step_cost_and_loop_checks(self):
+        def step(**changes):
+            message = {'finish': 'tool-calls', 'content': []}
+            message.update(changes)
+            return message
+
+        def snap(cost, *messages):
+            return {'cost': cost, 'messages': [('assistant', m) for m in messages]}
+
+        self.assertIsNone(violation(metrics(snap(0.01, step(), step())), 0.15, 16))
+        self.assertEqual(violation(metrics(snap(0.20, step())), 0.15, 16), 'cost_limit')
+        self.assertEqual(violation(metrics(snap(0.01, step(), step(), step())), 0.15, 2),
+                         'step_limit')
+        # cost is judged before steps: a spent budget is the primary signal
+        self.assertEqual(violation(metrics(snap(0.20, step(), step(), step())), 0.15, 2),
+                         'cost_limit')
+        self.assertEqual(violation(metrics(snap(0.01, step(error={'type': 'transport'}))),
+                                   0.15, 16), 'model_error')
+        self.assertEqual(violation(metrics({'cost': 0.01, 'messages': [('compaction', {})]}),
+                                   0.15, 16), 'compaction')
+
+    def test_finops_local_settlement_and_prior_cost(self):
+        snap_ok = {
+            'cost': 0.05,
+            'messages': [
+                ('assistant', {'finish': 'stop', 'cost': 0.05, 'content': []}),
+                ('assistant', {'error': {'type': 'guard'}, 'content': []}),
+            ],
+        }
+        proxy_ok = {
+            'blocked_count': 1,
+            'dispatched': [
+                {'completed': True, 'http_status': 200, 'error': None, 'generation_id': 'gen-1'},
+            ],
+        }
+        self.assertTrue(can_settle_from_proxy_local(snap_ok, proxy_ok))
+        self.assertFalse(can_settle_from_proxy_local(snap_ok, {'blocked_count': 0, 'dispatched': []}))
+        self.assertFalse(can_settle_from_proxy_local(None, proxy_ok))
+
+        state = self.path('state-finops')
+        for run_name, payload in [
+            ('r1', {'task_id': 't1', 'cost': 0.02}),
+            ('r2', {'task_id': 't1', 'cost': 0.03}),
+            ('r3', {'task_id': 't2', 'cost': 0.10}),
+        ]:
+            run_dir = os.path.join(state, 'runs', run_name)
+            os.makedirs(run_dir, exist_ok=True)
+            with open(os.path.join(run_dir, 'result.json'), 'w') as fh:
+                json.dump(payload, fh)
+        self.assertAlmostEqual(prior_cost(state, 't1'), 0.05, places=6)
+        self.assertAlmostEqual(prior_cost(state, 't2'), 0.10, places=6)
+        self.assertEqual(prior_cost(state, 'missing-task'), 0.0)
+
+    # ---- sandbox ---------------------------------------------------
+
+    def test_sandbox_validate_task_schema_and_boundary(self):
+        validated = validate_task(self._task())
+        self.assertEqual(validated['task_id'], 'h10')
+        missing = self._task()
+        del missing['prompt']
+        with self.assertRaisesRegex(GuardError, 'prompt_required'):
+            validate_task(missing)
+        with self.assertRaisesRegex(GuardError, 'exactly_one_to_three_files_required'):
+            validate_task(self._task(files=[self.path(f'{i}.py') for i in range(4)]))
+        with self.assertRaisesRegex(GuardError, 'file_paths_must_be_absolute'):
+            validate_task(self._task(files=['a.py']))
+        with self.assertRaisesRegex(GuardError, 'executable_must_be_an_existing_absolute_path'):
+            validate_task(self._task(test_argv=['pytest', '-q']))
+        with self.assertRaisesRegex(GuardError, 'worktree_files_must_be_under_directory'):
+            validate_task(self._task(worktree=True, files=['/tmp/outside_harness_test.py']))
+
+    def test_sandbox_locks_exclusive_and_conflict(self):
+        target = self.path('a.py')
+        other = self.path('b.py')
+        state = self.path('lock-state')
+        with locks(state, [target], 'task-1'):
+            with self.assertRaisesRegex(GuardError, 'files_or_task_already_running'):
+                with locks(state, [target], 'task-2'):
+                    pass
+            with self.assertRaisesRegex(GuardError, 'files_or_task_already_running'):
+                with locks(state, [other], 'task-1'):
+                    pass
+            with locks(state, [other], 'task-2'):
+                pass
+        with locks(state, [target], 'task-1'):
+            pass
+
+    def test_sandbox_file_hashes_digest_map(self):
+        alpha = self.path('alpha.py')
+        beta = self.path('beta.py')
+        with open(alpha, 'w') as fh:
+            fh.write('value = 1\n')
+        with open(beta, 'w') as fh:
+            fh.write('value = 2\n')
+        missing = self.path('never-created.py')
+        self.assertEqual(file_hashes([alpha, beta, missing]), {
+            alpha: hashlib.sha256(b'value = 1\n').hexdigest(),
+            beta: hashlib.sha256(b'value = 2\n').hexdigest(),
+            missing: None,
+        })
+
+    def test_sandbox_reexports_finops_single_source_of_truth(self):
+        import harness.finops as finops_mod
+        import harness.sandbox as sandbox_mod
+
+        shared = (
+            'number', 'private_write', 'private_log', 'event',
+            'request_records', 'capture_requests', 'resolved_cost',
+            'fetch_generation', 'fetch_generation_settled', '_reconcile_locked',
+            'reconcile_run', 'build_unexposed_settlement_evidence',
+            'auto_reconcile_from_proxy', 'locks', 'prior_cost',
+            'connect', 'verify_db', 'snapshot', 'metrics',
+            'violation', 'can_settle_from_proxy_local',
+        )
+        for name in shared:
+            self.assertIs(getattr(sandbox_mod, name), getattr(finops_mod, name), name)
+        self.assertIs(sandbox_mod.reconcile_run, finops_mod.reconcile_run)
+        self.assertIs(sandbox_mod.violation, finops_mod.violation)
+
+    def test_env_var_configurable_paths(self):
+        import importlib
+        import harness.finops as finops_mod
+        import harness.sandbox as sandbox_mod
+
+        custom_state = self.path('custom-state')
+        custom_db = self.path('custom.db')
+        custom_cli = self.path('custom-opencode-cli')
+        saved = {k: os.environ.get(k) for k in (
+            'HARNESS_STATE_DIR', 'HARNESS_DB', 'OPENCODE_DB', 'HARNESS_CLI', 'OPENCODE_CLI'
+        )}
+        try:
+            os.environ['HARNESS_STATE_DIR'] = custom_state
+            os.environ['HARNESS_DB'] = custom_db
+            os.environ['HARNESS_CLI'] = custom_cli
+            importlib.reload(finops_mod)
+            importlib.reload(sandbox_mod)
+            self.assertEqual(str(finops_mod.STATE), custom_state)
+            self.assertEqual(str(sandbox_mod.STATE), custom_state)
+            self.assertEqual(str(finops_mod.DB), custom_db)
+            self.assertEqual(str(sandbox_mod.DB), custom_db)
+            self.assertEqual(sandbox_mod.CLI, custom_cli)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+            importlib.reload(finops_mod)
+            importlib.reload(sandbox_mod)
+
+
+class TestFinopsAndSandboxUnit(unittest.TestCase):
+    """Unit tests for harness.finops and harness.sandbox using temp dirs and synthetic SQLite DBs."""
+
+    def _init_db(self, db_path, sessions=(), messages=()):
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL)')
+            conn.execute('CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT)')
+            conn.executemany('INSERT INTO session_v2 (id, cost) VALUES (?, ?)', sessions)
+            conn.executemany(
+                'INSERT INTO session_message (session_id, type, data) VALUES (?, ?, ?)',
+                [(sid, kind, json.dumps(data)) for sid, kind, data in messages],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _valid_task(self, root, **overrides):
+        target = os.path.join(root, 'target.py')
+        task = {
+            'task_id': 'unit_task-1',
+            'directory': root,
+            'files': [target],
+            'prompt': 'Update target.py cleanly.',
+            'test_argv': [sys.executable, '-c', 'pass'],
+        }
+        task.update(overrides)
+        return task
+
+    def test_finops_sqlite_connect_verify_snapshot_metrics_violation_and_settle(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_db = os.path.join(tmp, 'empty.db')
+            sqlite3.connect(bad_db).close()
+            with self.assertRaises(sqlite3.OperationalError):
+                verify_db(bad_db)
+
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(
+                db_path,
+                sessions=[('ses_1', 0.05)],
+                messages=[
+                    ('ses_1', 'assistant', {
+                        'id': 'gen-abc123',
+                        'finish': 'tool-calls',
+                        'cost': 0.02,
+                        'content': [
+                            {'type': 'tool', 'name': 'read', 'state': {
+                                'status': 'completed',
+                                'input': {'path': '/a.py'},
+                                'content': 'x = 1',
+                            }},
+                        ],
+                    }),
+                    ('ses_1', 'assistant', {'finish': 'stop', 'cost': 0.03, 'content': []}),
+                ],
+            )
+            verify_db(db_path)
+            conn = connect(db_path)
+            try:
+                row = conn.execute('SELECT cost FROM session_v2 WHERE id=?', ('ses_1',)).fetchone()
+                self.assertAlmostEqual(row[0], 0.05)
+            finally:
+                conn.close()
+
+            self.assertIsNone(snapshot(db_path, 'missing_sid'))
+            snap = snapshot(db_path, 'ses_1')
+            self.assertIsNotNone(snap)
+            self.assertAlmostEqual(snap['cost'], 0.05)
+            m = metrics(snap)
+            self.assertEqual(m['steps'], 2)
+            self.assertFalse(m['compact'])
+            self.assertFalse(m['model_error'])
+            self.assertFalse(m['unfinished'])
+            self.assertEqual(m['reads'], 1)
+            self.assertEqual(m['file_reads'], 1)
+
+            self.assertIsNone(violation(m, 0.15, 16))
+            self.assertEqual(violation(m, 0.05, 16), 'cost_limit')
+            self.assertEqual(violation(m, 0.15, 1), 'step_limit')
+
+            err_snap = {
+                'cost': 0.01,
+                'messages': [
+                    ('assistant', {'finish': 'tool-calls', 'content': [
+                        {'type': 'tool', 'name': 'bash', 'state': {'status': 'error', 'error': 'boom'}},
+                        {'type': 'tool', 'name': 'bash', 'state': {'status': 'error', 'error': 'boom'}},
+                    ]}),
+                ],
+            }
+            self.assertEqual(violation(metrics(err_snap), 0.15, 16), 'repeated_tool_error')
+
+            read_snap = {
+                'cost': 0.01,
+                'messages': [
+                    ('assistant', {'finish': 'tool-calls', 'content': [
+                        {'type': 'tool', 'name': 'read', 'state': {'status': 'completed', 'input': {'path': '/a.py'}, 'content': 'same'}},
+                        {'type': 'tool', 'name': 'read', 'state': {'status': 'completed', 'input': {'path': '/a.py'}, 'content': 'same'}},
+                        {'type': 'tool', 'name': 'read', 'state': {'status': 'completed', 'input': {'path': '/a.py'}, 'content': 'same'}},
+                    ]}),
+                ],
+            }
+            self.assertEqual(violation(metrics(read_snap), 0.15, 16), 'repeated_identical_read')
+
+            snap_blocked = {
+                'cost': 0.05,
+                'messages': snap['messages'] + [('assistant', {'error': {'type': 'guard'}, 'content': []})],
+            }
+            proxy_ok = {
+                'blocked_count': 1,
+                'dispatched': [
+                    {'completed': True, 'http_status': 200, 'error': None, 'generation_id': 'gen-abc123'},
+                    {'completed': True, 'http_status': 200, 'error': None, 'generation_id': 'gen-def456'},
+                ],
+            }
+            self.assertTrue(can_settle_from_proxy_local(snap_blocked, proxy_ok))
+
+    def test_finops_request_records_capture_resolved_and_prior_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = os.path.join(tmp, 'runs', 'r1')
+            os.makedirs(run_dir)
+            snap = {
+                'cost': 0.03,
+                'messages': [
+                    ('assistant', {'id': 'gen-local1', 'finish': 'tool-calls', 'cost': 0.02, 'tokens': {'input': 10}}),
+                    ('assistant', {'finish': 'stop', 'cost': 0.01}),
+                    ('assistant', {'error': {'type': 'guard'}}),
+                ],
+            }
+            proxy_summary = {
+                'blocked_count': 1,
+                'dispatched': [
+                    {'completed': True, 'http_status': 200, 'generation_id': 'gen-local1'},
+                    {'completed': True, 'http_status': 200, 'generation_id': 'gen-proxy2'},
+                ],
+            }
+            recs = request_records(snap, proxy_summary)
+            self.assertEqual(len(recs), 3)
+            self.assertEqual(recs[0]['identity_status'], 'recorded')
+            self.assertEqual(recs[1]['identity_status'], 'recorded_by_proxy')
+            self.assertEqual(recs[1]['provider_request_ids'], ['gen-proxy2'])
+            self.assertEqual(recs[2]['identity_status'], 'blocked_before_dispatch')
+            self.assertEqual(recs[2]['state'], 'blocked_locally')
+
+            capture_requests(run_dir, 'ses_cap', snap, proxy_summary)
+            req_path = os.path.join(run_dir, 'requests.json')
+            events_path = os.path.join(run_dir, 'events.jsonl')
+            self.assertTrue(os.path.exists(req_path))
+            self.assertTrue(os.path.exists(events_path))
+            with open(events_path) as fh:
+                lines_before = fh.readlines()
+            capture_requests(run_dir, 'ses_cap', snap, proxy_summary)
+            with open(events_path) as fh:
+                self.assertEqual(len(fh.readlines()), len(lines_before))
+
+            res_path = os.path.join(run_dir, 'result.json')
+            with open(res_path, 'w') as fh:
+                json.dump({'task_id': 't-cost', 'session_id': 'ses_cap', 'cost': 0.03}, fh)
+            self.assertAlmostEqual(resolved_cost(res_path, {'task_id': 't-cost', 'session_id': 'ses_cap', 'cost': 0.03}), 0.03)
+
+            with open(res_path, 'w') as fh:
+                json.dump({'task_id': 't-cost', 'session_id': 'ses_cap', 'cost': None, 'observed_cost': 0.03}, fh)
+            with self.assertRaisesRegex(GuardError, 'prior_cost_unknown_reconcile_before_retry'):
+                resolved_cost(res_path, {'task_id': 't-cost', 'session_id': 'ses_cap', 'cost': None})
+
+            with open(res_path, 'rb') as fh:
+                res_sha = hashlib.sha256(fh.read()).hexdigest()
+            recon_path = os.path.join(run_dir, 'billing-reconciliation.json')
+            with open(recon_path, 'w') as fh:
+                json.dump({
+                    'schema': 'verified_billing.v1',
+                    'task_id': 't-cost',
+                    'session_id': 'ses_cap',
+                    'result_sha256': res_sha,
+                    'cost': 0.042,
+                }, fh)
+            self.assertAlmostEqual(prior_cost(tmp, 't-cost'), 0.042)
+
+    def test_finops_reconcile_run_and_auto_reconcile_from_proxy(self):
+        def stub_fetch(gid):
+            return {
+                'id': gid,
+                'finish_reason': 'stop',
+                'total_cost': 0.042,
+                'native_tokens_prompt': 100,
+                'native_tokens_completion': 50,
+                'tokens_prompt': 100,
+                'tokens_completion': 50,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+
+            run1 = os.path.join(tmp, 'runs', 'run-1')
+            os.makedirs(run1)
+            res1 = {'task_id': 't-rec', 'session_id': 'ses_r1', 'status': 'blocked', 'cost': None, 'observed_cost': 0.0}
+            with open(os.path.join(run1, 'result.json'), 'w') as fh:
+                json.dump(res1, fh)
+            with open(os.path.join(run1, 'requests.json'), 'w') as fh:
+                json.dump({
+                    'session_id': 'ses_r1',
+                    'requests': [{
+                        'ordinal': 1,
+                        'state': 'finished',
+                        'cost': None,
+                        'provider_request_ids': ['gen-stub1'],
+                    }],
+                }, fh)
+
+            rec1 = reconcile_run(
+                run1,
+                {'session_id': 'ses_r1', 'requests': [{'ordinal': 1, 'generation_id': 'gen-stub1'}]},
+                fetch=stub_fetch,
+                state=tmp,
+                db=db_path,
+            )
+            self.assertEqual(rec1['schema'], 'verified_billing.v1')
+            self.assertAlmostEqual(rec1['cost'], 0.042)
+            self.assertTrue(os.path.exists(os.path.join(run1, 'billing-reconciliation.json')))
+            with self.assertRaisesRegex(GuardError, 'already_reconciled'):
+                reconcile_run(
+                    run1,
+                    {'session_id': 'ses_r1', 'requests': [{'ordinal': 1, 'generation_id': 'gen-stub1'}]},
+                    fetch=stub_fetch,
+                    state=tmp,
+                    db=db_path,
+                )
+
+            run2 = os.path.join(tmp, 'runs', 'run-2')
+            os.makedirs(run2)
+            res2_path = os.path.join(run2, 'result.json')
+            res2 = {'task_id': 't-auto', 'session_id': 'ses_r2', 'status': 'blocked', 'cost': None, 'observed_cost': 0.0}
+            with open(res2_path, 'w') as fh:
+                json.dump(res2, fh)
+            with open(os.path.join(run2, 'requests.json'), 'w') as fh:
+                json.dump({
+                    'session_id': 'ses_r2',
+                    'requests': [{
+                        'ordinal': 1,
+                        'state': 'finished',
+                        'cost': None,
+                        'provider_request_ids': ['gen-stub2'],
+                    }],
+                    'proxy': {
+                        'dispatched': [{'generation_id': 'gen-stub2', 'completed': True}],
+                    },
+                }, fh)
+
+            rec2 = auto_reconcile_from_proxy(run2, res2_path, res2, fetch=stub_fetch, db=db_path)
+            self.assertIsNotNone(rec2)
+            self.assertAlmostEqual(rec2['cost'], 0.042)
+            self.assertAlmostEqual(resolved_cost(res2_path, res2), 0.042)
+
+    def test_finops_locks_exclusive_and_contention(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'a.py')
+            with finops_locks(tmp, [target], 'task-lock'):
+                with self.assertRaisesRegex(GuardError, 'files_or_task_already_running'):
+                    with finops_locks(tmp, [target], 'task-other'):
+                        pass
+                with self.assertRaisesRegex(GuardError, 'files_or_task_already_running'):
+                    with finops_locks(tmp, [], 'task-lock'):
+                        pass
+
+    def test_sandbox_validate_task_bounds_and_traversal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok = validate_task(self._valid_task(tmp))
+            self.assertEqual(ok['task_id'], 'unit_task-1')
+            self.assertEqual(ok['directory'], os.path.realpath(tmp))
+
+            for bad_id in ('', 'bad/id', '../escape', 'a' * 101):
+                with self.assertRaisesRegex(GuardError, 'invalid_task_id'):
+                    validate_task(self._valid_task(tmp, task_id=bad_id))
+
+            for bad_steps in (0, -1, 1.5, 26):
+                with self.assertRaisesRegex(GuardError, 'invalid_max_steps'):
+                    validate_task(self._valid_task(tmp, max_steps=bad_steps, limit_reason='ok'))
+            with self.assertRaisesRegex(GuardError, 'limit_increase_requires_written_reason'):
+                validate_task(self._valid_task(tmp, max_steps=20))
+            self.assertEqual(validate_task(self._valid_task(tmp, max_steps=20, limit_reason='extra'))['max_steps'], 20)
+
+            for bad_cost in (-0.01, 0, 0.31):
+                with self.assertRaisesRegex(GuardError, 'invalid_max_cost_usd'):
+                    validate_task(self._valid_task(tmp, max_cost_usd=bad_cost, limit_reason='ok'))
+            with self.assertRaisesRegex(GuardError, 'limit_increase_requires_written_reason'):
+                validate_task(self._valid_task(tmp, max_cost_usd=0.20))
+
+            with self.assertRaisesRegex(GuardError, 'file_paths_must_be_absolute'):
+                validate_task(self._valid_task(tmp, files=['../outside.py']))
+            with self.assertRaisesRegex(GuardError, 'invalid_file_target'):
+                validate_task(self._valid_task(tmp, files=[os.path.join(tmp, '*.py')]))
+            with self.assertRaisesRegex(GuardError, 'worktree_files_must_be_under_directory'):
+                outside = os.path.join(tmp, 'sub', '..', 'outside.py')
+                sub = os.path.join(tmp, 'sub')
+                os.makedirs(sub)
+                validate_task(self._valid_task(sub, worktree=True, files=[outside]))
+
+    def test_sandbox_config_for_and_verify_permissions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = validate_task(self._valid_task(tmp))
+            cfg = config_for(task, base_url='http://127.0.0.1:9999')
+            self.assertEqual(cfg['providers']['openrouter']['settings']['baseURL'], 'http://127.0.0.1:9999')
+            perms = cfg['agents']['guarded_worker']['permissions']
+            payload = {'data': [{'id': 'guarded_worker', 'steps': task['max_steps'], 'permissions': perms}]}
+            verify_permissions(payload, task)
+
+            patch_task = validate_task(self._valid_task(
+                tmp, mode='patch', patch_file=os.path.join(tmp, 'fix.patch'),
+            ))
+            patch_cfg = config_for(patch_task)
+            verify_permissions({'data': [{
+                'id': 'guarded_worker',
+                'steps': patch_task['max_steps'],
+                'permissions': patch_cfg['agents']['guarded_worker']['permissions'],
+            }]}, patch_task)
+
+            with self.assertRaisesRegex(GuardError, 'unsupported_agent_model'):
+                verify_permissions({'data': [{'id': 'guarded_worker', 'model': {'providerID': 'bad', 'id': 'm'}}]}, task)
+            with self.assertRaisesRegex(GuardError, 'effective_agent_or_steps_mismatch'):
+                verify_permissions({'data': [{'id': 'guarded_worker', 'steps': 99, 'permissions': perms}]}, task)
+            with self.assertRaisesRegex(GuardError, 'effective_catch_all_deny_missing'):
+                verify_permissions({'data': [{'id': 'guarded_worker', 'steps': task['max_steps'], 'permissions': perms[1:]}]}, task)
+            with self.assertRaisesRegex(GuardError, 'effective_permissions_too_broad'):
+                too_broad = perms + [{'action': 'bash', 'resource': '*', 'effect': 'allow'}]
+                verify_permissions({'data': [{'id': 'guarded_worker', 'steps': task['max_steps'], 'permissions': too_broad}]}, task)
+            with self.assertRaisesRegex(GuardError, 'effective_file_permissions_missing'):
+                verify_permissions({'data': [{'id': 'guarded_worker', 'steps': task['max_steps'], 'permissions': perms[:1]}]}, task)
+
+    def test_sandbox_file_hashes_capture_files_and_execute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'mod.py')
+            missing = os.path.join(tmp, 'missing.py')
+            with open(target, 'w') as fh:
+                fh.write('x = 1\n')
+            self.assertEqual(file_hashes([target, missing]), {
+                target: hashlib.sha256(b'x = 1\n').hexdigest(),
+                missing: None,
+            })
+
+            run_dir = os.path.join(tmp, 'run')
+            os.makedirs(run_dir)
+            capture_files(run_dir, [target])
+            self.assertTrue(os.path.exists(os.path.join(run_dir, 'files.before.json')))
+            self.assertTrue(os.path.exists(os.path.join(run_dir, 'files.latest.json')))
+
+            with open(target, 'w') as fh:
+                fh.write('x = 2\n')
+            capture_files(run_dir, [target])
+            with open(os.path.join(run_dir, 'changes.patch')) as fh:
+                patch_text = fh.read()
+            self.assertIn('-x = 1', patch_text)
+            self.assertIn('+x = 2', patch_text)
+            self.assertTrue(os.path.exists(os.path.join(run_dir, 'events.jsonl')))
+
+            log_path = os.path.join(tmp, 'exec.log')
+            rc = execute([sys.executable, '-c', "print('ok')"], tmp, 10, log_path)
+            self.assertEqual(rc, 0)
+            with open(log_path) as fh:
+                self.assertEqual(fh.read().strip(), 'ok')
+
+            with self.assertRaisesRegex(GuardError, 'command_timeout'):
+                execute([sys.executable, '-c', 'import time; time.sleep(5)'], tmp, 0.1, log_path)
+
+    def test_cli_serve_and_run_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            url_file = os.path.join(tmp, 'proxy_url.json')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(['serve', '--duration-seconds', '0.05', '--print-url-file', url_file])
+            self.assertEqual(rc, 0)
+            info = json.loads(buf.getvalue().strip())
+            self.assertTrue(info['base_url'].startswith('http://127.0.0.1:'))
+            with open(url_file, 'r', encoding='utf-8') as fh:
+                self.assertEqual(json.load(fh), info)
+
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            manifest_path = os.path.join(tmp, 'task.json')
+            state_dir = os.path.join(tmp, 'state')
+            with open(manifest_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'cli-check-1',
+                    'directory': tmp,
+                    'files': [target],
+                    'prompt': 'Check target.py',
+                    'test_argv': [sys.executable, '-c', 'pass'],
+                }, fh)
+            run_buf = io.StringIO()
+            with contextlib.redirect_stdout(run_buf):
+                rc_run = cli_main(['run', '--check', '--state-dir', state_dir, manifest_path])
+            self.assertEqual(rc_run, 0)
+            run_out = json.loads(run_buf.getvalue())
+            self.assertIn(run_out['status'], ('passed', 'validated', 'configuration_verified_no_model_call'))
+
+
+class TestEgressAndSqlGuards(HarnessTestCase):
+    def test_forbidden_egress_keys_and_check_egress_payload(self):
+        self.assertIn('raw_rows', FORBIDDEN_EGRESS_KEYS)
+        self.assertIn('duckdb_rows', FORBIDDEN_EGRESS_KEYS)
+        self.assertIn('connection_string', FORBIDDEN_EGRESS_KEYS)
+
+        clean_payload = {
+            'model': GLM,
+            'messages': [{'role': 'user', 'content': 'summarize metrics'}],
+            'metadata': {'run_id': 'r1'},
+        }
+        self.assertEqual(check_egress_payload(clean_payload, allowed_models=[GLM]), [])
+
+        bad_key_payload = {
+            'model': GLM,
+            'messages': [{'role': 'user', 'content': 'hi'}],
+            'metadata': {'raw_rows': [{'id': 1}]},
+        }
+        violations = check_egress_payload(bad_key_payload)
+        self.assertTrue(any('forbidden egress key: body.metadata.raw_rows' in v for v in violations), violations)
+
+        secret_payload = {
+            'model': GLM,
+            'messages': [
+                {'role': 'user', 'content': 'token is sk-or-v1-abcdef123456'},
+                {'role': 'assistant', 'content': [{'type': 'text', 'text': '-----BEGIN RSA PRIVATE KEY-----'}]},
+            ],
+        }
+        secret_violations = check_egress_payload(secret_payload)
+        self.assertTrue(any('sk-or-v1-' in v for v in secret_violations), secret_violations)
+        self.assertTrue(any('PRIVATE KEY-----' in v for v in secret_violations), secret_violations)
+
+        model_violations = check_egress_payload(clean_payload, allowed_models=[DEEPSEEK])
+        self.assertTrue(any('disallowed model' in v for v in model_violations), model_violations)
+
+        oversized_payload = {
+            'model': GLM,
+            'messages': [{'role': 'user', 'content': 'x' * 300}],
+        }
+        size_violations = check_egress_payload(oversized_payload, max_payload_bytes=100)
+        self.assertTrue(any('exceeds max_payload_bytes' in v for v in size_violations), size_violations)
+
+    def test_check_readonly_sql_tool_calls(self):
+        safe_msgs = [
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'q1', 'function': {'name': 'query_warehouse',
+                                          'arguments': json.dumps({'sql': "SELECT id FROM orders WHERE status != 'DROP';"})}},
+            ]},
+        ]
+        self.assertEqual(check_readonly_sql_tool_calls(safe_msgs), [])
+
+        unsafe_msgs = [
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'q2', 'function': {'name': 'execute_sql',
+                                          'arguments': json.dumps({'sql': 'SELECT 1; DROP TABLE users'})}},
+                {'id': 'q3', 'function': {'name': 'run_sql',
+                                          'arguments': json.dumps({'query': 'SELECT a, FROM orders'})}},
+            ]},
+        ]
+        violations = check_readonly_sql_tool_calls(unsafe_msgs)
+        self.assertTrue(any('multi-statement SQL injection' in v for v in violations), violations)
+        self.assertTrue(any('unsafe SQL keyword DROP' in v for v in violations), violations)
+        self.assertTrue(any('trailing comma before FROM' in v for v in violations), violations)
+
+    def test_semantic_oscillation_in_detect_duplicate_tool_calls(self):
+        table_oscillation = [
+            {'role': 'user', 'content': 'inspect orders'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'c1', 'function': {'name': 'query_warehouse',
+                                          'arguments': json.dumps({'sql': 'SELECT count(*) FROM orders'})}}]},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': '10'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'c2', 'function': {'name': 'query_warehouse',
+                                          'arguments': json.dumps({'sql': 'SELECT sum(total) FROM orders'})}}]},
+            {'role': 'tool', 'tool_call_id': 'c2', 'content': '100'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'c3', 'function': {'name': 'query_warehouse',
+                                          'arguments': json.dumps({'sql': 'SELECT max(id) FROM orders'})}}]},
+            {'role': 'tool', 'tool_call_id': 'c3', 'content': '50'},
+        ]
+        warnings = detect_duplicate_tool_calls(table_oscillation)
+        self.assertTrue(any('semantic tool oscillation: query_warehouse' in w for w in warnings), warnings)
+
+        error_oscillation = [
+            {'role': 'user', 'content': 'run tests'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'b1', 'function': {'name': 'bash',
+                                          'arguments': json.dumps({'command': 'pytest tests/a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'b1', 'content': 'Error: module foo not found\ndetails 1'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'b2', 'function': {'name': 'bash',
+                                          'arguments': json.dumps({'command': 'pytest tests/b.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'b2', 'content': 'Error: module foo not found\ndetails 2'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'b3', 'function': {'name': 'bash',
+                                          'arguments': json.dumps({'command': 'pytest tests/c.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'b3', 'content': 'Error: module foo not found\ndetails 3'},
+        ]
+        err_warnings = detect_duplicate_tool_calls(error_oscillation)
+        self.assertTrue(any('semantic tool oscillation: bash failed 3 times' in w for w in err_warnings), err_warnings)
+
+    def test_proxy_enforces_egress_guard_and_readonly_sql(self):
+        upstream, captured = _scripted_upstream([{'status': 200}] * 2)
+        proxy = OpenRouterGuardProxy(
+            lambda: None,
+            upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+            allowed_models=[GLM],
+            enforce_egress_guard=True,
+            enforce_readonly_sql=True,
+        )
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            blocked_body = json.dumps({
+                'model': GLM,
+                'messages': [{'role': 'user', 'content': 'hi'}],
+                'extra': {'raw_rows': [1, 2, 3]},
+            }).encode()
+            status_blocked = _post_chat(proxy.base_url, blocked_body)
+
+            sql_body = json.dumps({
+                'model': GLM,
+                'messages': [
+                    {'role': 'user', 'content': 'clean up'},
+                    {'role': 'assistant', 'tool_calls': [
+                        {'id': 's1', 'function': {'name': 'sql_query',
+                                                  'arguments': json.dumps({'sql': 'DELETE FROM orders'})}}]},
+                    {'role': 'tool', 'tool_call_id': 's1', 'content': 'ok'},
+                ],
+            }).encode()
+            status_sql = _post_chat(proxy.base_url, sql_body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+
+        self.assertEqual(status_blocked, 400)
+        self.assertEqual(proxy.blocked_reason, 'egress_guard_blocked')
+        self.assertEqual(status_sql, 200)
+        self.assertEqual(len(captured), 1)
+        self.assertIn('[SQL GUARD ERROR: unsafe SQL keyword DELETE in sql_query',
+                      captured[0]['messages'][-1]['content'])
+
+
+class TestSmlCostManifestAndEscalation(HarnessTestCase):
+    def test_export_sml_cost_manifest_settled_and_atomic_write(self):
+        run_dir = self.path('run-1')
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, 'result.json'), 'w') as fh:
+            json.dump({
+                'task_id': 't1',
+                'session_id': 's1',
+                'cost': 0.012345,
+                'wall_clock_seconds': 42.5,
+            }, fh)
+        with open(os.path.join(run_dir, 'requests.json'), 'w') as fh:
+            json.dump({
+                'session_id': 's1',
+                'observed_cost': 0.012,
+                'requests': [
+                    {'ordinal': 1, 'tokens': {'input': 120, 'output': 30}},
+                    {'ordinal': 2, 'tokens': {'prompt_tokens': 80, 'completion_tokens': 20}},
+                ],
+            }, fh)
+        out_path = self.path('results/run-1/cost.json')
+        manifest = export_sml_cost_manifest(
+            run_dir,
+            out_path,
+            gpu_hours=0.5,
+            gpu_hourly_rate_usd=1.25,
+        )
+        expected = {
+            'wall_clock_seconds': 42.5,
+            'gpu_hours': 0.5,
+            'HourlyRateUSD': 1.25,
+            'hourly_rate_usd': 1.25,
+            'compute_cost_usd': 0.625,
+            'api_cost_usd': 0.012345,
+            'total_cost_usd': 0.637345,
+            'prompt_tokens': 200,
+            'completion_tokens': 50,
+            'request_count': 2,
+            'cost_accounting_status': 'settled',
+        }
+        self.assertEqual(manifest, expected)
+        self.assertTrue(os.path.exists(out_path))
+        with open(out_path) as fh:
+            self.assertEqual(json.load(fh), expected)
+
+    def test_export_sml_cost_manifest_proxy_requests_fallback(self):
+        run_dir = self.path('run-2')
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, 'result.json'), 'w') as fh:
+            json.dump({
+                'task_id': 't2',
+                'session_id': 's2',
+                'cost': None,
+                'started_at': 100.0,
+                'finished_at': 115.0,
+            }, fh)
+        with open(os.path.join(run_dir, 'proxy-requests.json'), 'w') as fh:
+            json.dump({
+                'dispatched': [
+                    {'stream_cost': 0.004, 'usage': {'prompt_tokens': 50, 'completion_tokens': 10}},
+                    {'stream_cost': 0.006, 'usage': {'prompt_tokens': 70, 'completion_tokens': 15}},
+                ],
+            }, fh)
+        manifest = export_sml_cost_manifest(run_dir)
+        self.assertEqual(manifest['wall_clock_seconds'], 15.0)
+        self.assertEqual(manifest['api_cost_usd'], 0.01)
+        self.assertEqual(manifest['total_cost_usd'], 0.01)
+        self.assertEqual(manifest['prompt_tokens'], 120)
+        self.assertEqual(manifest['completion_tokens'], 25)
+        self.assertEqual(manifest['request_count'], 2)
+        self.assertEqual(manifest['cost_accounting_status'], 'estimated')
+
+    def test_select_escalated_model_and_apply_provider_routing(self):
+        msgs_one_err = [
+            {'role': 'user', 'content': 'fix bug'},
+            {'role': 'tool', 'content': 'SyntaxError: bad syntax'},
+        ]
+        self.assertEqual(
+            select_escalated_model(
+                msgs_one_err,
+                current_model=GLM,
+                fallback_teacher_model='openrouter/qwen/qwen3-coder',
+                error_turn_threshold=2,
+            ),
+            GLM,
+        )
+        msgs_two_errs = [
+            {'role': 'user', 'content': 'fix bug'},
+            {'role': 'tool', 'content': '[AST PREFLIGHT ERROR: bad.py:1]'},
+            {'role': 'tool', 'content': '[SQL GUARD ERROR]: unsafe SQL'},
+        ]
+        self.assertEqual(
+            select_escalated_model(
+                msgs_two_errs,
+                current_model=GLM,
+                fallback_teacher_model='openrouter/qwen/qwen3-coder',
+                error_turn_threshold=2,
+            ),
+            'openrouter/qwen/qwen3-coder',
+        )
+        body = json.dumps({'model': GLM, 'messages': msgs_two_errs}).encode()
+        routed = json.loads(
+            apply_provider_routing(
+                body,
+                '/chat/completions',
+                turn_index=3,
+                fallback_teacher_model='openrouter/qwen/qwen3-coder',
+            )
+        )
+        self.assertEqual(routed['model'], 'openrouter/qwen/qwen3-coder')
+        self.assertNotIn('provider', routed)
+        self.assertEqual(routed['reasoning']['max_tokens'], ERROR_RECOVERY_REASONING_MAX_TOKENS)
+        self.assertEqual(routed['max_tokens'], 8192)
+
+    def test_clear_session_busy_disarms_zombie_sessions(self):
+        import sqlite3
+        import tempfile
+        from harness.finops import clear_session_busy
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, 'state.db')
+            conn = sqlite3.connect(db_path)
+            conn.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_busy REAL, idle_outcome TEXT)')
+            conn.execute("INSERT INTO session_v2 (id, time_busy, idle_outcome) VALUES ('ses_1', 12345, NULL)")
+            conn.commit()
+            conn.close()
+            self.assertTrue(clear_session_busy(db_path, 'ses_1'))
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute('SELECT time_busy, idle_outcome FROM session_v2 WHERE id=?', ('ses_1',)).fetchone()
+            finally:
+                conn.close()
+            self.assertIsNone(row[0])
+            self.assertEqual(row[1], 'failed')
+
+
+if __name__ == '__main__':
+    unittest.main()
