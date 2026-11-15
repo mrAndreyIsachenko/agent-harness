@@ -79,23 +79,28 @@ record into SQLite telemetry (`<state-dir>/telemetry.sqlite`), and feeds the
 cumulative per-task prior cost back into the gate: an unknown final cost
 blocks paid retries instead of silently overshooting.
 
-### Live benchmark — 2,068 production runs
+### Live benchmark — production runs
 
 The guarded path is benchmarked against live production state, not a
-synthetic corpus: every supervised run writes a run record, and
-`harness stats --state-dir …` / `format_state_stats_markdown` render the
-rolling benchmark table over **2,068 production runs** (state on
-2026-11-15), one row per routed model plus the `ALL` aggregate:
+synthetic corpus: every supervised run writes a run record under
+`<state-dir>/runs/<run>/result.json`, and `harness stats --state-dir …`
+(`format_state_stats_markdown`) renders the rolling per-model table plus the
+`ALL` aggregate directly from disk.
 
-| Model | Runs | Pass % |
-| --- | --- | --- |
-| ALL | 2,068 | rendered live from the state directory |
-| `openrouter/z-ai/glm-5.3-flash` | … | … |
-| `openrouter/deepseek/deepseek-v4.1-flash-1017` | … | … |
+Snapshot from `harness stats` on 2026-11-16 (**2,081 runs**):
 
-The per-model rows show the rendered shape; the authoritative numbers always
-come from re-running the command against the live state directory — the
-benchmark table is derived data, never a static catalog.
+| Model | Runs | Pass@1 (%) | Median Steps | Median Cost (USD) | Total Cost (USD) | Blocked Requests | Auto-Repairs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `openrouter/deepseek/deepseek-v4.1-flash-1017` | 423 | 55.6 | 6.0 | 0.0091 | 6.5911 | 0 | 0 |
+| `openrouter/moonshotai/kimi-k2.5` | 91 | 20.9 | 4.0 | 0.0000 | 1.2378 | 0 | 0 |
+| `openrouter/qwen/qwen3-coder` | 727 | 41.8 | 6.0 | 0.0069 | 8.4045 | 0 | 0 |
+| `openrouter/z-ai/glm-5.1` | 22 | 13.6 | 3.0 | 0.0058 | 0.9519 | 0 | 0 |
+| `openrouter/z-ai/glm-5.3-flash` | 771 | 53.8 | 4.0 | 0.0036 | 4.0721 | 0 | 0 |
+| `unknown` | 47 | 72.3 | 0.0 | 0.0000 | 0.0000 | 0 | 0 |
+| **ALL** | **2081** | **48.5** | **5.0** | **0.0052** | **21.2573** | **0** | **0** |
+
+Re-run `harness stats --state-dir …` to refresh these numbers from the live
+state directory.
 
 ## H-1 — Syntax pre-flight & provider circuit breaker
 
