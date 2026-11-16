@@ -2601,7 +2601,7 @@ sys.exit(1)
                 json.dump({'task_id': 't-f4', 'session_id': 'ses_f4', 'cost': None}, fh)
             manifest4 = export_sml_cost_manifest(run4)
             self.assertEqual(manifest4['api_cost_usd'], 0.0)
-            self.assertEqual(manifest4['cost_accounting_status'], 'unknown')
+            self.assertEqual(manifest4['cost_accounting_status'], 'unreconciled')
 
             # 5. build_unexposed_settlement_evidence with dispatched generation_id & blocked
             run5 = os.path.join(tmp, 'runs', 'run-f5')
@@ -2629,22 +2629,97 @@ sys.exit(1)
             self.assertEqual(ev1['session_id'], 'ses_f1')
             self.assertGreaterEqual(len(ev1['requests']), 1)
 
-            # 5b. reconcile_run with proxy stream fallback when fetch returns {}
-            rec5 = reconcile_run(
-                run5,
-                {
+            # 5b. reconcile_run rejects unexposed resolution on exposed request, then succeeds with generation_id
+            with self.assertRaisesRegex(GuardError, 'finished_request_must_use_actual_cost'):
+                reconcile_run(run5, ev1, fetch=lambda gid: {}, state=tmp, db=db_path)
+
+            run5b = os.path.join(tmp, 'runs', 'run-f5b')
+            os.makedirs(run5b)
+            with open(os.path.join(run5b, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-f5b', 'session_id': 'ses_f1', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run5b, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
                     'session_id': 'ses_f1',
-                    'allow_proxy_stream_fallback': True,
-                    'requests': [
-                        {'ordinal': 1, 'generation_id': 'gen-p1'},
-                        {'ordinal': 2, 'resolution': 'blocked_locally'},
-                    ],
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-p1']}],
+                }, fh)
+            rec5 = reconcile_run(
+                run5b,
+                {'session_id': 'ses_f1', 'requests': [{'ordinal': 1, 'generation_id': 'gen-p1'}]},
+                fetch=lambda gid: {
+                    'id': gid,
+                    'finish_reason': 'stop',
+                    'total_cost': 0.01,
+                    'native_tokens_prompt': 20,
+                    'native_tokens_completion': 10,
                 },
-                fetch=lambda gid: {},
                 state=tmp,
                 db=db_path,
             )
             self.assertAlmostEqual(rec5['cost'], 0.01)
+
+            # 5c. resolved_cost via billing-reconciliation.json & prior_cost across runs
+            self.assertAlmostEqual(
+                resolved_cost(os.path.join(run5b, 'result.json'), {'task_id': 't-f5b', 'session_id': 'ses_f1', 'cost': None}),
+                0.01,
+            )
+            self.assertAlmostEqual(prior_cost(tmp, 't-f5b'), 0.01)
+
+            # 5d. clear_session_busy False cases + metrics/violation edge cases
+            from harness.finops import clear_session_busy, fetch_generation
+            self.assertFalse(clear_session_busy(db_path, 'ses_f1'))
+            self.assertFalse(clear_session_busy(os.path.join(tmp, 'no-such.db'), 'ses_f1'))
+            m_err = metrics({'cost': 0.01, 'messages': [
+                ('assistant', {'error': {'type': 'api'}, 'finish': 'stop', 'content': []}),
+            ]})
+            self.assertTrue(m_err['model_error'])
+            self.assertEqual(violation(m_err, 0.15, 16), 'model_error')
+            m_unfin = metrics({'cost': 0.01, 'messages': [
+                ('assistant', {'content': []}),
+            ]})
+            self.assertTrue(m_unfin['unfinished'])
+
+            # 5e. fetch_generation missing key / HTTPError / exhausted retries
+            from unittest import mock
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(GuardError):
+                    fetch_generation('gen-nokey')
+            with mock.patch.dict(os.environ, {'OPENROUTER_API_KEY': 'sk-or-test'}):
+                err = urllib.error.HTTPError('http://x', 502, 'bad', {}, None)
+                with mock.patch('urllib.request.urlopen', side_effect=err):
+                    with self.assertRaises(GuardError):
+                        fetch_generation('gen-http-err')
+                    with self.assertRaises(GuardError):
+                        fetch_generation_settled('gen-exhaust', attempts=2, delays=(0.0,))
+
+            # 5f. resolved_cost tampered reconciliation & prior_cost with multiple runs
+            recon_path = os.path.join(run5b, 'billing-reconciliation.json')
+            with open(recon_path, 'r', encoding='utf-8') as fh:
+                recon_obj = json.load(fh)
+            recon_obj['result_sha256'] = '0' * 64
+            with open(recon_path, 'w', encoding='utf-8') as fh:
+                json.dump(recon_obj, fh)
+            with self.assertRaises(GuardError):
+                resolved_cost(os.path.join(run5b, 'result.json'), {'task_id': 't-f5b', 'session_id': 'ses_f1', 'cost': None})
+
+            run_paid = os.path.join(tmp, 'runs', 'run-paid')
+            os.makedirs(run_paid)
+            with open(os.path.join(run_paid, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-multi', 'session_id': 'ses_m1', 'cost': 0.025}, fh)
+            run_other = os.path.join(tmp, 'runs', 'run-other')
+            os.makedirs(run_other)
+            with open(os.path.join(run_other, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-other', 'session_id': 'ses_o1', 'cost': 0.05}, fh)
+            self.assertAlmostEqual(prior_cost(tmp, 't-multi'), 0.025)
+
+            # 5g. auto_reconcile_from_proxy early returns & reconcile_run edge errors
+            self.assertIsNone(auto_reconcile_from_proxy(run_paid, os.path.join(run_paid, 'result.json'), {'cost': 0.025}, db=db_path))
+            self.assertIsNone(auto_reconcile_from_proxy(run4, os.path.join(run4, 'result.json'), {'cost': None}, db=db_path))
+            with self.assertRaises(GuardError):
+                reconcile_run(run_paid, {'session_id': 'ses_m1', 'requests': []}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': 'bad'}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 'x'}]}, state=tmp, db=db_path)
 
             # 6. reconcile_run validation / error branches
             with self.assertRaises(GuardError):
@@ -2671,8 +2746,293 @@ sys.exit(1)
 
             empty_run = os.path.join(tmp, 'runs', 'empty-run')
             os.makedirs(empty_run)
+            m_empty = export_sml_cost_manifest(empty_run)
+            self.assertEqual(m_empty['cost_accounting_status'], 'unreconciled')
+
+            # 8. Additional finops coverage: request_records, reconcile_run validation, fetch_generation non-dict
+            recs = request_records(
+                {
+                    'cost': 0.01,
+                    'messages': [
+                        ('assistant', {'finish': 'tool-calls', 'cost': 0.01, 'tokens': {'prompt_tokens': 10, 'completion_tokens': 5}}),
+                    ],
+                },
+                {'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': None}], 'blocked_count': 0},
+            )
+            self.assertEqual(len(recs), 1)
+
             with self.assertRaises(FileNotFoundError):
-                export_sml_cost_manifest(empty_run)
+                reconcile_run(empty_run, {'session_id': 'x', 'requests': []}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 1, 'generation_id': 'g1'}, {'ordinal': 1, 'generation_id': 'g2'}]}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 1}]}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 99, 'generation_id': 'g1'}]}, state=tmp, db=db_path)
+
+            # 10. auto_reconcile_from_proxy when fetch fails -> returns None; prior_cost rejects corrupt run
+            corrupt_state = os.path.join(tmp, 'corrupt-state')
+            corrupt_run = os.path.join(corrupt_state, 'runs', 'run-corrupt')
+            os.makedirs(corrupt_run)
+            with open(os.path.join(corrupt_run, 'result.json'), 'w', encoding='utf-8') as fh:
+                fh.write('{bad json')
+            with self.assertRaisesRegex(GuardError, 'unreadable_cost_journal'):
+                prior_cost(corrupt_state, 't-multi')
+
+            run_fail_fetch = os.path.join(tmp, 'runs', 'run-fail-fetch')
+            os.makedirs(run_fail_fetch)
+            res_ff_path = os.path.join(run_fail_fetch, 'result.json')
+            res_ff = {'task_id': 't-ff', 'session_id': 'ses_ff', 'cost': None, 'observed_cost': 0.0}
+            with open(res_ff_path, 'w', encoding='utf-8') as fh:
+                json.dump(res_ff, fh)
+            with open(os.path.join(run_fail_fetch, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_ff',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-bad']}],
+                    'proxy': {'dispatched': [{'generation_id': 'gen-bad', 'completed': True}]},
+                }, fh)
+            with self.assertRaisesRegex(GuardError, 'billing_not_final_or_wrong_identity'):
+                auto_reconcile_from_proxy(run_fail_fetch, res_ff_path, res_ff, fetch=lambda gid: {}, db=db_path)
+
+            # 11. number() validation, snapshot with NULL cost, and manifest fallback branches
+            for bad_num in (True, float('nan'), 'abc'):
+                with self.assertRaises(GuardError):
+                    number(bad_num, 'max_cost_usd')
+
+            import sqlite3
+            conn_null = sqlite3.connect(db_path)
+            try:
+                conn_null.execute("INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES ('ses_null', NULL, NULL, NULL)")
+                conn_null.commit()
+            finally:
+                conn_null.close()
+            with self.assertRaisesRegex(GuardError, 'invalid_telemetry_cost'):
+                snapshot(db_path, 'ses_null')
+
+            run_proxy_only = os.path.join(tmp, 'runs', 'run-proxy-only')
+            os.makedirs(run_proxy_only)
+            with open(os.path.join(run_proxy_only, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-po', 'session_id': 'ses_po', 'cost': None, 'started_at': 10.0}, fh)
+            with open(os.path.join(run_proxy_only, 'proxy-requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'dispatched': [{'stream_cost': 0.005, 'usage': {'input': 10, 'output': 5}}]}, fh)
+            m_po = export_sml_cost_manifest(run_proxy_only)
+            self.assertAlmostEqual(m_po['api_cost_usd'], 0.005)
+            self.assertEqual(m_po['prompt_tokens'], 10)
+            self.assertEqual(m_po['completion_tokens'], 5)
+
+            # 12. request_records with non-gen id + error+tokens
+            recs_err = request_records(
+                {'cost': 0.01, 'messages': [
+                    ('assistant', {'id': 'msg_local_1', 'finish': 'stop', 'tokens': {'input': 5, 'output': 2}}),
+                    ('assistant', {'error': {'type': 'api'}, 'tokens': {'input': 5, 'output': 0}}),
+                ]},
+                {'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': 'gen-from-proxy'}], 'blocked_count': 1},
+            )
+            self.assertEqual(len(recs_err), 2)
+            self.assertEqual(recs_err[0]['provider_request_ids'], ['gen-from-proxy'])
+
+            # 13. build_unexposed_settlement_evidence error cases
+            with self.assertRaisesRegex(GuardError, 'verified_by_required'):
+                build_unexposed_settlement_evidence(run5, verified_by='', mapping_source='m', db=db_path)
+            with self.assertRaises(GuardError):
+                build_unexposed_settlement_evidence(run5, verified_by='u', mapping_source='', db=db_path)
+
+            # 13b. reconcile_run invalid generation_id, wrong-identity fetch & blocked_locally-only run
+            with self.assertRaisesRegex(GuardError, 'invalid_or_duplicate_generation_id'):
+                reconcile_run(
+                    run4,
+                    {'session_id': 'ses_f4', 'requests': [{'ordinal': 1, 'generation_id': 'bad-id'}]},
+                    fetch=lambda gid: {},
+                    state=tmp,
+                    db=db_path,
+                )
+            with self.assertRaisesRegex(GuardError, 'mapping_evidence_required'):
+                reconcile_run(
+                    run4,
+                    {'session_id': 'ses_f4', 'requests': [{'ordinal': 1, 'generation_id': 'gen-want'}]},
+                    fetch=lambda gid: {'id': 'gen-other', 'finish_reason': 'stop', 'total_cost': 0.01},
+                    state=tmp,
+                    db=db_path,
+                )
+            run_wrong = os.path.join(tmp, 'runs', 'run-wrong')
+            os.makedirs(run_wrong)
+            with open(os.path.join(run_wrong, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-w', 'session_id': 'ses_w', 'cost': None}, fh)
+            with open(os.path.join(run_wrong, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_w',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-want']}],
+                }, fh)
+            with self.assertRaisesRegex(GuardError, 'billing_not_final_or_wrong_identity'):
+                reconcile_run(
+                    run_wrong,
+                    {'session_id': 'ses_w', 'requests': [{'ordinal': 1, 'generation_id': 'gen-want'}]},
+                    fetch=lambda gid: {'id': 'gen-other', 'finish_reason': 'stop', 'total_cost': 0.01},
+                    state=tmp,
+                    db=db_path,
+                )
+            run_blk = os.path.join(tmp, 'runs', 'run-blk')
+            os.makedirs(run_blk)
+            with open(os.path.join(run_blk, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-blk', 'session_id': 'ses_blk', 'cost': None}, fh)
+            with open(os.path.join(run_blk, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_blk',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': 0.0, 'provider_request_ids': []}],
+                    'proxy': {'dispatched': [], 'blocked': [{'reason': 'loop'}]},
+                }, fh)
+            ev_blk = build_unexposed_settlement_evidence(run_blk, verified_by='u', mapping_source='m', db=db_path)
+            rec_blk = reconcile_run(run_blk, ev_blk, state=tmp, db=db_path)
+            self.assertEqual(rec_blk['cost'], 0.0)
+
+            # 13c. metrics with tool_use/compact/read & prior_cost with unknown cost run
+            m_reads = metrics({'cost': 0.01, 'messages': [
+                ('assistant', {'finish': 'stop', 'content': [
+                    {'type': 'tool', 'name': 'bash', 'state': {'status': 'completed'}},
+                ]}),
+            ]})
+            self.assertEqual(m_reads['reads'], 0)
+            with self.assertRaisesRegex(GuardError, 'prior_cost_unknown_reconcile_before_retry'):
+                prior_cost(tmp, 't-f4')
+
+            # 13. build_unexposed_settlement_evidence when result.json has no session_id -> GuardError
+            run_nosid = os.path.join(tmp, 'runs', 'run-nosid')
+            os.makedirs(run_nosid)
+            with open(os.path.join(run_nosid, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-ns', 'session_id': None}, fh)
+            with self.assertRaises(GuardError):
+                build_unexposed_settlement_evidence(run_nosid, verified_by='u', mapping_source='m', db=db_path)
+
+            # 14. auto_reconcile_from_proxy with auth_bearer + requests with missing provider_request_ids
+            run_noid = os.path.join(tmp, 'runs', 'run-noid')
+            os.makedirs(run_noid)
+            res_noid_path = os.path.join(run_noid, 'result.json')
+            res_noid = {'task_id': 't-noid', 'session_id': 'ses_noid', 'cost': None}
+            with open(res_noid_path, 'w', encoding='utf-8') as fh:
+                json.dump(res_noid, fh)
+            with open(os.path.join(run_noid, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_noid',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': []}],
+                    'proxy': {'dispatched': []},
+                }, fh)
+            rec_noid = auto_reconcile_from_proxy(run_noid, res_noid_path, res_noid, fetch=lambda gid: {}, db=db_path)
+            self.assertIsNotNone(rec_noid)
+            self.assertAlmostEqual(rec_noid['cost'], 0.01)
+
+            run_dur = os.path.join(tmp, 'runs', 'run-dur')
+            os.makedirs(run_dur)
+            with open(os.path.join(run_dur, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-dur', 'session_id': 'ses_d', 'cost': 0.01, 'duration_seconds': 12.5}, fh)
+            with open(os.path.join(run_dur, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'requests': [{'ordinal': 1, 'tokens': {'prompt_tokens': 30, 'completion_tokens': 12}}]}, fh)
+            m_dur = export_sml_cost_manifest(run_dur)
+            self.assertEqual(m_dur['wall_clock_seconds'], 12.5)
+            self.assertEqual(m_dur['prompt_tokens'], 30)
+            self.assertEqual(m_dur['completion_tokens'], 12)
+
+            # 9. fetch_generation returning non-dict JSON & urllib.error.URLError
+            class _RespJson:
+                def __init__(self, body):
+                    self._body = body
+                def read(self):
+                    return self._body
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    return False
+
+            with mock.patch.dict(os.environ, {'OPENROUTER_API_KEY': 'sk-or-test'}):
+                with mock.patch('urllib.request.urlopen', return_value=_RespJson(b'[1, 2]')):
+                    with self.assertRaises(TypeError):
+                        fetch_generation('gen-list')
+                with mock.patch('urllib.request.urlopen', side_effect=urllib.error.URLError('down')):
+                    with self.assertRaises(GuardError):
+                        fetch_generation('gen-url-err')
+
+            # 15. reconcile_run with conservative_step_cap
+            run_cap = os.path.join(tmp, 'runs', 'run-cap')
+            os.makedirs(run_cap)
+            with open(os.path.join(run_cap, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-cap', 'session_id': 'ses_cap2', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run_cap, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_cap2',
+                    'requests': [{'ordinal': 1, 'state': 'dispatched', 'cost': None, 'provider_request_ids': []}],
+                }, fh)
+            rec_cap = reconcile_run(
+                run_cap,
+                {
+                    'session_id': 'ses_cap2',
+                    'requests': [{
+                        'ordinal': 1,
+                        'resolution': 'conservative_step_cap',
+                        'capped_cost': 0.01,
+                        'verified_by': 'u',
+                        'mapping_source': 'm',
+                    }],
+                },
+                state=tmp,
+                db=db_path,
+            )
+            self.assertAlmostEqual(rec_cap['cost'], 0.01)
+
+            # 16. build_unexposed_settlement_evidence with unfinished/dispatched request + stream_cost
+            run_unfin = os.path.join(tmp, 'runs', 'run-unfin')
+            os.makedirs(run_unfin)
+            with open(os.path.join(run_unfin, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-unfin', 'session_id': 'ses_unfin', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run_unfin, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_unfin',
+                    'requests': [{'ordinal': 1, 'state': 'dispatched', 'cost': None, 'provider_request_ids': []}],
+                    'proxy': {'dispatched': [{'completed': True, 'stream_cost': 0.007, 'generation_id': None}], 'blocked': []},
+                }, fh)
+            ev_unfin = build_unexposed_settlement_evidence(run_unfin, verified_by='u', mapping_source='m', db=db_path)
+            self.assertEqual(ev_unfin['session_id'], 'ses_unfin')
+            rec_unfin = reconcile_run(run_unfin, ev_unfin, state=tmp, db=db_path)
+            self.assertGreater(rec_unfin['cost'], 0.0)
+
+            # 17. export_sml_cost_manifest with requests.json usage + out_path
+            run_usage = os.path.join(tmp, 'runs', 'run-usage')
+            os.makedirs(run_usage)
+            with open(os.path.join(run_usage, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-u', 'session_id': 'ses_u', 'cost': 0.02, 'wall_clock_seconds': 5.0}, fh)
+            with open(os.path.join(run_usage, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'requests': [{'ordinal': 1, 'tokens': {'input_tokens': 11, 'output_tokens': 7}}]}, fh)
+            m_u = export_sml_cost_manifest(run_usage, os.path.join(run_usage, 'cost.json'))
+            self.assertEqual(m_u['prompt_tokens'], 11)
+            self.assertEqual(m_u['completion_tokens'], 7)
+
+            # 18. clear_session_busy with outcome='succeeded', old-schema DB, and can_settle_from_proxy_local branches
+            from harness.finops import clear_session_busy as _csb
+            conn_busy = sqlite3.connect(db_path)
+            try:
+                conn_busy.execute("INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES ('ses_busy2', 0.01, 9.0, NULL)")
+                conn_busy.commit()
+            finally:
+                conn_busy.close()
+            self.assertTrue(_csb(db_path, 'ses_busy2', outcome='succeeded'))
+
+            old_db = os.path.join(tmp, 'old.db')
+            c_old = sqlite3.connect(old_db)
+            c_old.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL)')
+            c_old.execute("INSERT INTO session_v2 VALUES ('ses_old', 0.01)")
+            c_old.commit()
+            c_old.close()
+            self.assertFalse(_csb(old_db, 'ses_old'))
+
+            self.assertFalse(can_settle_from_proxy_local(
+                {'cost': 0.01, 'messages': [('assistant', {'finish': 'stop', 'content': []})]},
+                {'blocked_count': 1, 'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': 'gen-1'}]},
+            ))
+            self.assertFalse(can_settle_from_proxy_local(
+                {'cost': 0.01, 'messages': [
+                    ('assistant', {'finish': 'stop', 'content': []}),
+                    ('assistant', {'error': {'type': 'guard'}, 'content': []}),
+                ]},
+                {'blocked_count': 2, 'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': 'gen-1'}]},
+            ))
 
 
 class TestProxyPerTaskSmlManifests(HarnessTestCase):
