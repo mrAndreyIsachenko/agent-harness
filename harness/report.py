@@ -12,12 +12,22 @@ import json
 import statistics
 from pathlib import Path
 
+from harness.guards import (
+    check_readonly_sql_tool_calls,
+    compact_stale_reads,
+    detect_duplicate_tool_calls,
+    estimate_messages_tokens,
+)
+from harness.routing import apply_provider_routing
+
 __all__ = [
     "summarize_run",
     "aggregate_benchmark_runs",
     "format_benchmark_markdown",
     "scan_state_runs",
     "format_state_stats_markdown",
+    "simulate_replay",
+    "format_replay_markdown",
 ]
 
 # Statuses treated as a Pass@1 success (after lowercasing).
@@ -362,4 +372,196 @@ def format_state_stats_markdown(state_dir: str | Path) -> str:
     ]
     lines.extend(_row(model, groups[model]) for model in sorted(groups))
     lines.append(_row("ALL", runs))
+    return "\n".join(lines)
+
+
+def _compact_context_window(messages: list[dict], *, max_context_tokens: int) -> list[dict]:
+    """Invoke ``harness.guards.compact_context_window`` when available, with a safe fallback."""
+    from harness import guards as _guards
+
+    fn = getattr(_guards, "compact_context_window", None)
+    if callable(fn):
+        result = fn(messages, max_context_tokens=max_context_tokens)
+        if isinstance(result, tuple):
+            return list(result[0])
+        return list(result)
+
+    compacted, _ = compact_stale_reads(
+        list(messages),
+        turn_index=max(5, len(messages)),
+        min_turn=5,
+    )
+    if max_context_tokens <= 0:
+        return compacted
+    while len(compacted) > 2 and estimate_messages_tokens(compacted) > max_context_tokens:
+        drop_idx = 1 if (compacted[0].get("role") == "system") else 0
+        compacted.pop(drop_idx)
+    return compacted
+
+
+def _load_replay_episodes(records_or_state_dir: list[dict] | str | Path) -> list[dict]:
+    """Normalize a list of episode dicts or a state_dir path into episode dicts."""
+    if isinstance(records_or_state_dir, (str, Path)):
+        path = Path(records_or_state_dir)
+        if path.is_file():
+            text = path.read_text(encoding="utf-8").strip()
+            if not text:
+                return []
+            try:
+                payload = json.loads(text)
+            except ValueError:
+                episodes: list[dict] = []
+                for line in text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(item, dict):
+                        episodes.append(item)
+                return episodes
+            if isinstance(payload, list):
+                return [item for item in payload if isinstance(item, dict)]
+            if isinstance(payload, dict):
+                for key in ("episodes", "runs", "records"):
+                    if isinstance(payload.get(key), list):
+                        return [item for item in payload[key] if isinstance(item, dict)]
+                return [payload]
+            return []
+
+        runs_dir = path / "runs"
+        if not runs_dir.is_dir():
+            return []
+        run_dirs: list[tuple[float, Path]] = []
+        for child in runs_dir.iterdir():
+            try:
+                if child.is_dir():
+                    run_dirs.append((child.stat().st_mtime, child))
+            except OSError:
+                continue
+        run_dirs.sort(key=lambda entry: entry[0])
+
+        episodes = []
+        for _, run_dir in run_dirs:
+            result_path = run_dir / "result.json"
+            if result_path.is_file():
+                try:
+                    result = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    result = None
+                if isinstance(result, dict) and isinstance(result.get("messages"), list):
+                    episodes.append(result)
+                    continue
+            requests_path = run_dir / "requests.json"
+            if requests_path.is_file():
+                try:
+                    req_payload = json.loads(requests_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    req_payload = None
+                if isinstance(req_payload, dict) and isinstance(req_payload.get("messages"), list):
+                    episodes.append(req_payload)
+                elif isinstance(req_payload, list):
+                    with_msgs = [
+                        item for item in req_payload
+                        if isinstance(item, dict) and isinstance(item.get("messages"), list)
+                    ]
+                    if with_msgs:
+                        episodes.append(with_msgs[-1])
+        return episodes
+
+    return [item for item in (records_or_state_dir or []) if isinstance(item, dict)]
+
+
+def simulate_replay(
+    records_or_state_dir: list[dict] | str | Path,
+    *,
+    max_context_tokens: int = 6000,
+    fallback_teacher_model: str | None = None,
+    upstream_mode: str = "openrouter",
+) -> dict:
+    """Run offline A/B guard and routing simulation over recorded episodes or a state_dir."""
+    episodes = _load_replay_episodes(records_or_state_dir)
+
+    total_episodes = len(episodes)
+    loop_warnings_triggered = 0
+    sql_violations_caught = 0
+    escalated_to_teacher_count = 0
+    tokens_before = 0
+    tokens_after = 0
+
+    for record in episodes:
+        raw_messages = record.get("messages")
+        messages = [m for m in raw_messages if isinstance(m, dict)] if isinstance(raw_messages, list) else []
+        model = _first(record, ("model", "model_id", "modelId", "model_name"))
+
+        loop_warnings_triggered += len(detect_duplicate_tool_calls(messages))
+        sql_violations_caught += len(check_readonly_sql_tool_calls(messages))
+
+        before = estimate_messages_tokens(messages) if messages else 0
+        compacted = _compact_context_window(messages, max_context_tokens=max_context_tokens)
+        after = estimate_messages_tokens(compacted) if compacted else 0
+        tokens_before += before
+        tokens_after += after
+
+        req_payload: dict = {"messages": compacted}
+        if model is not None:
+            req_payload["model"] = model
+        raw_body = json.dumps(req_payload, ensure_ascii=False).encode("utf-8")
+        routed_bytes = apply_provider_routing(
+            raw_body,
+            "/chat/completions",
+            default_model=model,
+            turn_index=max(1, len(messages)),
+            upstream_mode=upstream_mode,
+            fallback_teacher_model=fallback_teacher_model,
+        )
+        try:
+            routed = json.loads(routed_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            routed = {}
+        if (
+            fallback_teacher_model
+            and isinstance(routed, dict)
+            and routed.get("model") == fallback_teacher_model
+            and model != fallback_teacher_model
+        ):
+            escalated_to_teacher_count += 1
+
+    tokens_saved = max(0, tokens_before - tokens_after)
+    token_reduction_pct = round((tokens_saved / tokens_before) * 100.0, 2) if tokens_before > 0 else 0.0
+
+    return {
+        "total_episodes": total_episodes,
+        "loop_warnings_triggered": loop_warnings_triggered,
+        "sql_violations_caught": sql_violations_caught,
+        "escalated_to_teacher_count": escalated_to_teacher_count,
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+        "tokens_saved": tokens_saved,
+        "token_reduction_pct": token_reduction_pct,
+    }
+
+
+def format_replay_markdown(summary: dict) -> str:
+    """Render a GitHub-flavored Markdown report table for replay simulation results."""
+    data = summary if isinstance(summary, dict) else {}
+    rows = [
+        ("Total Episodes", str(_to_int(data.get("total_episodes")))),
+        ("Loop Warnings Triggered", str(_to_int(data.get("loop_warnings_triggered")))),
+        ("SQL Violations Caught", str(_to_int(data.get("sql_violations_caught")))),
+        ("Escalated to Teacher", str(_to_int(data.get("escalated_to_teacher_count")))),
+        ("Tokens Before", str(_to_int(data.get("tokens_before")))),
+        ("Tokens After", str(_to_int(data.get("tokens_after")))),
+        ("Tokens Saved", str(_to_int(data.get("tokens_saved")))),
+        ("Token Reduction (%)", f"{_to_float(data.get('token_reduction_pct')):.2f}%"),
+    ]
+    lines = [
+        "# Offline Replay Simulation",
+        "",
+        "| Metric | Value |",
+        "| --- | ---: |",
+    ]
+    lines.extend(f"| {metric} | {value} |" for metric, value in rows)
     return "\n".join(lines)

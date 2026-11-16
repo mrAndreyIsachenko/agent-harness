@@ -29,6 +29,8 @@ from collections import Counter
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from .telemetry import sync_state_traces_to_phoenix, synthesize_spans_from_run_dir
+
 from .finops import (
     DB,
     LIMITS,
@@ -463,6 +465,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
             run_dir = state / 'runs' / uuid.uuid4().hex
             run_dir.mkdir(parents=True, mode=0o700)
             started = time.monotonic()
+            started_at = time.time()
             if not check:
                 task = stack.enter_context(isolated_worktree(task, run_dir))
             tracked = task['files'] + ([task['patch_file']] if task['mode'] == 'patch' else [])
@@ -472,7 +475,8 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                           limit_reason=task.get('limit_reason'),
                           limits={k: task[k] for k in LIMITS}, test_return_code=None,
                           artifact=str(run_dir), hashes_before=_fh(task['files']),
-                          worktree=task.get('worktree', False))
+                          worktree=task.get('worktree', False),
+                          started_at=started_at)
             result['limits']['available_cost_usd'] = budget
             private_write(run_dir / 'result.json', result)
             private_write(run_dir / 'task.json', task)
@@ -615,6 +619,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                     result['status'] = 'blocked'
                     result['reason'] = result['reason'] or 'cannot_capture_final_files'
                 result['duration_seconds'] = round(time.monotonic() - started, 3)
+                result['finished_at'] = time.time()
                 result['validation_attempted'] = validation_attempted
                 result_path = run_dir / 'result.json'
                 event(run_dir, 'run_finished', status=result['status'], reason=result['reason'],
@@ -630,6 +635,11 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                     except (GuardError, OSError, ValueError, sqlite3.Error) as exc:
                         event(run_dir, 'auto_reconcile_deferred',
                               reason=str(exc) if isinstance(exc, GuardError) else type(exc).__name__)
+                try:
+                    synthesize_spans_from_run_dir(run_dir)
+                    sync_state_traces_to_phoenix(run_dir, timeout=1.5)
+                except Exception:
+                    pass
     except (GuardError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
         error = str(exc) if isinstance(exc, GuardError) else type(exc).__name__
         if result.get('reason'):
