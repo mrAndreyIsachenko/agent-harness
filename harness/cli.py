@@ -6,6 +6,8 @@ Subcommands:
     bench-report          Render a Markdown benchmark comparison from two
                           JSON files of run records.
     stats [--state-dir]   Summarize live state-directory runs as Markdown.
+    replay                Run offline A/B replay simulation over episodes
+                          or a state directory.
     trace [path]          Print a trace tree from traces.jsonl (or a run
                           directory containing it); defaults to the newest
                           state-dir run and syncs state traces to Phoenix
@@ -26,7 +28,12 @@ import sys
 from pathlib import Path
 
 from harness.proxy import OPENROUTER_UPSTREAM, openrouter_proxy
-from harness.report import format_benchmark_markdown, format_state_stats_markdown
+from harness.report import (
+    format_benchmark_markdown,
+    format_replay_markdown,
+    format_state_stats_markdown,
+    simulate_replay,
+)
 from harness.telemetry import (
     DEFAULT_PHOENIX_ENDPOINT,
     HarnessTracer,
@@ -178,6 +185,26 @@ def _run_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_replay(args: argparse.Namespace) -> int:
+    target = args.input if args.input is not None else args.state_dir
+    try:
+        summary = simulate_replay(
+            target,
+            max_context_tokens=args.max_context_tokens,
+            fallback_teacher_model=args.fallback_teacher_model,
+            upstream_mode=args.upstream_mode,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"replay: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(format_replay_markdown(summary))
+    return 0
+
+
 def _run_trace(args: argparse.Namespace) -> int:
     if not args.no_sync:
         try:
@@ -281,6 +308,8 @@ def _run_serve(args: argparse.Namespace) -> int:
         allowed_models=args.allowed_models,
         enforce_egress_guard=args.enforce_egress_guard,
         enforce_readonly_sql=args.enforce_readonly_sql,
+        max_context_tokens=args.max_context_tokens,
+        sml_results_dir=args.sml_results_dir,
     ) as proxy:
         proxy_ref[0] = proxy
         info = {"base_url": proxy.base_url, "upstream_url": args.upstream_url}
@@ -429,6 +458,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--max-cost-usd", type=float, default=None, help="optional max cost budget in USD")
     serve.add_argument("--max-steps", type=int, default=None, help="optional max turn count")
+    serve.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=None,
+        help="optional max context token budget",
+    )
+    serve.add_argument(
+        "--sml-results-dir",
+        default=None,
+        help="optional directory to flush per-task SML cost.json manifests",
+    )
     serve.add_argument("--print-url-file", default=None, help="optional path to write base_url JSON")
     serve.add_argument(
         "--duration-seconds",
@@ -444,6 +484,43 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--upstream-url", default=None, help="optional upstream LLM API base URL")
     run.add_argument("--state-dir", default=None, help="optional state directory override")
     run.set_defaults(handler=_run_run)
+
+    replay = subparsers.add_parser(
+        "replay",
+        help="run offline A/B replay simulation over episodes or a state directory",
+    )
+    replay.add_argument(
+        "--input",
+        default=None,
+        help="optional path to JSON/JSONL file of episodes or state dir (default: --state-dir)",
+    )
+    replay.add_argument(
+        "--state-dir",
+        default=default_state_dir,
+        help="state directory containing runs/ when --input is omitted (default: %(default)s)",
+    )
+    replay.add_argument(
+        "--max-context-tokens",
+        type=int,
+        default=6000,
+        help="context token budget for compaction (default: %(default)s)",
+    )
+    replay.add_argument(
+        "--fallback-teacher-model",
+        default=None,
+        help="optional fallback teacher model ID for escalation simulation",
+    )
+    replay.add_argument(
+        "--upstream-mode",
+        default="openrouter",
+        help="upstream routing mode (default: %(default)s)",
+    )
+    replay.add_argument(
+        "--json",
+        action="store_true",
+        help="print raw JSON instead of Markdown",
+    )
+    replay.set_defaults(handler=_run_replay)
 
     return parser
 

@@ -10,6 +10,8 @@ Public functions:
 - :func:`collect_python_top_symbols` -- top-level Python symbol inventory.
 - :func:`detect_duplicate_tool_calls` -- repeated identical tool-call detection (H-5).
 - :func:`compact_stale_reads` -- stale read-result compaction (H-8).
+- :func:`estimate_messages_tokens` -- deterministic message token estimator.
+- :func:`compact_context_window` -- context-budget compaction for older tool outputs.
 - :func:`build_file_skeletons` -- compact line-range maps for large files.
 - :func:`extract_compact_test_failure` -- bounded digest of a failing test run.
 
@@ -35,9 +37,12 @@ __all__ = [
     "check_readonly_sql_tool_calls",
     "check_sql_syntax",
     "collect_python_top_symbols",
+    "compact_context_window",
     "compact_stale_reads",
     "detect_duplicate_tool_calls",
+    "estimate_messages_tokens",
     "extract_compact_test_failure",
+    "inject_edit_failure_hints",
 ]
 
 #: Forbidden keys that must never leave the local harness in an LLM egress payload.
@@ -829,6 +834,105 @@ def detect_duplicate_tool_calls(messages: Iterable[Mapping[str, Any]] | None) ->
     return []
 
 
+_EDIT_MISMATCH_RE = re.compile(
+    r"(?:oldstring not found|old_string not found|failed to match|no exact match)",
+    re.IGNORECASE,
+)
+_EDIT_HINT_MARKER = "[HARNESS_EDIT_HINT"
+_EDIT_FAILURE_HINT = (
+    "\n[HARNESS_EDIT_HINT: Exact target text did not match file contents. "
+    "Do NOT retry the same edit blindly; call read with offset/limit around "
+    "the target lines first, then apply a single accurate edit.]"
+)
+
+
+def inject_edit_failure_hints(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """H-17: append a recovery hint to trailing edit-mismatch tool results.
+
+    Scans the latest trailing ``role == "tool"`` messages (or trailing
+    ``tool_result`` content blocks) without mutating ``messages``. If a tool
+    result matches an edit-target mismatch error and does not already contain
+    ``[HARNESS_EDIT_HINT``, appends ``_EDIT_FAILURE_HINT`` and returns the
+    new message list together with the number of hints injected.
+    """
+    if not isinstance(messages, list) or not messages:
+        return (messages, 0)
+
+    new_messages: list[dict[str, Any]] | None = None
+    injected = 0
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict):
+            break
+        role = message.get("role")
+        if role == "tool":
+            text = _message_text(message)
+            if _EDIT_MISMATCH_RE.search(text) and _EDIT_HINT_MARKER not in text:
+                content = message.get("content")
+                if isinstance(content, list):
+                    updated_content: Any = [
+                        *content,
+                        {"type": "text", "text": _EDIT_FAILURE_HINT},
+                    ]
+                elif isinstance(content, str):
+                    updated_content = content + _EDIT_FAILURE_HINT
+                else:
+                    updated_content = _EDIT_FAILURE_HINT
+                if new_messages is None:
+                    new_messages = list(messages)
+                new_messages[index] = {**message, "content": updated_content}
+                injected += 1
+            continue
+
+        content = message.get("content")
+        if (
+            index == len(messages) - 1
+            and isinstance(content, list)
+            and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            )
+        ):
+            new_content: list[Any] | None = None
+            for block_index, block in enumerate(content):
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                block_text = _message_text({"content": block.get("content")})
+                if (
+                    _EDIT_MISMATCH_RE.search(block_text)
+                    and _EDIT_HINT_MARKER not in block_text
+                ):
+                    block_content = block.get("content")
+                    if isinstance(block_content, list):
+                        updated_block_content: Any = [
+                            *block_content,
+                            {"type": "text", "text": _EDIT_FAILURE_HINT},
+                        ]
+                    elif isinstance(block_content, str):
+                        updated_block_content = block_content + _EDIT_FAILURE_HINT
+                    else:
+                        updated_block_content = _EDIT_FAILURE_HINT
+                    if new_content is None:
+                        new_content = list(content)
+                    new_content[block_index] = {
+                        **block,
+                        "content": updated_block_content,
+                    }
+                    injected += 1
+            if new_content is not None:
+                if new_messages is None:
+                    new_messages = list(messages)
+                new_messages[index] = {**message, "content": new_content}
+        break
+
+    if new_messages is None:
+        return (messages, 0)
+    return (new_messages, injected)
+
+
 def _sql_skeleton_lines(text: str) -> list[str]:
     """Summarize a SQL script as ``L<start>-L<end>`` CTE and final-SELECT ranges.
 
@@ -1115,3 +1219,180 @@ def compact_stale_reads(
         if new_content is not None:
             new_messages[index] = {**message, "content": new_content}
     return (new_messages, compacted)
+
+
+_CONTEXT_BUDGET_NOTICE = (
+    "\n...[HARNESS CONTEXT BUDGET: truncated {omitted_lines} lines / "
+    "{omitted_chars} chars to fit {max_context_tokens} token budget]...\n"
+)
+
+
+def estimate_messages_tokens(messages: Iterable[Mapping[str, Any]] | None) -> int:
+    """Fast deterministic token estimate across message ``content`` and ``tool_calls``."""
+    if not messages:
+        return 1
+    total_chars = 0
+    for message in messages:
+        if not isinstance(message, Mapping):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            total_chars += len(content)
+        elif content is not None:
+            total_chars += len(json.dumps(content, ensure_ascii=False, sort_keys=True, default=str))
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            total_chars += len(json.dumps(tool_calls, ensure_ascii=False, sort_keys=True, default=str))
+    return max(1, total_chars // 4)
+
+
+def _truncate_tool_text(
+    text: str,
+    *,
+    head_lines: int,
+    tail_lines: int,
+    max_context_tokens: int,
+) -> tuple[str, bool]:
+    """Truncate the middle of a large tool output while keeping head and tail."""
+    lines = text.splitlines()
+    if len(lines) <= head_lines + tail_lines + 4 and len(text) <= 1200:
+        return text, False
+    if len(lines) > head_lines + tail_lines:
+        head = "\n".join(lines[:head_lines])
+        tail = "\n".join(lines[-tail_lines:]) if tail_lines > 0 else ""
+        omitted_lines = len(lines) - head_lines - tail_lines
+        omitted_chars = max(0, len(text) - len(head) - len(tail))
+    else:
+        head_chars = 400
+        tail_chars = 200
+        head = text[:head_chars]
+        tail = text[-tail_chars:] if len(text) > head_chars + tail_chars else ""
+        omitted_lines = 0
+        omitted_chars = max(0, len(text) - len(head) - len(tail))
+    marker = _CONTEXT_BUDGET_NOTICE.format(
+        omitted_lines=omitted_lines,
+        omitted_chars=omitted_chars,
+        max_context_tokens=max_context_tokens,
+    )
+    return f"{head}{marker}{tail}", True
+
+
+def compact_context_window(
+    messages: list[Mapping[str, Any]],
+    *,
+    max_context_tokens: int = 6000,
+    keep_recent_messages: int = 4,
+    head_lines: int = 12,
+    tail_lines: int = 8,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Compact older tool outputs so estimated tokens fit within ``max_context_tokens``."""
+    tokens_before = estimate_messages_tokens(messages)
+    working: list[dict[str, Any]] = [
+        dict(m) if isinstance(m, Mapping) else m for m in (messages or [])
+    ]
+    if len(working) >= 5:
+        working, _ = compact_stale_reads(working, turn_index=len(working))
+
+    current_tokens = estimate_messages_tokens(working)
+    if current_tokens <= max_context_tokens:
+        return working, {
+            "tokens_before": tokens_before,
+            "tokens_after": current_tokens,
+            "truncated_messages": 0,
+        }
+
+    start_idx = 1 if (working and isinstance(working[0], Mapping) and working[0].get("role") == "system") else 0
+    end_idx = len(working) - max(0, keep_recent_messages)
+    truncated_messages = 0
+
+    for idx in range(start_idx, max(start_idx, end_idx)):
+        if current_tokens <= max_context_tokens:
+            break
+        msg = working[idx]
+        if not isinstance(msg, Mapping):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        msg_modified = False
+
+        if role == "tool":
+            if isinstance(content, str):
+                new_text, changed = _truncate_tool_text(
+                    content,
+                    head_lines=head_lines,
+                    tail_lines=tail_lines,
+                    max_context_tokens=max_context_tokens,
+                )
+                if changed:
+                    working[idx] = {**msg, "content": new_text}
+                    msg_modified = True
+            elif isinstance(content, list):
+                new_blocks = list(content)
+                for b_idx, block in enumerate(new_blocks):
+                    if isinstance(block, str):
+                        new_text, changed = _truncate_tool_text(
+                            block,
+                            head_lines=head_lines,
+                            tail_lines=tail_lines,
+                            max_context_tokens=max_context_tokens,
+                        )
+                        if changed:
+                            new_blocks[b_idx] = new_text
+                            msg_modified = True
+                    elif isinstance(block, Mapping) and isinstance(block.get("text"), str):
+                        new_text, changed = _truncate_tool_text(
+                            block["text"],
+                            head_lines=head_lines,
+                            tail_lines=tail_lines,
+                            max_context_tokens=max_context_tokens,
+                        )
+                        if changed:
+                            new_blocks[b_idx] = {**block, "text": new_text}
+                            msg_modified = True
+                if msg_modified:
+                    working[idx] = {**msg, "content": new_blocks}
+        elif role in ("user", "assistant") and isinstance(content, list):
+            new_blocks = list(content)
+            for b_idx, block in enumerate(new_blocks):
+                if not (isinstance(block, Mapping) and block.get("type") == "tool_result"):
+                    continue
+                block_content = block.get("content")
+                if isinstance(block_content, str):
+                    new_text, changed = _truncate_tool_text(
+                        block_content,
+                        head_lines=head_lines,
+                        tail_lines=tail_lines,
+                        max_context_tokens=max_context_tokens,
+                    )
+                    if changed:
+                        new_blocks[b_idx] = {**block, "content": new_text}
+                        msg_modified = True
+                elif isinstance(block_content, list):
+                    inner_blocks = list(block_content)
+                    inner_changed = False
+                    for ib_idx, ib in enumerate(inner_blocks):
+                        if isinstance(ib, Mapping) and isinstance(ib.get("text"), str):
+                            new_text, changed = _truncate_tool_text(
+                                ib["text"],
+                                head_lines=head_lines,
+                                tail_lines=tail_lines,
+                                max_context_tokens=max_context_tokens,
+                            )
+                            if changed:
+                                inner_blocks[ib_idx] = {**ib, "text": new_text}
+                                inner_changed = True
+                    if inner_changed:
+                        new_blocks[b_idx] = {**block, "content": inner_blocks}
+                        msg_modified = True
+            if msg_modified:
+                working[idx] = {**msg, "content": new_blocks}
+
+        if msg_modified:
+            truncated_messages += 1
+            current_tokens = estimate_messages_tokens(working)
+
+    return working, {
+        "tokens_before": tokens_before,
+        "tokens_after": current_tokens,
+        "truncated_messages": truncated_messages,
+    }
