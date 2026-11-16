@@ -39,7 +39,8 @@ from harness.guards import (FORBIDDEN_EGRESS_KEYS, build_file_skeletons,
                             check_readonly_sql_tool_calls, check_sql_syntax,
                             collect_python_top_symbols, compact_context_window,
                             compact_stale_reads, detect_duplicate_tool_calls,
-                            estimate_messages_tokens, extract_compact_test_failure)
+                            estimate_messages_tokens, extract_compact_test_failure,
+                            inject_edit_failure_hints)
 from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
                             format_state_stats_markdown, scan_state_runs, summarize_run)
 from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
@@ -840,6 +841,192 @@ class TestTelemetry(HarnessTestCase):
         self.assertEqual(child['end_time_ns'] - child['start_time_ns'], 3_000_000_000)
         self.assertEqual(child['attributes']['llm.token_count.total'], 175)
         self.assertEqual(child['attributes']['llm.cost.total'], 0.012)
+
+    def test_record_tool_span_and_format_trace_tree(self):
+        tracer = HarnessTracer(service_name='tool-test', trace_id='02' * 16)
+        tracer.record_span('harness.task', kind='AGENT', start_time_ns=1_000_000, end_time_ns=5_000_000)
+        long_arg = 'x' * 2500
+        long_out = 'y' * 2500
+        ok_span = tracer.record_tool_span(
+            'edit',
+            arguments={'file': 'a.py', 'data': long_arg},
+            output=long_out,
+            status='OK',
+            start_time_ns=1_500_000,
+            end_time_ns=2_500_000,
+            step_index=1,
+        )
+        err_span = tracer.record_tool_span(
+            'bash',
+            arguments='pytest -q',
+            output='exit code 1',
+            status='ERROR',
+            start_time_ns=2_600_000,
+            end_time_ns=3_000_000,
+        )
+        self.assertEqual(ok_span['parent_span_id'], tracer.root_span_id)
+        self.assertEqual(ok_span['attributes']['openinference.span.kind'], 'TOOL')
+        self.assertEqual(ok_span['attributes']['tool.name'], 'edit')
+        self.assertEqual(len(ok_span['attributes']['tool.parameters']), 2000)
+        self.assertEqual(len(ok_span['attributes']['output.value']), 2000)
+        self.assertEqual(ok_span['attributes']['harness.turn_index'], 1)
+        self.assertEqual(err_span['status'], 'ERROR')
+
+        # Parent tool spans to the recorded root span for tree rendering.
+        root = tracer.spans[0]
+        ok_span['parent_span_id'] = root['span_id']
+        err_span['parent_span_id'] = root['span_id']
+        tree = format_trace_tree(tracer.spans)
+        self.assertIn('[TOOL] edit (OK)', tree)
+        self.assertIn('[TOOL] bash (ERROR)', tree)
+
+    def test_synthesize_spans_from_run_dir_with_tool_spans(self):
+        from pathlib import Path
+        from harness.telemetry import _deterministic_hex, synthesize_spans_from_run_dir
+
+        run_dir = Path(self.path('synth-tools-run'))
+        run_dir.mkdir()
+        (run_dir / 'task.json').write_text(json.dumps({
+            'task_id': 't-tools', 'model': GLM, 'files': ['a.py'], 'prompt': 'Edit a.py',
+        }))
+        (run_dir / 'result.json').write_text(json.dumps({
+            'task_id': 't-tools', 'status': 'succeeded', 'model': GLM, 'cost': 0.01, 'steps': 1,
+        }))
+        (run_dir / 'requests.json').write_text(json.dumps({
+            'requests': [{
+                'ordinal': 1,
+                'time': {'created': 1700000000000, 'completed': 1700000005000},
+                'state': 'finished',
+                'cost': 0.01,
+                'tokens': {'input': 50, 'output': 10, 'reasoning': 0, 'cache': {'read': 0, 'write': 0}},
+            }],
+            'messages': [
+                {
+                    'role': 'assistant',
+                    'parts': [
+                        {
+                            'type': 'tool',
+                            'tool': 'edit',
+                            'state': {
+                                'status': 'completed',
+                                'input': {'filePath': 'a.py'},
+                                'output': 'edited a.py',
+                                'time': {'start': 1700000001000, 'end': 1700000002000},
+                            },
+                        },
+                        {
+                            'type': 'tool',
+                            'tool': 'bash',
+                            'state': {
+                                'status': 'error',
+                                'input': {'command': 'pytest'},
+                                'error': 'failed',
+                                'time': {'start': 1700000002500, 'end': 1700000003500},
+                            },
+                        },
+                    ],
+                },
+                {
+                    'role': 'assistant',
+                    'tool_calls': [
+                        {
+                            'id': 'call_3',
+                            'type': 'function',
+                            'function': {'name': 'read', 'arguments': '{"path": "a.py"}'},
+                        },
+                    ],
+                },
+            ],
+        }))
+
+        spans = synthesize_spans_from_run_dir(run_dir)
+        tool_spans = [s for s in spans if (s.get('attributes') or {}).get('openinference.span.kind') == 'TOOL']
+        llm_spans = [s for s in spans if (s.get('attributes') or {}).get('openinference.span.kind') == 'LLM']
+        self.assertEqual(len(llm_spans), 1)
+        self.assertEqual(len(tool_spans), 3)
+        self.assertEqual(tool_spans[0]['span_id'], _deterministic_hex('synth-tools-run:tool:0', 16))
+        self.assertEqual(tool_spans[1]['span_id'], _deterministic_hex('synth-tools-run:tool:1', 16))
+        self.assertEqual(tool_spans[2]['span_id'], _deterministic_hex('synth-tools-run:tool:2', 16))
+        self.assertEqual(tool_spans[0]['attributes']['tool.name'], 'edit')
+        self.assertEqual(tool_spans[0]['status'], 'OK')
+        self.assertIn('filePath', tool_spans[0]['attributes']['tool.parameters'])
+        self.assertEqual(tool_spans[0]['attributes']['output.value'], 'edited a.py')
+        self.assertEqual(tool_spans[1]['attributes']['tool.name'], 'bash')
+        self.assertEqual(tool_spans[1]['status'], 'ERROR')
+        self.assertEqual(tool_spans[2]['attributes']['tool.name'], 'read')
+
+        tree = format_trace_tree(spans)
+        self.assertIn('[TOOL] edit (OK)', tree)
+        self.assertIn('[TOOL] bash (ERROR)', tree)
+        self.assertIn('[TOOL] read (OK)', tree)
+
+    def test_worker_log_tool_spans_resynthesis_and_replay(self):
+        from pathlib import Path
+
+        from harness.report import simulate_replay
+        from harness.telemetry import _needs_resynthesis, synthesize_spans_from_run_dir
+
+        # --- synthesize_spans_from_run_dir extracts TOOL spans from worker.log ---
+        run_dir = Path(self.path('worker-log-run'))
+        run_dir.mkdir()
+        (run_dir / 'task.json').write_text(json.dumps({
+            'task_id': 't-wlog', 'model': GLM, 'files': ['a.py'], 'prompt': 'Edit a.py',
+        }))
+        (run_dir / 'result.json').write_text(json.dumps({
+            'task_id': 't-wlog', 'status': 'succeeded', 'model': GLM, 'cost': 0.02, 'steps': 1,
+        }))
+        (run_dir / 'requests.json').write_text(json.dumps({
+            'requests': [{
+                'ordinal': 1,
+                'time': {'created': 1700000000000, 'completed': 1700000005000},
+                'state': 'finished',
+                'cost': 0.02,
+                'tokens': {'input': 40, 'output': 8, 'reasoning': 0,
+                           'cache': {'read': 0, 'write': 0}},
+            }],
+        }))
+        tool_line = {
+            'type': 'tool_use', 'timestamp': 1700000001000,
+            'part': {'type': 'tool', 'tool': 'read',
+                     'state': {'status': 'completed', 'input': {'path': 'a.py'},
+                               'output': 'contents of a.py'}},
+        }
+        (run_dir / 'worker.log').write_text(json.dumps(tool_line) + '\n' + 'not json\n')
+
+        # No TOOL spans + tool events in worker.log -> resynthesis required.
+        self.assertTrue(_needs_resynthesis([], run_dir))
+        spans = synthesize_spans_from_run_dir(run_dir)
+        tool_spans = [s for s in spans
+                      if (s.get('attributes') or {}).get('openinference.span.kind') == 'TOOL']
+        self.assertEqual(len(tool_spans), 1)
+        self.assertEqual(tool_spans[0]['attributes']['tool.name'], 'read')
+        self.assertEqual(tool_spans[0]['attributes']['output.value'], 'contents of a.py')
+
+        cached_llm_only = [{
+            'name': 'gen_ai.chat', 'span_id': 'a' * 16, 'trace_id': 'b' * 32,
+            'parent_span_id': None, 'start_time_ns': 1000, 'end_time_ns': 2000,
+            'status': 'OK',
+            'attributes': {'openinference.span.kind': 'LLM', 'gen_ai.request.model': GLM},
+        }]
+        self.assertTrue(_needs_resynthesis(cached_llm_only, run_dir))
+        self.assertFalse(_needs_resynthesis(spans, run_dir))
+
+        # --- simulate_replay loads episodes from worker.log in a state_dir ---
+        state = self.path('replay-state')
+        os.makedirs(os.path.join(state, 'runs', 'r1'))
+        with open(os.path.join(state, 'runs', 'r1', 'result.json'), 'w') as fh:
+            json.dump({'task_id': 'r1', 'status': 'succeeded', 'model': GLM}, fh)
+        tool_args = {'command': 'SELECT 1'}
+        with open(os.path.join(state, 'runs', 'r1', 'worker.log'), 'w') as fh:
+            fh.write(json.dumps({
+                'type': 'tool_use', 'timestamp': 1700000001000,
+                'part': {'type': 'tool', 'tool': 'bash',
+                         'state': {'status': 'completed', 'input': tool_args,
+                                   'output': '1 row'}},
+            }) + '\n')
+        summary = simulate_replay(state)
+        self.assertEqual(summary['total_episodes'], 1)
+        self.assertGreater(summary['tokens_before'], 0)
 
 
 class TestH9StateStatsAndCLI(HarnessTestCase):
@@ -3153,6 +3340,267 @@ class TestProxyPerTaskSmlManifests(HarnessTestCase):
         self.assertEqual(ep2['api_cost_usd'], 0.009)
         self.assertEqual(ep2['total_cost_usd'], 0.009)
         self.assertEqual(ep2['cost_accounting_status'], 'estimated')
+
+
+class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
+    def test_step_limit_salvage_passes_when_validation_passes(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_salvage_ok.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 1' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'salvage-pass',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                }, fh)
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 1\n')
+                raise GuardError('step_limit')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertEqual(res['status'], 'validation_passed_review_required')
+            self.assertEqual(res['salvaged_from'], 'step_limit')
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
+
+    def test_step_limit_salvage_blocks_and_restores_when_validation_fails(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_salvage_fail.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'salvage-fail',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                }, fh)
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 1\n')
+                raise GuardError('step_limit')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 1)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'blocked')
+            self.assertEqual(out['reason'], 'step_limit')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertEqual(res['status'], 'blocked')
+            self.assertEqual(res['reason'], 'step_limit')
+            self.assertIsNone(res.get('salvaged_from'))
+            self.assertFalse(res.get('micro_repair_attempted', False))
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 0\n')
+
+    def test_validate_task_adaptive_steps_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f1 = os.path.join(tmp, 'a.py')
+            f2 = os.path.join(tmp, 'b.py')
+            f3 = os.path.join(tmp, 'c.py')
+            for p in (f1, f2, f3):
+                with open(p, 'w', encoding='utf-8') as fh:
+                    fh.write('x = 1\n')
+            base = {
+                'task_id': 'adaptive-1',
+                'directory': tmp,
+                'prompt': 'edit files',
+                'test_argv': [sys.executable, '-c', 'pass'],
+            }
+            self.assertEqual(validate_task(dict(base, files=[f1], max_steps=6))['max_steps'], 7)
+            self.assertEqual(validate_task(dict(base, files=[f1], max_steps=10))['max_steps'], 10)
+            self.assertEqual(validate_task(dict(base, files=[f1, f2], max_steps=6))['max_steps'], 10)
+            self.assertEqual(validate_task(dict(base, files=[f1, f2, f3], max_steps=6))['max_steps'], 13)
+            self.assertEqual(
+                validate_task(dict(base, files=[f1, f2, f3], max_steps=6, adaptive_steps=False))['max_steps'],
+                6,
+            )
+            self.assertEqual(
+                validate_task(dict(
+                    base,
+                    files=[f1, f2, f3],
+                    max_steps=6,
+                    mode='patch',
+                    patch_file=os.path.join(tmp, 'out.patch'),
+                ))['max_steps'],
+                6,
+            )
+
+    def test_auto_micro_repair_triggers_above_8_steps_with_current_patch(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            helper = os.path.join(repo, 'helper.py')
+            with open(helper, 'w', encoding='utf-8') as fh:
+                fh.write('HELPER = 1\n')
+            task_path = os.path.join(tmp, 'task_repair.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repair-10-steps',
+                    'directory': repo,
+                    'files': [target, helper],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'max_steps': 12,
+                    'max_cost_usd': 0.10,
+                }, fh)
+
+            seen_repair_tasks = []
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                if len(seen_repair_tasks) == 0 and not result.get('micro_repair_attempted'):
+                    with open(target, 'w', encoding='utf-8') as fh:
+                        fh.write('VALUE = 1\n')
+                    result['steps'] = 10
+                    result['cost'] = 0.05
+                    return
+                seen_repair_tasks.append(dict(task))
+                with open(target, 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 2\n')
+                result['steps'] = 2
+                result['cost'] = 0.01
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen_repair_tasks), 1)
+            repair_task = seen_repair_tasks[0]
+            self.assertEqual(repair_task['max_steps'], 6)
+            self.assertIn('[CURRENT_PATCH]', repair_task['prompt'])
+            self.assertIn('+VALUE = 1', repair_task['prompt'])
+            out = json.loads(buf.getvalue())
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertTrue(res['micro_repair_attempted'])
+            self.assertEqual(res['steps'], 12)
+            self.assertAlmostEqual(res['cost'], 0.06)
+
+    def test_inject_edit_failure_hints_and_idempotency(self):
+        # Empty / non-list inputs pass through cleanly.
+        self.assertEqual(inject_edit_failure_hints([]), ([], 0))
+
+        # Non-trailing tool error is ignored.
+        non_trailing = [
+            {'role': 'tool', 'tool_call_id': 'e0', 'content': 'oldString not found in file'},
+            {'role': 'assistant', 'content': 'retrying'},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'ok'},
+        ]
+        out, count = inject_edit_failure_hints(non_trailing)
+        self.assertEqual(count, 0)
+        self.assertIs(out, non_trailing)
+
+        # All four mismatch patterns trigger on trailing tool messages (case-insensitive).
+        for phrase in (
+            'Error: oldString not found in content',
+            'old_string not found',
+            'FAILED TO MATCH target block',
+            'No exact match found',
+        ):
+            msgs = [
+                {'role': 'user', 'content': 'edit it'},
+                {'role': 'tool', 'tool_call_id': 'e1', 'content': phrase},
+            ]
+            snapshot = json.dumps(msgs)
+            updated, count = inject_edit_failure_hints(msgs)
+            self.assertEqual(count, 1)
+            self.assertEqual(json.dumps(msgs), snapshot)  # pure: input untouched
+            self.assertIn('[HARNESS_EDIT_HINT:', updated[1]['content'])
+            # Idempotent on re-run.
+            again, count2 = inject_edit_failure_hints(updated)
+            self.assertEqual(count2, 0)
+            self.assertIs(again, updated)
+
+        # Trailing tool_result block in user message is also handled idempotently.
+        block_msgs = [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'e2', 'content': 'oldString not found'},
+                ],
+            }
+        ]
+        updated_blocks, bcount = inject_edit_failure_hints(block_msgs)
+        self.assertEqual(bcount, 1)
+        self.assertIn('[HARNESS_EDIT_HINT:', updated_blocks[0]['content'][0]['content'])
+        again_blocks, bcount2 = inject_edit_failure_hints(updated_blocks)
+        self.assertEqual(bcount2, 0)
+        self.assertIs(again_blocks, updated_blocks)
+
+    def test_proxy_injects_edit_failure_hints(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [
+            {'role': 'user', 'content': 'fix function'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'e1', 'function': {'name': 'edit', 'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'e1', 'content': 'Error: oldString not found in file'},
+        ]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][2]['content']
+        self.assertIn('[HARNESS_EDIT_HINT:', forwarded)
+        summary = proxy.summary()
+        self.assertEqual(summary['edit_hints_injected'], 1)
+        self.assertTrue(any(s.get('name') == 'guard.edit_failure_hint' for s in summary['spans']))
 
 
 if __name__ == '__main__':

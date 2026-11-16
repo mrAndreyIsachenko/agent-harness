@@ -42,6 +42,7 @@ __all__ = [
     "detect_duplicate_tool_calls",
     "estimate_messages_tokens",
     "extract_compact_test_failure",
+    "inject_edit_failure_hints",
 ]
 
 #: Forbidden keys that must never leave the local harness in an LLM egress payload.
@@ -831,6 +832,105 @@ def detect_duplicate_tool_calls(messages: Iterable[Mapping[str, Any]] | None) ->
                             f"with {err_prefix!r} in last 6 assistant turns"
                         ]
     return []
+
+
+_EDIT_MISMATCH_RE = re.compile(
+    r"(?:oldstring not found|old_string not found|failed to match|no exact match)",
+    re.IGNORECASE,
+)
+_EDIT_HINT_MARKER = "[HARNESS_EDIT_HINT"
+_EDIT_FAILURE_HINT = (
+    "\n[HARNESS_EDIT_HINT: Exact target text did not match file contents. "
+    "Do NOT retry the same edit blindly; call read with offset/limit around "
+    "the target lines first, then apply a single accurate edit.]"
+)
+
+
+def inject_edit_failure_hints(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """H-17: append a recovery hint to trailing edit-mismatch tool results.
+
+    Scans the latest trailing ``role == "tool"`` messages (or trailing
+    ``tool_result`` content blocks) without mutating ``messages``. If a tool
+    result matches an edit-target mismatch error and does not already contain
+    ``[HARNESS_EDIT_HINT``, appends ``_EDIT_FAILURE_HINT`` and returns the
+    new message list together with the number of hints injected.
+    """
+    if not isinstance(messages, list) or not messages:
+        return (messages, 0)
+
+    new_messages: list[dict[str, Any]] | None = None
+    injected = 0
+
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict):
+            break
+        role = message.get("role")
+        if role == "tool":
+            text = _message_text(message)
+            if _EDIT_MISMATCH_RE.search(text) and _EDIT_HINT_MARKER not in text:
+                content = message.get("content")
+                if isinstance(content, list):
+                    updated_content: Any = [
+                        *content,
+                        {"type": "text", "text": _EDIT_FAILURE_HINT},
+                    ]
+                elif isinstance(content, str):
+                    updated_content = content + _EDIT_FAILURE_HINT
+                else:
+                    updated_content = _EDIT_FAILURE_HINT
+                if new_messages is None:
+                    new_messages = list(messages)
+                new_messages[index] = {**message, "content": updated_content}
+                injected += 1
+            continue
+
+        content = message.get("content")
+        if (
+            index == len(messages) - 1
+            and isinstance(content, list)
+            and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            )
+        ):
+            new_content: list[Any] | None = None
+            for block_index, block in enumerate(content):
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                block_text = _message_text({"content": block.get("content")})
+                if (
+                    _EDIT_MISMATCH_RE.search(block_text)
+                    and _EDIT_HINT_MARKER not in block_text
+                ):
+                    block_content = block.get("content")
+                    if isinstance(block_content, list):
+                        updated_block_content: Any = [
+                            *block_content,
+                            {"type": "text", "text": _EDIT_FAILURE_HINT},
+                        ]
+                    elif isinstance(block_content, str):
+                        updated_block_content = block_content + _EDIT_FAILURE_HINT
+                    else:
+                        updated_block_content = _EDIT_FAILURE_HINT
+                    if new_content is None:
+                        new_content = list(content)
+                    new_content[block_index] = {
+                        **block,
+                        "content": updated_block_content,
+                    }
+                    injected += 1
+            if new_content is not None:
+                if new_messages is None:
+                    new_messages = list(messages)
+                new_messages[index] = {**message, "content": new_content}
+        break
+
+    if new_messages is None:
+        return (messages, 0)
+    return (new_messages, injected)
 
 
 def _sql_skeleton_lines(text: str) -> list[str]:

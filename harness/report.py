@@ -445,6 +445,7 @@ def _load_replay_episodes(records_or_state_dir: list[dict] | str | Path) -> list
 
         episodes = []
         for _, run_dir in run_dirs:
+            result = None
             result_path = run_dir / "result.json"
             if result_path.is_file():
                 try:
@@ -455,6 +456,7 @@ def _load_replay_episodes(records_or_state_dir: list[dict] | str | Path) -> list
                     episodes.append(result)
                     continue
             requests_path = run_dir / "requests.json"
+            appended = False
             if requests_path.is_file():
                 try:
                     req_payload = json.loads(requests_path.read_text(encoding="utf-8"))
@@ -462,6 +464,7 @@ def _load_replay_episodes(records_or_state_dir: list[dict] | str | Path) -> list
                     req_payload = None
                 if isinstance(req_payload, dict) and isinstance(req_payload.get("messages"), list):
                     episodes.append(req_payload)
+                    appended = True
                 elif isinstance(req_payload, list):
                     with_msgs = [
                         item for item in req_payload
@@ -469,6 +472,63 @@ def _load_replay_episodes(records_or_state_dir: list[dict] | str | Path) -> list
                     ]
                     if with_msgs:
                         episodes.append(with_msgs[-1])
+                        appended = True
+            if appended:
+                continue
+
+            # Fall back to worker.log JSONL (tool_use lines) as synthetic episodes.
+            worker_log = run_dir / "worker.log"
+            if not worker_log.is_file():
+                continue
+            try:
+                worker_text = worker_log.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            messages: list[dict] = []
+            for line in worker_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                if obj.get("type") != "tool_use":
+                    continue
+                part = obj.get("part")
+                if not isinstance(part, dict):
+                    continue
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                tool_name = str(part.get("tool") or "unknown")
+                raw_input = state.get("input", part.get("input"))
+                if raw_input is None:
+                    raw_input = {}
+                raw_output = state.get("output", state.get("error", part.get("output")))
+                call_id = f"{run_dir.name}:tool:{len(messages)}"
+                messages.append({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(raw_input, default=str),
+                        },
+                    }],
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": tool_name,
+                    "content": str(raw_output if raw_output is not None else ""),
+                })
+            if messages:
+                episodes.append({
+                    "model": (result or {}).get("model") if isinstance(result, dict) else None,
+                    "messages": messages,
+                })
         return episodes
 
     return [item for item in (records_or_state_dir or []) if isinstance(item, dict)]

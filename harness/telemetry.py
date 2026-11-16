@@ -100,6 +100,30 @@ class HarnessTracer:
                     handle.write(json.dumps(span, sort_keys=True) + '\n')
         return span
 
+    def record_tool_span(self, tool_name: str, *, arguments: dict | str | None = None,
+                         output: str | None = None, status: str = 'OK',
+                         start_time_ns: int | None = None, end_time_ns: int | None = None,
+                         step_index: int | None = None) -> dict:
+        """Record an OpenInference TOOL span parented to the root run span."""
+        attributes: dict = {'tool.name': tool_name}
+        if arguments is not None:
+            serialized = (arguments if isinstance(arguments, str)
+                          else json.dumps(arguments, sort_keys=True, default=str))
+            attributes['tool.parameters'] = serialized[:2000]
+        if output is not None:
+            attributes['output.value'] = str(output)[:2000]
+        if step_index is not None:
+            attributes['harness.turn_index'] = step_index
+        return self.record_span(
+            tool_name,
+            kind='TOOL',
+            parent_span_id=self.root_span_id,
+            start_time_ns=start_time_ns,
+            end_time_ns=end_time_ns,
+            status=status,
+            attributes=attributes,
+        )
+
     def to_otlp_payload(self) -> dict:
         """Convert recorded spans into OTLP/HTTP JSON ExportTraceServiceRequest."""
         with self._lock:
@@ -314,9 +338,15 @@ def format_trace_tree(spans: list[dict]) -> str:
         extras = ', '.join(f"{key}={attributes[key]}"
                            for key in _PREVIEW_ATTR_KEYS if key in attributes)
         suffix = f'  {extras}' if extras else ''
-        lines.append(f"{prefix}{connector}[{kind}] {span.get('name', '?')}"
-                     f"  latency_ms={latency_ms:.1f}"
-                     f"  status={span.get('status', 'OK')}{suffix}")
+        if kind == 'TOOL':
+            tool_name = attributes.get('tool.name') or span.get('name', '?')
+            status = span.get('status', 'OK')
+            lines.append(f"{prefix}{connector}[TOOL] {tool_name} ({status})"
+                         f"  latency_ms={latency_ms:.1f}{suffix}")
+        else:
+            lines.append(f"{prefix}{connector}[{kind}] {span.get('name', '?')}"
+                         f"  latency_ms={latency_ms:.1f}"
+                         f"  status={span.get('status', 'OK')}{suffix}")
         kids = children.get(span.get('span_id'), [])
         for index, child in enumerate(kids):
             last = index == len(kids) - 1
@@ -520,6 +550,11 @@ def _needs_resynthesis(spans: list[dict], run_path: Path) -> bool:
         return False
     if any((s.get('end_time_ns') or 0) < (s.get('start_time_ns') or 0) for s in spans):
         return True
+    if not any(
+        (s.get('attributes') or {}).get('openinference.span.kind') == 'TOOL' for s in spans
+    ) and _extract_tool_events(_load_run_messages(run_path)):
+        # Cached traces.jsonl predates TOOL span synthesis from worker.log.
+        return True
     root = next((s for s in spans if s.get('name') == 'harness.task'), None)
     if root is not None:
         attrs = root.get('attributes') or {}
@@ -530,6 +565,118 @@ def _needs_resynthesis(spans: list[dict], run_path: Path) -> bool:
             return (run_path / 'events.jsonl').is_file() or (run_path / 'requests.json').is_file()
         return False
     return (run_path / 'requests.json').is_file() or (run_path / 'events.jsonl').is_file()
+
+
+def _load_run_messages(run_path: Path) -> list:
+    """Load ``messages`` from ``requests.json``, falling back to ``worker.log`` JSONL.
+
+    Real OpenCode runs write ``worker.log`` as JSONL where each line is a dict
+    like ``{"type": "tool_use", "timestamp": ..., "part": {"type": "tool",
+    "tool": "read", "state": {...}}}``. Such lines are converted into tool
+    part dicts that ``_extract_tool_events`` understands.
+    """
+    try:
+        payload = json.loads((run_path / 'requests.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+        return payload['messages']
+
+    worker_log = run_path / 'worker.log'
+    if not worker_log.is_file():
+        return []
+    try:
+        text = worker_log.read_text(encoding='utf-8')
+    except OSError:
+        return []
+    messages: list = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get('type') == 'tool_use' or (
+            isinstance(obj.get('part'), dict) and obj['part'].get('type') == 'tool'
+        ):
+            if not isinstance(obj.get('part'), dict):
+                continue
+            part = dict(obj['part'])
+            if 'time' not in part or part.get('state'):
+                part.setdefault('time', {'start': obj.get('timestamp'), 'end': obj.get('timestamp')})
+            messages.append(part)
+    return messages
+
+
+def _extract_tool_events(messages: list) -> list[dict]:
+    """Extract normalized tool call dicts from OpenCode/OpenAI message snapshots."""
+    events: list[dict] = []
+
+    def _serialize_params(raw) -> str:
+        if raw is None:
+            return ''
+        text = raw if isinstance(raw, str) else json.dumps(raw, sort_keys=True, default=str)
+        return text[:2000]
+
+    def _add_part(part: dict) -> None:
+        state = part.get('state') if isinstance(part.get('state'), dict) else {}
+        tool_name = str(part.get('tool') or part.get('name') or 'unknown')
+        raw_input = state.get('input', part.get('input', part.get('arguments')))
+        raw_output = state.get('output', part.get('output', part.get('result')))
+        err = state.get('error') or part.get('error')
+        raw_status = str(state.get('status') or part.get('status') or '').lower()
+        status = 'ERROR' if (err or raw_status in ('error', 'failed')) else 'OK'
+        if raw_output is None and err:
+            raw_output = err
+        time_obj = state.get('time') if isinstance(state.get('time'), dict) else (
+            part.get('time') if isinstance(part.get('time'), dict) else {}
+        )
+        t_start = _timestamp_to_ns(time_obj.get('start') or time_obj.get('created'))
+        t_end = _timestamp_to_ns(time_obj.get('end') or time_obj.get('completed'))
+        events.append({
+            'tool_name': tool_name,
+            'parameters': _serialize_params(raw_input),
+            'output': str(raw_output)[:2000] if raw_output is not None else '',
+            'status': status,
+            'start_ns': t_start,
+            'end_ns': t_end,
+        })
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('type') == 'tool' or ('tool' in msg and 'parts' not in msg and 'tool_calls' not in msg):
+            _add_part(msg)
+            continue
+        parts = msg.get('parts')
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict) and (part.get('type') == 'tool' or 'tool' in part):
+                    _add_part(part)
+        tool_calls = msg.get('tool_calls')
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
+                tool_name = str(fn.get('name') or tc.get('name') or tc.get('tool') or 'unknown')
+                raw_args = fn.get('arguments', tc.get('arguments', tc.get('input')))
+                raw_out = tc.get('output', tc.get('result'))
+                err = tc.get('error')
+                status = 'ERROR' if (err or str(tc.get('status') or '').lower() in ('error', 'failed')) else 'OK'
+                events.append({
+                    'tool_name': tool_name,
+                    'parameters': _serialize_params(raw_args),
+                    'output': str(raw_out if raw_out is not None else (err or ''))[:2000],
+                    'status': status,
+                    'start_ns': None,
+                    'end_ns': None,
+                })
+    return events
 
 
 def synthesize_spans_from_run_dir(run_dir: str | Path) -> list[dict]:
@@ -697,6 +844,34 @@ def synthesize_spans_from_run_dir(run_dir: str | Path) -> list[dict]:
                     'output.value': rec_output,
                     'output.mime_type': 'application/json',
                 },
+            })
+
+    tool_events = _extract_tool_events(_load_run_messages(run_path))
+    if tool_events:
+        tool_window = max((end_ns - start_ns) // (len(tool_events) + 1), 1)
+        for idx, tev in enumerate(tool_events):
+            t_start = tev['start_ns'] if tev['start_ns'] is not None else (start_ns + idx * tool_window)
+            t_end = tev['end_ns'] if tev['end_ns'] is not None else (t_start + tool_window)
+            if t_end < t_start:
+                t_end = t_start
+            tool_attrs = {
+                'openinference.span.kind': 'TOOL',
+                'openinference.project.name': project_name,
+                'tool.name': tev['tool_name'],
+            }
+            if tev['parameters']:
+                tool_attrs['tool.parameters'] = tev['parameters']
+            if tev['output']:
+                tool_attrs['output.value'] = tev['output']
+            child_spans.append({
+                'name': tev['tool_name'],
+                'span_id': _deterministic_hex(f'{run_id}:tool:{idx}', 16),
+                'trace_id': trace_id,
+                'parent_span_id': root_span_id,
+                'start_time_ns': t_start,
+                'end_time_ns': t_end,
+                'status': tev['status'],
+                'attributes': tool_attrs,
             })
 
     if total_cost == 0.0 and sum_req_cost > 0.0:

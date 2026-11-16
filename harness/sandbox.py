@@ -62,6 +62,8 @@ from .guards import build_file_skeletons, extract_compact_test_failure
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
 from .routing import DEFAULT_MODEL, MODELS
 
+MAX_STEPS = LIMITS['max_steps'][1]
+
 CLI = os.environ.get("HARNESS_CLI") or os.environ.get("OPENCODE_CLI") or "/Applications/OpenCode.app/Contents/Resources/opencode-cli"
 # The durable journal stays next to the launcher facade when loaded via opencode_guard;
 # otherwise use finops.STATE (which honors HARNESS_STATE_DIR).
@@ -145,6 +147,8 @@ def validate_task(raw):
             raise GuardError(f'invalid_{key}')
         if value > default and (not isinstance(t.get('limit_reason'), str) or not t['limit_reason'].strip()):
             raise GuardError('limit_increase_requires_written_reason')
+    if t['mode'] == 'model' and t.get('adaptive_steps', True):
+        t['max_steps'] = min(MAX_STEPS, max(int(t['max_steps']), 4 + 3 * len(t['files'])))
     return t
 
 def capture_files(run_dir, files):
@@ -491,6 +495,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                 is_real_cli = False
             use_proxy = (not check and task['mode'] != 'command' and (upstream_url is not None or is_real_cli))
             started_ref = [None]
+            active_max_steps = [task['max_steps']]
             try:
                 if task['mode'] != 'command':
                     verify_db(db)
@@ -505,10 +510,10 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                             if snap_cur is None:
                                 return None
                             m_cur = metrics(snap_cur)
-                            reason = violation(m_cur, budget, task['max_steps'])
+                            reason = violation(m_cur, budget, active_max_steps[0])
                             if reason:
                                 return reason
-                            if m_cur['steps'] >= task['max_steps'] and not m_cur['unfinished']:
+                            if m_cur['steps'] >= active_max_steps[0] and not m_cur['unfinished']:
                                 return 'step_limit'
                             return None
                         proxy = stack.enter_context(openrouter_proxy(
@@ -523,6 +528,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                 if check:
                     result['status'] = 'configuration_verified_no_model_call'
                 else:
+                    salvage_candidate = None
                     if task['mode'] == 'command':
                         rc = execute(task['command_argv'], task['directory'], task['timeout_seconds'], run_dir / 'command.log')
                         if rc:
@@ -532,12 +538,22 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                         if snapshot(db, sid) is not None:
                             raise GuardError('session_id_collision')
                         result['session_id'] = sid
-                        model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
+                        try:
+                            model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
+                        except GuardError as exc:
+                            if (task['mode'] == 'model'
+                                    and str(exc) in ('step_limit', 'worker_timeout')
+                                    and _fh(task['files']) != result['hashes_before']):
+                                capture_files(run_dir, tracked)
+                                salvage_candidate = str(exc)
+                                event(run_dir, 'salvage_validation_started', reason=salvage_candidate)
+                            else:
+                                raise
                         if task['mode'] == 'patch':
                             if _fh(task['files']) != result['hashes_before']:
                                 raise GuardError('patch_worker_modified_source')
                             check_patch(task)
-                        elif _fh(task['files']) == result['hashes_before']:
+                        elif salvage_candidate is None and _fh(task['files']) == result['hashes_before']:
                             raise GuardError('no_change')
                     if task['mode'] == 'patch':
                         result['status'] = 'patch_ready_review_required'
@@ -547,18 +563,31 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                                                             task['test_timeout_seconds'], run_dir / 'test.log')
                         if result['test_return_code']:
                             capture_files(run_dir, tracked)
+                            if salvage_candidate is not None:
+                                raise GuardError(salvage_candidate)
                             if (task.get('auto_micro_repair', True)
                                     and task['mode'] == 'model'
                                     and (run_dir / 'changes.patch').exists()
                                     and (run_dir / 'changes.patch').stat().st_size > 0
                                     and result.get('cost') is not None
-                                    and result.get('steps', 0) <= 8
-                                    and result['cost'] <= 0.06):
+                                    and result.get('steps', 0) <= task['max_steps']
+                                    and result['cost'] <= min(budget * 0.8, 0.08)):
                                 compact_failure = extract_compact_test_failure(
                                     (run_dir / 'test.log').read_text(errors='replace'), '')
-                                repair_task = dict(task, max_steps=4, prompt=task['prompt']
-                                                   + '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
-                                                   + compact_failure)
+                                current_patch = (run_dir / 'changes.patch').read_text(errors='replace')[:4000]
+                                repair_max_steps = min(6, MAX_STEPS)
+                                active_max_steps[0] = repair_max_steps
+                                repair_task = dict(
+                                    task,
+                                    max_steps=repair_max_steps,
+                                    prompt=(
+                                        task['prompt']
+                                        + '\n\n[CURRENT_PATCH]\n'
+                                        + current_patch
+                                        + '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
+                                        + compact_failure
+                                    ),
+                                )
                                 primary_steps = result.get('steps', 0)
                                 primary_cost = result.get('cost')
                                 primary_observed = result.get('observed_cost')
@@ -596,6 +625,8 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                                     Path(dst).write_bytes(Path(src).read_bytes())
                                 elif Path(dst).exists():
                                     Path(dst).unlink()
+                        if salvage_candidate is not None:
+                            result['salvaged_from'] = salvage_candidate
                         result['status'] = 'validation_passed_review_required'
             except (GuardError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
                 result.update(status='blocked', reason=str(exc) if isinstance(exc, GuardError) else type(exc).__name__)

@@ -28,6 +28,7 @@ from .guards import (
     compact_context_window,
     compact_stale_reads,
     detect_duplicate_tool_calls,
+    inject_edit_failure_hints,
 )
 from .routing import ProviderHealthStore, apply_provider_routing
 from .telemetry import HarnessTracer
@@ -88,6 +89,7 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
         self._blocked_reason = None
         self._auth_bearer = None
         self._compacted_reads = 0
+        self._edit_hints_injected = 0
         self.degraded_providers = (set(health_store.active_degraded())
                                    if health_store is not None else set())
         self.sticky_provider = (health_store.get_sticky(default_model)
@@ -116,7 +118,8 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
                     'dispatched': [dict(d) for d in self._dispatched],
                     'blocked': [dict(b) for b in self._blocked],
                     'spans': list(self.tracer.spans),
-                    'compacted_reads': self._compacted_reads}
+                    'compacted_reads': self._compacted_reads,
+                    'edit_hints_injected': self._edit_hints_injected}
 
     def task_summaries(self) -> dict[str, dict]:
         with self._lock:
@@ -368,6 +371,24 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         last['content'] = (content if isinstance(content, str) else '') + notice
                     body = json.dumps(payload).encode('utf-8')
+            # H-17: inject recovery hints on trailing edit-target mismatch results.
+            if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+                new_msgs, hints_injected = inject_edit_failure_hints(payload['messages'])
+                if hints_injected > 0:
+                    payload['messages'] = new_msgs
+                    with self.server._lock:
+                        self.server._edit_hints_injected += hints_injected
+                    body = json.dumps(payload).encode('utf-8')
+                    self.server.tracer.record_span(
+                        'guard.edit_failure_hint',
+                        kind='GUARDRAIL',
+                        attributes={
+                            'guardrail.name': 'edit_failure_hint',
+                            'guardrail.triggered': True,
+                            'harness.edit_hints_injected': hints_injected,
+                            'harness.turn_index': turn_index,
+                        },
+                    )
             # H-8: on later turns, compact stale read outputs the guard cannot
             # rewrite in place (notice injection already re-encoded the body).
             if turn_index >= 5 and isinstance(payload, dict) and isinstance(payload.get('messages'), list):
