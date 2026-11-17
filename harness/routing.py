@@ -52,9 +52,11 @@ LATE_TURN_REASONING_MAX_TOKENS = 768
 LATE_TURN_START = 3
 QUIET_LATE_TURN_REASONING_MAX_TOKENS = 512
 ERROR_RECOVERY_REASONING_MAX_TOKENS = 1536
+ERROR_RECOVERY_MAX_TOKENS_CAP = 12288
 ERROR_SIGNAL_SUBSTRINGS = ('[AST PREFLIGHT ERROR', '[GUARD LOOP WARNING',
                            'Traceback (most recent call last)', 'SyntaxError',
-                           'FAILED ', 'AssertionError')
+                           'FAILED ', 'AssertionError',
+                           'could not be parsed as JSON', '[HARNESS_EDIT_HINT')
 GLM_51_REASONING_MAX_TOKENS = DEFAULT_REASONING_MAX_TOKENS
 DEFAULT_MAX_TOKENS_CAP = 8192
 GLM_51_MAX_TOKENS_CAP = DEFAULT_MAX_TOKENS_CAP
@@ -230,7 +232,19 @@ def apply_provider_routing(body, path, *, default_model=None, turn_index=1, reas
         mcap = caps.get('max_tokens_cap')
         if mcap:
             cur_max = payload.get('max_tokens')
-            if cur_max is None or (type(cur_max) is int and cur_max > mcap):
+            messages = payload.get('messages')
+            last_text = (
+                _message_text(messages[-1]).lower()
+                if isinstance(messages, list) and messages
+                and isinstance(messages[-1], dict) else ''
+            )
+            if ('could not be parsed as json' in last_text
+                    or 'tool call json arguments were malformed or truncated' in last_text):
+                mcap = max(mcap or 0, ERROR_RECOVERY_MAX_TOKENS_CAP)
+                if cur_max != mcap:
+                    payload['max_tokens'] = mcap
+                    changed = True
+            elif cur_max is None or (type(cur_max) is int and cur_max > mcap):
                 payload['max_tokens'] = mcap
                 changed = True
     return json.dumps(payload).encode('utf-8') if changed else body

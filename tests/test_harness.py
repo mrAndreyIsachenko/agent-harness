@@ -34,7 +34,8 @@ from harness.finops import (auto_reconcile_from_proxy,
                             metrics, number, prior_cost, reconcile_run,
                             request_records, resolved_cost, snapshot,
                             verify_db, violation)
-from harness.guards import (FORBIDDEN_EGRESS_KEYS, build_file_skeletons,
+from harness.guards import (FORBIDDEN_EGRESS_KEYS, _EDIT_FAILURE_HINT,
+                            _message_text, build_file_skeletons,
                             check_allowed_files_syntax, check_egress_payload,
                             check_readonly_sql_tool_calls, check_sql_syntax,
                             collect_python_top_symbols, compact_context_window,
@@ -46,11 +47,13 @@ from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
                             format_replay_markdown, format_state_stats_markdown,
                             scan_state_runs, simulate_replay, summarize_run)
 from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
+                             ERROR_RECOVERY_MAX_TOKENS_CAP,
                              ERROR_RECOVERY_REASONING_MAX_TOKENS, LATE_TURN_REASONING_MAX_TOKENS,
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
                              ProviderHealthStore, apply_provider_routing,
                              select_escalated_model)
-from harness.sandbox import (GuardError, capture_files, config_for, execute,
+from harness.sandbox import (GuardError, capture_files, compute_repair_max_steps,
+                             config_for, execute,
                              file_hashes, isolated_worktree, locks,
                              main as sandbox_main, model_run, owned_process,
                              preflight, run_task, stop_group, validate_task,
@@ -3789,7 +3792,8 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertEqual(rc, 0)
             self.assertEqual(len(seen_repair_tasks), 1)
             repair_task = seen_repair_tasks[0]
-            self.assertEqual(repair_task['max_steps'], 6)
+            self.assertEqual(repair_task['max_steps'], 8)
+            self.assertIn('Apply the minimal targeted edit directly to fix the failure above', repair_task['prompt'])
             self.assertIn('[CURRENT_PATCH]', repair_task['prompt'])
             self.assertIn('+VALUE = 1', repair_task['prompt'])
             out = json.loads(buf.getvalue())
@@ -4094,5 +4098,133 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
         self.assertTrue(any(s.get('name') == 'guard.edit_failure_hint' for s in summary['spans']))
 
 
+        self.assertTrue(any(s.get('name') == 'guard.edit_failure_hint' for s in summary['spans']))
+
+    def test_validate_task_symlink_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            real = os.path.join(tmp, 'real')
+            os.makedirs(real)
+            with open(os.path.join(real, 'a.py'), 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            with open(os.path.join(real, 'ro.py'), 'w', encoding='utf-8') as fh:
+                fh.write('y = 2\n')
+            link = os.path.join(tmp, 'link')
+            os.symlink(real, link)
+            t = validate_task({
+                'task_id': 'symlink-alias',
+                'directory': link,
+                'files': [os.path.join(link, 'a.py')],
+                'read_only_files': [os.path.join(link, 'ro.py')],
+                'prompt': 'edit ' + os.path.join(link, 'a.py') + ' under ' + link,
+                'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+            })
+            real_dir = os.path.realpath(link)
+            self.assertEqual(t['directory'], real_dir)
+            self.assertEqual(t['files'], [os.path.join(real_dir, 'a.py')])
+            self.assertEqual(t['read_only_files'], [os.path.join(real_dir, 'ro.py')])
+            self.assertEqual(t['prompt'], 'edit ' + os.path.join(real_dir, 'a.py') + ' under ' + real_dir)
+            self.assertIn(os.path.join(link, 'a.py'), t['file_aliases'])
+            self.assertIn(os.path.join(link, 'ro.py'), t['read_only_file_aliases'])
+            cfg = config_for(t)
+            perms = cfg['agents']['guarded_worker']['permissions']
+            resources = [p['resource'] for p in perms if p['effect'] == 'allow']
+            self.assertIn(os.path.join(real_dir, 'a.py'), resources)
+            self.assertIn(os.path.join(link, 'a.py'), resources)
+            self.assertIn(os.path.join(link, 'ro.py'), resources)
+
+    def test_compute_repair_max_steps(self):
+        self.assertEqual(compute_repair_max_steps({'files': ['a.py']}), 6)
+        self.assertEqual(compute_repair_max_steps({'files': ['a.py', 'b.py']}), 8)
+        self.assertEqual(compute_repair_max_steps({'files': ['a.py', 'b.py', 'c.py']}), 10)
+        self.assertEqual(compute_repair_max_steps({'files': []}), 6)
+
+    def test_micro_repair_adaptive_steps(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            second = os.path.join(repo, 'b.py')
+            with open(second, 'w', encoding='utf-8') as fh:
+                fh.write('b = 1\n')
+            test_code = (
+                "import pathlib, sys; "
+                "txt = pathlib.Path('target.py').read_text(); "
+                "print('E   AssertionError: expected VALUE = 2') if 'VALUE = 2' not in txt else None; "
+                "sys.exit(0 if 'VALUE = 2' in txt else 1)"
+            )
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repair-adaptive',
+                    'directory': repo,
+                    'files': [target, second],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                }, fh)
+            seen_steps = []
+
+            def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+                seen_steps.append(task['max_steps'])
+                content = 'VALUE = 2\n' if '[TEST_ARGV FAILURE' in task['prompt'] else 'VALUE = 1\n'
+                with open(target, 'w', encoding='utf-8') as fh:
+                    fh.write(content)
+                result['steps'] = 1
+                result['cost'] = 0.01
+                result['observed_cost'] = 0.01
+
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path}):
+                with mock.patch('harness.sandbox.model_run', side_effect=fake_model_run):
+                    with contextlib.redirect_stdout(buf):
+                        rc = run_task(task_path, cli=cli_path,
+                                      db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen_steps), 2)
+            self.assertEqual(seen_steps[-1], 8)
+            self.assertNotEqual(seen_steps[0], 8)
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 2\n')
+
+    def test_inject_edit_failure_hints_opencode_errors(self):
+        errors = [
+            'Could not find oldString in /path/file.py',
+            'Found 2 matches for oldString, but expected exactly one.',
+            'No changes to apply: oldString and newString are identical.',
+            'The tool input could not be parsed as JSON, so the call was not executed.',
+            'Invalid arguments for tool "edit": missing oldString',
+        ]
+        for text in errors:
+            messages = [{'role': 'tool', 'content': text}]
+            updated, count = inject_edit_failure_hints(messages)
+            self.assertEqual(count, 1)
+            final_text = updated[-1]['content']
+            self.assertIn('[HARNESS_EDIT_HINT:', final_text)
+            if ('could not be parsed as JSON' in text
+                    or 'Invalid arguments for tool' in text):
+                self.assertIn('Keep oldString/newString small', final_text)
+            else:
+                self.assertIn('Exact target text did not match file contents', final_text)
+
+    def test_routing_boosts_max_tokens_on_json_truncation(self):
+        body = json.dumps({
+            'model': 'openrouter/z-ai/glm-5.3-flash',
+            'max_tokens': 8192,
+            'messages': [
+                {'role': 'user', 'content': 'hi'},
+                {'role': 'tool',
+                 'content': 'The tool input could not be parsed as JSON, '
+                            'so the call was not executed.'},
+            ],
+        }).encode('utf-8')
+        out = json.loads(apply_provider_routing(
+            body, '/v1/chat/completions', turn_index=3))
+        self.assertEqual(out['max_tokens'], ERROR_RECOVERY_MAX_TOKENS_CAP)
+
+
 if __name__ == '__main__':
     unittest.main()
+

@@ -835,10 +835,20 @@ def detect_duplicate_tool_calls(messages: Iterable[Mapping[str, Any]] | None) ->
 
 
 _EDIT_MISMATCH_RE = re.compile(
-    r"(?:oldstring not found|old_string not found|failed to match|no exact match)",
+    r"(?:oldstring not found|old_string not found|could not find oldstring|failed to match"
+    r"|no exact match|found \d+ matches for oldstring|oldstring and newstring are identical)",
+    re.IGNORECASE,
+)
+_TOOL_JSON_OR_ARGS_ERROR_RE = re.compile(
+    r"(?:could not be parsed as json|invalid arguments for tool)",
     re.IGNORECASE,
 )
 _EDIT_HINT_MARKER = "[HARNESS_EDIT_HINT"
+_EDIT_JSON_TRUNCATION_HINT = (
+    "\n[HARNESS_EDIT_HINT: Tool call JSON arguments were malformed or truncated. "
+    "Keep oldString/newString small (under 40 lines) and prefer targeted edit calls "
+    "instead of rewriting whole files.]"
+)
 _EDIT_FAILURE_HINT = (
     "\n[HARNESS_EDIT_HINT: Exact target text did not match file contents. "
     "Do NOT retry the same edit blindly; call read with offset/limit around "
@@ -870,17 +880,23 @@ def inject_edit_failure_hints(
         role = message.get("role")
         if role == "tool":
             text = _message_text(message)
-            if _EDIT_MISMATCH_RE.search(text) and _EDIT_HINT_MARKER not in text:
+            hint = None
+            if _EDIT_HINT_MARKER not in text:
+                if _TOOL_JSON_OR_ARGS_ERROR_RE.search(text):
+                    hint = _EDIT_JSON_TRUNCATION_HINT
+                elif _EDIT_MISMATCH_RE.search(text):
+                    hint = _EDIT_FAILURE_HINT
+            if hint is not None:
                 content = message.get("content")
                 if isinstance(content, list):
                     updated_content: Any = [
                         *content,
-                        {"type": "text", "text": _EDIT_FAILURE_HINT},
+                        {"type": "text", "text": hint},
                     ]
                 elif isinstance(content, str):
-                    updated_content = content + _EDIT_FAILURE_HINT
+                    updated_content = content + hint
                 else:
-                    updated_content = _EDIT_FAILURE_HINT
+                    updated_content = hint
                 if new_messages is None:
                     new_messages = list(messages)
                 new_messages[index] = {**message, "content": updated_content}
@@ -901,20 +917,23 @@ def inject_edit_failure_hints(
                 if not (isinstance(block, dict) and block.get("type") == "tool_result"):
                     continue
                 block_text = _message_text({"content": block.get("content")})
-                if (
-                    _EDIT_MISMATCH_RE.search(block_text)
-                    and _EDIT_HINT_MARKER not in block_text
-                ):
+                hint = None
+                if _EDIT_HINT_MARKER not in block_text:
+                    if _TOOL_JSON_OR_ARGS_ERROR_RE.search(block_text):
+                        hint = _EDIT_JSON_TRUNCATION_HINT
+                    elif _EDIT_MISMATCH_RE.search(block_text):
+                        hint = _EDIT_FAILURE_HINT
+                if hint is not None:
                     block_content = block.get("content")
                     if isinstance(block_content, list):
                         updated_block_content: Any = [
                             *block_content,
-                            {"type": "text", "text": _EDIT_FAILURE_HINT},
+                            {"type": "text", "text": hint},
                         ]
                     elif isinstance(block_content, str):
-                        updated_block_content = block_content + _EDIT_FAILURE_HINT
+                        updated_block_content = block_content + hint
                     else:
-                        updated_block_content = _EDIT_FAILURE_HINT
+                        updated_block_content = hint
                     if new_content is None:
                         new_content = list(content)
                     new_content[block_index] = {

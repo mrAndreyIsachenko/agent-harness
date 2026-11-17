@@ -89,10 +89,15 @@ def validate_task(raw):
     t = dict(raw)
     if not isinstance(t.get('task_id'), str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', t['task_id']):
         raise GuardError('invalid_task_id')
+    prompt_replacements = []
+    file_aliases = []
+    read_only_file_aliases = []
     directory = t.get('directory')
     if not isinstance(directory, str) or not Path(directory).is_absolute() or not Path(directory).is_dir():
         raise GuardError('invalid_working_directory')
     t['directory'] = str(Path(directory).resolve())
+    if os.path.abspath(directory) != t['directory']:
+        prompt_replacements.append((os.path.abspath(directory), t['directory']))
     files = t.get('files')
     if not isinstance(files, list) or not 1 <= len(files) <= 3:
         raise GuardError('exactly_one_to_three_files_required')
@@ -104,6 +109,9 @@ def validate_task(raw):
         if any(x in str(p) for x in '*?') or not p.parent.is_dir() or (p.exists() and not p.is_file()):
             raise GuardError('invalid_file_target')
         normalized.append(str(p))
+        if os.path.abspath(f) != str(p):
+            file_aliases.append(os.path.abspath(f))
+            prompt_replacements.append((os.path.abspath(f), str(p)))
     if len(set(normalized)) != len(normalized):
         raise GuardError('duplicate_file_or_symlink_alias')
     t['files'] = sorted(normalized)
@@ -120,6 +128,9 @@ def validate_task(raw):
         if str(p) in t['files']:
             raise GuardError('read_only_file_overlaps_editable_files')
         normalized_ro.append(str(p))
+        if os.path.abspath(f) != str(p):
+            read_only_file_aliases.append(os.path.abspath(f))
+            prompt_replacements.append((os.path.abspath(f), str(p)))
     t['read_only_files'] = sorted(set(normalized_ro))
     t['test_argv'] = executable_argv(t.get('test_argv'))
     t.setdefault('mode', 'model')
@@ -137,6 +148,13 @@ def validate_task(raw):
         t['patch_file'] = str(Path(p).resolve())
         if t['patch_file'] in t['files']:
             raise GuardError('patch_cannot_replace_source')
+        if os.path.abspath(p) != t['patch_file']:
+            prompt_replacements.append((os.path.abspath(p), t['patch_file']))
+    if isinstance(t.get('prompt'), str) and prompt_replacements:
+        for raw_abs, resolved in sorted(set(prompt_replacements), key=lambda item: len(item[0]), reverse=True):
+            t['prompt'] = t['prompt'].replace(raw_abs, resolved)
+    t['file_aliases'] = sorted(set(file_aliases))
+    t['read_only_file_aliases'] = sorted(set(read_only_file_aliases))
     t.setdefault('model', DEFAULT_MODEL)
     if t['model'] not in MODELS:
         raise GuardError('unsupported_model')
@@ -234,6 +252,10 @@ def config_for(task, *, base_url=None):
                     for path in task['files'] for action in actions]
     permissions += [{'action': 'read', 'resource': path, 'effect': 'allow'}
                     for path in task.get('read_only_files', ())]
+    permissions += [{'action': action, 'resource': path, 'effect': 'allow'}
+                    for path in task.get('file_aliases', ()) for action in actions]
+    permissions += [{'action': 'read', 'resource': path, 'effect': 'allow'}
+                    for path in task.get('read_only_file_aliases', ())]
     if task['mode'] == 'patch':
         permissions += [{'action': a, 'resource': task['patch_file'], 'effect': 'allow'} for a in ('read', 'edit')]
     cfg = {'model': task['model'], 'small_model': task['model'],
@@ -482,6 +504,12 @@ def isolated_worktree(task, run_dir):
         subprocess.run(['/usr/bin/git', 'worktree', 'remove', '--force', str(wt_root)],
                        cwd=repo_root, capture_output=True, timeout=30)
 
+def compute_repair_max_steps(task: dict) -> int:
+    """Adaptive micro-repair budget: tighter than the primary run but enough
+    for the worker to re-read only the failing region and apply one edit."""
+    return min(MAX_STEPS, max(6, 4 + 2 * len(task.get('files', ()))))
+
+
 def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None):
     if cli is None:
         cli = CLI
@@ -612,7 +640,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 compact_failure = extract_compact_test_failure(
                                     (run_dir / 'test.log').read_text(errors='replace'), '')
                                 current_patch = (run_dir / 'changes.patch').read_text(errors='replace')[:4000]
-                                repair_max_steps = min(6, MAX_STEPS)
+                                repair_max_steps = compute_repair_max_steps(task)
                                 active_max_steps[0] = repair_max_steps
                                 repair_task = dict(
                                     task,
@@ -622,6 +650,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                         + '\n\n[CURRENT_PATCH]\n'
                                         + current_patch
                                         + '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
+                                        + 'Apply the minimal targeted edit directly to fix the failure above; do NOT re-read entire files from scratch.\n'
                                         + compact_failure
                                     ),
                                 )
