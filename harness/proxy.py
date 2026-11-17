@@ -29,6 +29,7 @@ from .guards import (
     compact_stale_reads,
     detect_duplicate_tool_calls,
     inject_edit_failure_hints,
+    inject_read_guard_hints,
 )
 from .routing import ProviderHealthStore, apply_provider_routing
 from .telemetry import HarnessTracer
@@ -386,6 +387,22 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                             'guardrail.name': 'edit_failure_hint',
                             'guardrail.triggered': True,
                             'harness.edit_hints_injected': hints_injected,
+                            'harness.turn_index': turn_index,
+                        },
+                    )
+            # H-21: inject read-guard hints (permission denied / read budget).
+            if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+                new_msgs, read_hints = inject_read_guard_hints(payload['messages'])
+                if read_hints > 0:
+                    payload['messages'] = new_msgs
+                    body = json.dumps(payload).encode('utf-8')
+                    self.server.tracer.record_span(
+                        'guard.read_guard_hint',
+                        kind='GUARDRAIL',
+                        attributes={
+                            'guardrail.name': 'read_guard_hint',
+                            'guardrail.triggered': True,
+                            'harness.read_hints_injected': read_hints,
                             'harness.turn_index': turn_index,
                         },
                     )

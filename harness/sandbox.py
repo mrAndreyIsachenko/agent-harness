@@ -107,6 +107,20 @@ def validate_task(raw):
     if len(set(normalized)) != len(normalized):
         raise GuardError('duplicate_file_or_symlink_alias')
     t['files'] = sorted(normalized)
+    ro_raw = t.get('read_only_files', [])
+    if not isinstance(ro_raw, list) or not 0 <= len(ro_raw) <= 5:
+        raise GuardError('read_only_files_must_be_a_list_of_up_to_five_files')
+    normalized_ro = []
+    for f in ro_raw:
+        if not isinstance(f, str) or '\x00' in f or not Path(f).is_absolute():
+            raise GuardError('file_paths_must_be_absolute')
+        p = Path(f).resolve()
+        if any(x in str(p) for x in '*?') or not p.is_file():
+            raise GuardError('invalid_file_target')
+        if str(p) in t['files']:
+            raise GuardError('read_only_file_overlaps_editable_files')
+        normalized_ro.append(str(p))
+    t['read_only_files'] = sorted(set(normalized_ro))
     t['test_argv'] = executable_argv(t.get('test_argv'))
     t.setdefault('mode', 'model')
     if t['mode'] not in ('model', 'patch', 'command'):
@@ -137,6 +151,8 @@ def validate_task(raw):
         if t['mode'] == 'patch':
             raise GuardError('worktree_not_supported_for_patch_mode')
         if any(not Path(f).is_relative_to(Path(t['directory'])) for f in t['files']):
+            raise GuardError('worktree_files_must_be_under_directory')
+        if any(not Path(f).is_relative_to(Path(t['directory'])) for f in t['read_only_files']):
             raise GuardError('worktree_files_must_be_under_directory')
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
@@ -216,6 +232,8 @@ def config_for(task, *, base_url=None):
     actions = ('read',) if task['mode'] == 'patch' else ('read', 'edit')
     permissions += [{'action': action, 'resource': path, 'effect': 'allow'}
                     for path in task['files'] for action in actions]
+    permissions += [{'action': 'read', 'resource': path, 'effect': 'allow'}
+                    for path in task.get('read_only_files', ())]
     if task['mode'] == 'patch':
         permissions += [{'action': a, 'resource': task['patch_file'], 'effect': 'allow'} for a in ('read', 'edit')]
     cfg = {'model': task['model'], 'small_model': task['model'],
@@ -438,6 +456,16 @@ def isolated_worktree(task, run_dir):
             elif dst.exists():
                 dst.unlink()
             wt_files.append(str(dst))
+        wt_ro_files = []
+        for src in task.get('read_only_files', ()):
+            rel = Path(src).resolve().relative_to(repo_root)
+            dst = (wt_root / rel).resolve()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if Path(src).exists():
+                dst.write_bytes(Path(src).read_bytes())
+            elif dst.exists():
+                dst.unlink()
+            wt_ro_files.append(str(dst))
         prefix = str(repo_root)
         _fh = getattr(sys.modules.get('opencode_guard'), 'file_hashes', file_hashes)
         def remap(argv):
@@ -445,6 +473,7 @@ def isolated_worktree(task, run_dir):
         wt_task = dict(task, directory=str(wt_dir), files=wt_files,
                        prompt=task.get('prompt', '').replace(prefix, str(wt_root)),
                        origin_files=list(task['files']), origin_hashes=_fh(task['files']),
+                       read_only_files=wt_ro_files,
                        test_argv=remap(task['test_argv']))
         if 'command_argv' in task:
             wt_task['command_argv'] = remap(task['command_argv'])
@@ -453,7 +482,13 @@ def isolated_worktree(task, run_dir):
         subprocess.run(['/usr/bin/git', 'worktree', 'remove', '--force', str(wt_root)],
                        cwd=repo_root, capture_output=True, timeout=30)
 
-def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_url=None, fetch=None):
+def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None):
+    if cli is None:
+        cli = CLI
+    if db is None:
+        db = DB
+    if state is None:
+        state = STATE
     result = {'status': 'rejected', 'reason': '', 'artifact': None}
     reconciled_cost = None
     _fh = getattr(sys.modules.get('opencode_guard'), 'file_hashes', file_hashes)
@@ -473,6 +508,8 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
             if not check:
                 task = stack.enter_context(isolated_worktree(task, run_dir))
             tracked = task['files'] + ([task['patch_file']] if task['mode'] == 'patch' else [])
+            ro_files = task.get('read_only_files', ())
+            ro_hashes_before = _fh(ro_files)
             result = dict(task_id=task['task_id'], session_id=None, status='pending', reason='',
                           model=task['model'] if task['mode'] != 'command' else None,
                           cost=0, steps=0, observed_cost=0, prior_task_cost=spent,
@@ -616,6 +653,8 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                                                                     run_dir / 'test.log')
                             if result['test_return_code']:
                                 raise GuardError('validation_failed')
+                        if ro_files and _fh(ro_files) != ro_hashes_before:
+                            raise GuardError('read_only_file_modified')
                         if task.get('origin_files'):
                             if _fh(task['origin_files']) != task['origin_hashes']:
                                 raise GuardError('worktree_origin_modified_concurrently')
@@ -668,7 +707,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                               reason=str(exc) if isinstance(exc, GuardError) else type(exc).__name__)
                 try:
                     synthesize_spans_from_run_dir(run_dir)
-                    sync_state_traces_to_phoenix(run_dir, timeout=1.5)
+                    sync_state_traces_to_phoenix(state, timeout=1.5, max_runs=25)
                 except Exception:
                     pass
     except (GuardError, OSError, ValueError, TypeError, sqlite3.Error) as exc:

@@ -40,9 +40,11 @@ from harness.guards import (FORBIDDEN_EGRESS_KEYS, build_file_skeletons,
                             collect_python_top_symbols, compact_context_window,
                             compact_stale_reads, detect_duplicate_tool_calls,
                             estimate_messages_tokens, extract_compact_test_failure,
-                            inject_edit_failure_hints)
+                            inject_edit_failure_hints,
+                            inject_read_guard_hints)
 from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
-                            format_state_stats_markdown, scan_state_runs, summarize_run)
+                            format_replay_markdown, format_state_stats_markdown,
+                            scan_state_runs, simulate_replay, summarize_run)
 from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
                              ERROR_RECOVERY_REASONING_MAX_TOKENS, LATE_TURN_REASONING_MAX_TOKENS,
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
@@ -104,6 +106,14 @@ def _post_chat(base_url, body):
 class HarnessTestCase(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix='harness-test-')
+        self._prev_otel_disabled = os.environ.get('HARNESS_OTEL_DISABLED')
+        os.environ['HARNESS_OTEL_DISABLED'] = '1'
+
+    def tearDown(self):
+        if self._prev_otel_disabled is None:
+            os.environ.pop('HARNESS_OTEL_DISABLED', None)
+        else:
+            os.environ['HARNESS_OTEL_DISABLED'] = self._prev_otel_disabled
 
     def path(self, name):
         import os
@@ -842,6 +852,100 @@ class TestTelemetry(HarnessTestCase):
         self.assertEqual(child['attributes']['llm.token_count.total'], 175)
         self.assertEqual(child['attributes']['llm.cost.total'], 0.012)
 
+    def test_flush_otlp_disabled_env(self):
+        seen = []
+
+        class _Collector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                self.rfile.read(length)
+                seen.append(1)
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        tracer = HarnessTracer(service_name='otel-disabled-test')
+        tracer.record_span('gen_ai.chat', kind='LLM', attributes={'gen_ai.request.model': GLM})
+        try:
+            blocked = tracer.flush_otlp(endpoint=None)
+            self.assertFalse(blocked)
+            self.assertEqual(seen, [])
+            explicit = tracer.flush_otlp(endpoint='http://127.0.0.1:%d' % server.server_port)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertTrue(explicit)
+        self.assertEqual(len(seen), 1)
+
+    def test_sync_state_traces_ledger_base_and_disabled_skip(self):
+        from pathlib import Path
+        from harness.telemetry import sync_state_traces_to_phoenix
+
+        state_dir = Path(self.path('state'))
+        seen = []
+
+        class _Collector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                self.rfile.read(length)
+                seen.append(1)
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        endpoint = 'http://127.0.0.1:%d' % server.server_port
+
+        def make_run(run_id):
+            run_dir = state_dir / 'runs' / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / 'task.json').write_text(json.dumps({
+                'task_id': run_id, 'model': GLM, 'files': ['a.py'], 'prompt': 'Fix a.py',
+            }))
+            (run_dir / 'result.json').write_text(json.dumps({
+                'task_id': run_id, 'status': 'succeeded', 'model': GLM,
+                'cost': 0.01, 'steps': 1,
+            }))
+            (run_dir / 'events.jsonl').write_text(
+                json.dumps({'time': 1700000000.0, 'event': 'run_started'}) + '\n'
+                + json.dumps({'time': 1700000010.0, 'event': 'run_finished'}) + '\n'
+            )
+            return run_dir
+
+        make_run('run-sync-1')
+        try:
+            result = sync_state_traces_to_phoenix(state_dir / 'runs' / 'run-sync-1',
+                                                  endpoint=endpoint)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(result['newly_synced'], 1)
+        self.assertEqual(len(seen), 1)
+        # The ledger lands next to `runs/`, not inside the run directory.
+        ledger = state_dir / 'phoenix-sync-state.json'
+        self.assertTrue(ledger.is_file())
+        synced = json.loads(ledger.read_text())['synced']
+        self.assertIn('run-sync-1', synced)
+        self.assertFalse((state_dir / 'runs' / 'run-sync-1'
+                          / 'phoenix-sync-state.json').exists())
+
+        # HARNESS_OTEL_DISABLED=1 (set in setUp) skips the network entirely.
+        make_run('run-sync-2')
+        blocked = sync_state_traces_to_phoenix(state_dir, endpoint=None)
+        self.assertEqual(blocked['newly_synced'], 0)
+        self.assertEqual(blocked['pending_unsynced'], 1)
+        self.assertFalse(blocked['collector_reachable'])
+        self.assertEqual(len(seen), 1)  # no additional POST
+        synced2 = json.loads(ledger.read_text())['synced']
+        self.assertNotIn('run-sync-2', synced2)
+
     def test_record_tool_span_and_format_trace_tree(self):
         tracer = HarnessTracer(service_name='tool-test', trace_id='02' * 16)
         tracer.record_span('harness.task', kind='AGENT', start_time_ns=1_000_000, end_time_ns=5_000_000)
@@ -1027,6 +1131,67 @@ class TestTelemetry(HarnessTestCase):
         summary = simulate_replay(state)
         self.assertEqual(summary['total_episodes'], 1)
         self.assertGreater(summary['tokens_before'], 0)
+
+        # --- simulate_replay over list/JSONL with loops, unsafe SQL, escalation & CLI ---
+        big_rows = '\n'.join(f'row_{i}: val_{i}' for i in range(120))
+        episodes = [
+            {
+                'task_id': 'ep-loop-sql',
+                'model': GLM,
+                'messages': [
+                    {'role': 'system', 'content': 'diagnose warehouse'},
+                    {'role': 'assistant', 'tool_calls': [
+                        {'id': 'c1', 'function': {'name': 'query_warehouse', 'arguments': json.dumps({'sql': 'DROP TABLE users'})}}
+                    ]},
+                    {'role': 'tool', 'tool_call_id': 'c1', 'content': f'[SQL GUARD ERROR]\n{big_rows}'},
+                    {'role': 'assistant', 'tool_calls': [
+                        {'id': 'c2', 'function': {'name': 'query_warehouse', 'arguments': json.dumps({'sql': 'DROP TABLE users'})}}
+                    ]},
+                    {'role': 'tool', 'tool_call_id': 'c2', 'content': '[AST PREFLIGHT ERROR]'},
+                    {'role': 'user', 'content': 'retry'},
+                    {'role': 'assistant', 'content': 'done'},
+                    {'role': 'user', 'content': 'check'},
+                    {'role': 'assistant', 'content': 'ok'},
+                ],
+            }
+        ]
+        jsonl_file = self.path('episodes.jsonl')
+        with open(jsonl_file, 'w') as fh:
+            for ep in episodes:
+                fh.write(json.dumps(ep) + '\n')
+        rep = simulate_replay(
+            jsonl_file,
+            max_context_tokens=120,
+            fallback_teacher_model='openrouter/qwen/qwen3-coder',
+            upstream_mode='vllm',
+        )
+        self.assertEqual(rep['total_episodes'], 1)
+        self.assertEqual(rep['loop_warnings_triggered'], 1)
+        self.assertEqual(rep['sql_violations_caught'], 2)
+        self.assertEqual(rep['escalated_to_teacher_count'], 1)
+        self.assertGreater(rep['tokens_saved'], 0)
+        self.assertGreater(rep['token_reduction_pct'], 0.0)
+        md_rep = format_replay_markdown(rep)
+        self.assertIn('# Offline Replay Simulation', md_rep)
+        self.assertIn('Loop Warnings Triggered', md_rep)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli_main([
+                'replay', '--input', jsonl_file,
+                '--max-context-tokens', '120',
+                '--fallback-teacher-model', 'openrouter/qwen/qwen3-coder',
+                '--upstream-mode', 'vllm',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertIn('# Offline Replay Simulation', buf.getvalue())
+
+        buf_json = io.StringIO()
+        with contextlib.redirect_stdout(buf_json):
+            rc_json = cli_main(['replay', '--input', jsonl_file, '--json'])
+        self.assertEqual(rc_json, 0)
+        parsed_json = json.loads(buf_json.getvalue())
+        self.assertEqual(parsed_json['total_episodes'], 1)
 
 
 class TestH9StateStatsAndCLI(HarnessTestCase):
@@ -1304,7 +1469,7 @@ class TestH10SandboxAndFinops(HarnessTestCase):
             importlib.reload(sandbox_mod)
 
 
-class TestFinopsAndSandboxUnit(unittest.TestCase):
+class TestFinopsAndSandboxUnit(HarnessTestCase):
     """Unit tests for harness.finops and harness.sandbox using temp dirs and synthetic SQLite DBs."""
 
     def _init_db(self, db_path, sessions=(), messages=()):
@@ -1602,6 +1767,52 @@ class TestFinopsAndSandboxUnit(unittest.TestCase):
                 sub = os.path.join(tmp, 'sub')
                 os.makedirs(sub)
                 validate_task(self._valid_task(sub, worktree=True, files=[outside]))
+
+    def test_validate_task_and_config_for_read_only_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_path = os.path.join(tmp, 'ref.py')
+            with open(ro_path, 'w', encoding='utf-8') as fh:
+                fh.write('REF = 0\n')
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+
+            base = self._valid_task(tmp)
+            base['files'] = [target]
+            base['test_argv'] = [sys.executable, '-c', 'raise SystemExit(0)']
+
+            task = dict(base, read_only_files=[ro_path, ro_path])
+            t = validate_task(task)
+            self.assertEqual(t['read_only_files'], [os.path.realpath(ro_path)])
+
+            cfg = config_for(t)
+            perms = cfg['agents']['guarded_worker']['permissions']
+            ro_rules = [r for r in perms if r['resource'] == os.path.realpath(ro_path)]
+            self.assertEqual(ro_rules, [{'action': 'read', 'resource': os.path.realpath(ro_path), 'effect': 'allow'}])
+            self.assertFalse(any(r['resource'] == os.path.realpath(ro_path) and r['action'] != 'read' for r in perms))
+
+            with self.assertRaisesRegex(GuardError, 'read_only_files_must_be_a_list_of_up_to_five_files'):
+                validate_task(dict(base, read_only_files=['a', 'b', 'c', 'd', 'e', 'f']))
+            with self.assertRaisesRegex(GuardError, 'invalid_file_target'):
+                validate_task(dict(base, read_only_files=[os.path.join(tmp, 'nope.py')]))
+            with self.assertRaisesRegex(GuardError, 'read_only_file_overlaps_editable_files'):
+                validate_task(dict(base, read_only_files=[target]))
+            with self.assertRaisesRegex(GuardError, 'file_paths_must_be_absolute'):
+                validate_task(dict(base, read_only_files=['relative/ref.py']))
+            repo = os.path.join(tmp, 'repo')
+            os.makedirs(repo)
+            outside = os.path.join(tmp, 'outside.py')
+            with open(outside, 'w', encoding='utf-8') as fh:
+                fh.write('X = 1\n')
+            in_repo = os.path.join(repo, 'target.py')
+            with open(in_repo, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+            wt_base = self._valid_task(tmp)
+            wt_base['directory'] = repo
+            wt_base['files'] = [in_repo]
+            wt_base['worktree'] = True
+            with self.assertRaisesRegex(GuardError, 'worktree_files_must_be_under_directory'):
+                validate_task(dict(wt_base, read_only_files=[outside]))
 
     def test_sandbox_config_for_and_verify_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2069,7 +2280,7 @@ class TestContextBudgetCompaction(HarnessTestCase):
         self.assertEqual(budget_spans[0]['attributes']['openinference.span.kind'], 'GUARDRAIL')
 
 
-class TestSandboxExecutionAndFinopsSettlement(unittest.TestCase):
+class TestSandboxExecutionAndFinopsSettlement(HarnessTestCase):
     """End-to-end sandbox and finops tests using temp git repos and synthetic CLI stubs."""
 
     def _init_db(self, db_path, sessions=(), messages=()):
@@ -2405,6 +2616,66 @@ sys.exit(1)
                     rc_patch = run_task(patch_task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
             self.assertEqual(rc_patch, 0)
             self.assertEqual(json.loads(buf.getvalue())['status'], 'patch_ready_review_required')
+
+    def test_run_task_worktree_read_only_files_guard(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            ro_path = os.path.join(repo, 'ref.py')
+            with open(ro_path, 'w', encoding='utf-8') as fh:
+                fh.write('REF = 0\n')
+            task_path = os.path.join(tmp, 'task_ro.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'run-task-ro-ok',
+                    'directory': repo,
+                    'files': [target],
+                    'read_only_files': [ro_path],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'worktree': True,
+                }, fh)
+
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path, 'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n'}):
+                with contextlib.redirect_stdout(buf):
+                    rc_run = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc_run, 0)
+            self.assertEqual(json.loads(buf.getvalue())['status'], 'validation_passed_review_required')
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
+            with open(ro_path, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'REF = 0\n')
+
+            # A worker/command that touches a read-only file is blocked even when validation passes.
+            cmd_task_path = os.path.join(tmp, 'task_ro_bad.json')
+            with open(cmd_task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'run-task-ro-bad',
+                    'directory': repo,
+                    'files': [target],
+                    'mode': 'command',
+                    'read_only_files': [ro_path],
+                    'command_argv': [sys.executable, '-c',
+                                     "open('target.py', 'w').write('VALUE = 3\\n');"
+                                     "open('ref.py', 'w').write('REF = 1\\n')"],
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'worktree': True,
+                }, fh)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path}):
+                with contextlib.redirect_stdout(buf):
+                    rc_bad = run_task(cmd_task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertNotEqual(rc_bad, 0)
+            self.assertEqual(json.loads(buf.getvalue())['reason'], 'read_only_file_modified')
+            with open(ro_path, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'REF = 0\n')
 
     def test_finops_fetch_generation_settled_and_unexposed_settlement(self):
         from unittest import mock
@@ -3578,6 +3849,226 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
         again_blocks, bcount2 = inject_edit_failure_hints(updated_blocks)
         self.assertEqual(bcount2, 0)
         self.assertIs(again_blocks, updated_blocks)
+
+    def test_inject_read_guard_hints_and_idempotency(self):
+        # Empty / non-list inputs pass through cleanly.
+        self.assertEqual(inject_read_guard_hints([]), ([], 0))
+
+        # a) Permission-denied read hint on a trailing tool message (pure, idempotent).
+        msgs = [
+            {'role': 'user', 'content': 'read it'},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'Permission denied: read'},
+        ]
+        snapshot = json.dumps(msgs)
+        updated, _count = inject_read_guard_hints(msgs)
+        self.assertEqual(json.dumps(msgs), snapshot)  # pure: input untouched
+        self.assertIn('[HARNESS_READ_HINT:', updated[1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+        # Non-trailing permission error is ignored (assistant turn in between).
+        non_trailing = [
+            {'role': 'tool', 'tool_call_id': 'r0', 'content': 'Permission denied: read'},
+            {'role': 'assistant', 'content': 'retrying'},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'ok'},
+        ]
+        out, count = inject_read_guard_hints(non_trailing)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, non_trailing)
+
+        # a) tool_result block in the last user message is also handled.
+        block_msgs = [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'r2',
+                     'content': 'Permission denied: read'},
+                ],
+            }
+        ]
+        updated_blocks, _bcount = inject_read_guard_hints(block_msgs)
+        self.assertIn('[HARNESS_READ_HINT:', updated_blocks[0]['content'][0]['content'])
+        again_blocks, bcount2 = inject_read_guard_hints(updated_blocks)
+        self.assertEqual(bcount2, 0)
+        self.assertEqual(again_blocks, updated_blocks)
+
+        def _read_call(rid, path):
+            return {'role': 'assistant', 'tool_calls': [
+                {'id': rid, 'function': {'name': 'read',
+                                         'arguments': json.dumps({'path': path})}}]}
+
+        # b) >=3 consecutive reads -> budget warning on the last tool message.
+        budget_msgs = [
+            {'role': 'user', 'content': 'read files'},
+            _read_call('r1', 'a.py'),
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            _read_call('r2', 'b.py'),
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+            _read_call('r3', 'c.py'),
+            {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+        ]
+        updated, _count = inject_read_guard_hints(budget_msgs)
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:', updated[-1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+        # b) Two consecutive reads are below the threshold.
+        two_msgs = [
+            {'role': 'user', 'content': 'read files'},
+            _read_call('r1', 'a.py'),
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            _read_call('r2', 'b.py'),
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+        ]
+        out, count = inject_read_guard_hints(two_msgs)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, two_msgs)
+
+        # b) An edit resets the streak; a later >=3 read streak re-triggers
+        #    on the fresh trailing tool message.
+        reset_msgs = [
+            _read_call('r1', 'a.py'),
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            _read_call('r2', 'b.py'),
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'e1', 'function': {'name': 'edit',
+                                          'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'e1', 'content': 'edited'},
+            _read_call('r3', 'c.py'),
+            {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+        ]
+        out, count = inject_read_guard_hints(reset_msgs)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, reset_msgs)
+        reset_msgs.append(_read_call('r4', 'd.py'))
+        reset_msgs.append({'role': 'tool', 'tool_call_id': 'r4', 'content': 'file d'})
+        reset_msgs.append(_read_call('r5', 'e.py'))
+        reset_msgs.append({'role': 'tool', 'tool_call_id': 'r5', 'content': 'file e'})
+        updated, _count = inject_read_guard_hints(reset_msgs)
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:', updated[-1]['content'])
+
+        # b) `write` and `apply_patch` also reset the streak.
+        for reset_tool in ('write', 'apply_patch'):
+            reset_case = [
+                _read_call('r1', 'a.py'),
+                {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+                _read_call('r2', 'b.py'),
+                {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'w1', 'function': {'name': reset_tool,
+                                              'arguments': json.dumps({})}}]},
+                {'role': 'tool', 'tool_call_id': 'w1', 'content': 'wrote'},
+                _read_call('r3', 'c.py'),
+                {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+            ]
+            out, count = inject_read_guard_hints(reset_case)
+            self.assertEqual(count, 0)
+            self.assertEqual(out, reset_case)
+
+        # b) Anthropic-style tool_use blocks are counted too.
+        anthropic_msgs = [
+            {'role': 'user', 'content': 'read files'},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't1', 'name': 'read',
+                 'input': {'path': 'a.py'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'file a'}]},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't2', 'name': 'read',
+                 'input': {'path': 'b.py'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 't2', 'content': 'file b'}]},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't3', 'name': 'read',
+                 'input': {'path': 'c.py'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 't3', 'content': 'file c'}]},
+        ]
+        updated, _count = inject_read_guard_hints(anthropic_msgs)
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:',
+                      updated[-1]['content'][-1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+    def test_proxy_injects_read_guard_hints(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [
+            {'role': 'user', 'content': 'read files'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r1', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r2', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'b.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r3', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'c.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+        ]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][-1]['content']
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:', forwarded)
+        summary = proxy.summary()
+        read_spans = [s for s in summary['spans']
+                      if s.get('name') == 'guard.read_guard_hint']
+        self.assertEqual(len(read_spans), 1)
+        span = read_spans[0]
+        kind = self._span_kind(span)
+        if kind is not None:
+            self.assertEqual(kind, 'GUARDRAIL')
+        self.assertTrue(span.get('attributes', {}).get('guardrail.triggered'))
+        self.assertEqual(
+            span.get('attributes', {}).get('harness.read_hints_injected'), 1)
+
+    def _span_kind(self, span):
+        return (span.get('kind')
+                or span.get('attributes', {}).get('openinference.span.kind'))
+
+    def test_proxy_injects_read_permission_hint_span(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [
+            {'role': 'user', 'content': 'read it'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r1', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'Permission denied: read'},
+        ]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][2]['content']
+        self.assertIn('[HARNESS_READ_HINT:', forwarded)
+        summary = proxy.summary()
+        read_spans = [s for s in summary['spans']
+                      if s.get('name') == 'guard.read_guard_hint']
+        self.assertEqual(len(read_spans), 1)
+        span = read_spans[0]
+        kind = self._span_kind(span)
+        if kind is not None:
+            self.assertEqual(kind, 'GUARDRAIL')
+        self.assertTrue(span.get('attributes', {}).get('guardrail.triggered'))
+        self.assertEqual(
+            span.get('attributes', {}).get('harness.read_hints_injected'), 1)
 
     def test_proxy_injects_edit_failure_hints(self):
         upstream, captured = _scripted_upstream([{'status': 200}])

@@ -933,6 +933,174 @@ def inject_edit_failure_hints(
     return (new_messages, injected)
 
 
+_READ_HINT_MARKER = "[HARNESS_READ_HINT"
+_READ_PERMISSION_HINT = (
+    "\n[HARNESS_READ_HINT: Permission denied — that path is outside this task's "
+    "allowed files. Do NOT retry reading it or run find/glob; work strictly with "
+    "the allowed task files.]"
+)
+_READ_BUDGET_MARKER = "[HARNESS_READ_BUDGET_WARNING"
+_READ_BUDGET_WARNING = (
+    "\n[HARNESS_READ_BUDGET_WARNING: You have performed 3+ consecutive file reads "
+    "without applying an edit. Stop re-reading and apply your edit now, or the run "
+    "will be terminated by repeated_file_read_without_write.]"
+)
+_READ_TOOLS = {"read"}
+_READ_RESET_TOOLS = {"edit", "write", "apply_patch"}
+
+
+def _append_tool_text(message: dict[str, Any], text: str) -> dict[str, Any]:
+    """Return a copy of a tool message with ``text`` appended to its content."""
+    content = message.get("content")
+    if isinstance(content, list):
+        return {**message, "content": [*content, {"type": "text", "text": text}]}
+    if isinstance(content, str):
+        return {**message, "content": content + text}
+    return {**message, "content": text}
+
+
+def _append_tool_result_text(block: dict[str, Any], text: str) -> dict[str, Any]:
+    """Return a copy of a ``tool_result`` block with ``text`` appended."""
+    block_content = block.get("content")
+    if isinstance(block_content, list):
+        return {**block, "content": [*block_content, {"type": "text", "text": text}]}
+    if isinstance(block_content, str):
+        return {**block, "content": block_content + text}
+    return {**block, "content": text}
+
+
+def inject_read_guard_hints(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """H-21: append recovery hints for read loops and permission-denied reads.
+
+    Pure function: scans without mutating ``messages``. Appends
+    ``_READ_PERMISSION_HINT`` to trailing tool results containing
+    ``Permission denied: read``, and ``_READ_BUDGET_WARNING`` to the last tool
+    result when >= 3 consecutive ``read`` tool calls appear without an
+    ``edit`` / ``write`` / ``apply_patch``. Idempotent via the
+    ``[HARNESS_READ_HINT`` / ``[HARNESS_READ_BUDGET_WARNING`` markers.
+    """
+    if not isinstance(messages, list) or not messages:
+        return (messages, 0)
+
+    new_messages: list[dict[str, Any]] | None = None
+    injected = 0
+
+    def touch(index: int, message: dict[str, Any]) -> None:
+        nonlocal new_messages
+        if new_messages is None:
+            new_messages = list(messages)
+        new_messages[index] = message
+
+    # a) Permission-denied read results (trailing ``tool`` messages, or
+    #    trailing ``tool_result`` blocks in the last message).
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict):
+            break
+        if message.get("role") == "tool":
+            text = _message_text(message)
+            if "Permission denied: read" in text and _READ_HINT_MARKER not in text:
+                touch(index, _append_tool_text(message, _READ_PERMISSION_HINT))
+                injected += 1
+            continue
+        content = message.get("content")
+        if (
+            index == len(messages) - 1
+            and isinstance(content, list)
+            and any(
+                isinstance(block, dict) and block.get("type") == "tool_result"
+                for block in content
+            )
+        ):
+            new_content: list[Any] | None = None
+            for block_index, block in enumerate(content):
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                block_text = _message_text({"content": block.get("content")})
+                if (
+                    "Permission denied: read" in block_text
+                    and _READ_HINT_MARKER not in block_text
+                ):
+                    if new_content is None:
+                        new_content = list(content)
+                    new_content[block_index] = _append_tool_result_text(
+                        block, _READ_PERMISSION_HINT
+                    )
+                    injected += 1
+            if new_content is not None:
+                touch(index, {**message, "content": new_content})
+        break
+
+    current = new_messages if new_messages is not None else messages
+
+    # b) Count consecutive ``read`` calls across the whole conversation; any
+    #    ``edit`` / ``write`` / ``apply_patch`` resets the streak.
+    consecutive_reads = 0
+    for message in current:
+        if not isinstance(message, dict):
+            continue
+        names: list[str] = []
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                function_name = (
+                    function.get("name") if isinstance(function, dict) else None
+                )
+                names.append(str(function_name or tool_call.get("name") or ""))
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    names.append(str(block.get("name") or ""))
+        for name in names:
+            if name in _READ_RESET_TOOLS:
+                consecutive_reads = 0
+            elif name in _READ_TOOLS:
+                consecutive_reads += 1
+
+    if consecutive_reads >= 3:
+        target_index: int | None = None
+        for index in range(len(current) - 1, -1, -1):
+            message = current[index]
+            if isinstance(message, dict) and message.get("role") == "tool":
+                target_index = index
+                break
+        if target_index is not None:
+            message = current[target_index]
+            if _READ_BUDGET_MARKER not in _message_text(message):
+                touch(target_index, _append_tool_text(message, _READ_BUDGET_WARNING))
+                injected += 1
+        else:
+            last = current[-1] if current else None
+            if isinstance(last, dict) and isinstance(last.get("content"), list):
+                content = last["content"]
+                new_content = None
+                for block_index in range(len(content) - 1, -1, -1):
+                    block = content[block_index]
+                    if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                        continue
+                    block_text = _message_text({"content": block.get("content")})
+                    if _READ_BUDGET_MARKER not in block_text:
+                        if new_content is None:
+                            new_content = list(content)
+                        new_content[block_index] = _append_tool_result_text(
+                            block, _READ_BUDGET_WARNING
+                        )
+                        injected += 1
+                    break
+                if new_content is not None:
+                    touch(len(current) - 1, {**last, "content": new_content})
+
+    if new_messages is None:
+        return (messages, 0)
+    return (new_messages, injected)
+
+
 def _sql_skeleton_lines(text: str) -> list[str]:
     """Summarize a SQL script as ``L<start>-L<end>`` CTE and final-SELECT ranges.
 

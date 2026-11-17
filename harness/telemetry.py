@@ -42,6 +42,11 @@ _PREVIEW_ATTR_KEYS = (
 )
 
 
+def _is_otel_disabled() -> bool:
+    """True when ``HARNESS_OTEL_DISABLED`` opts telemetry POSTs out in tests."""
+    return os.environ.get('HARNESS_OTEL_DISABLED', '').strip().lower() in ('1', 'true', 'yes')
+
+
 class HarnessTracer:
     """Minimal OTel-compatible tracer with OpenInference/GenAI attributes."""
 
@@ -272,6 +277,8 @@ class HarnessTracer:
 
     def flush_otlp(self, *, endpoint: str | None = None, timeout: float = 1.5) -> bool:
         """POST spans as OTLP/HTTP Protobuf (falling back to JSON if rejected); True on 2xx."""
+        if endpoint is None and _is_otel_disabled():
+            return False
         target = endpoint or self.otlp_endpoint
         if not target:
             return False
@@ -992,7 +999,12 @@ def sync_state_traces_to_phoenix(state_dir: str | Path, *, endpoint: str | None 
     """
     state = Path(state_dir)
     target = _resolve_otlp_endpoint(endpoint)
-    ledger_base = state.parent if state.is_file() else state
+    if state.is_file():
+        ledger_base = state.parent
+    elif state.parent.name == 'runs':
+        ledger_base = state.parent.parent
+    else:
+        ledger_base = state
     ledger_path = ledger_base / 'phoenix-sync-state.json'
     synced: dict[str, str] = {}
     try:
@@ -1018,6 +1030,10 @@ def sync_state_traces_to_phoenix(state_dir: str | Path, *, endpoint: str | None 
         total += 1
         if synced.get(run_id) == digest:
             already_synced += 1
+            continue
+        if endpoint is None and _is_otel_disabled():
+            failed_sync += 1
+            pending += 1
             continue
         if failed_sync:
             pending += 1

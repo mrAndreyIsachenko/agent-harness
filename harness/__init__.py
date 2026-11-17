@@ -5,32 +5,38 @@ __version__ = '0.1.0'
 from .finops import (DB, LIMITS, STATE,
                      _reconcile_locked, auto_reconcile_from_proxy,
                      build_unexposed_settlement_evidence, can_settle_from_proxy_local,
-                     capture_requests, connect, event, fetch_generation,
-                     fetch_generation_settled, metrics, number, prior_cost,
-                     private_log, private_write, reconcile_run, request_records,
-                     resolved_cost, snapshot, verify_db, violation)
+                     capture_requests, connect, event, export_sml_cost_manifest,
+                     fetch_generation, fetch_generation_settled, metrics, number,
+                     prior_cost, private_log, private_write, reconcile_run,
+                     request_records, resolved_cost, snapshot, verify_db, violation)
 from .guards import (
+    FORBIDDEN_EGRESS_KEYS,
     _message_text,
     _sql_skeleton_lines,
     build_file_skeletons,
     check_allowed_files_syntax,
+    check_egress_payload,
+    check_readonly_sql_tool_calls,
     check_sql_syntax,
     collect_python_top_symbols,
+    compact_context_window,
     compact_stale_reads,
     detect_duplicate_tool_calls,
+    estimate_messages_tokens,
     extract_compact_test_failure,
 )
 from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
                     STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
 from .report import (aggregate_benchmark_runs, format_benchmark_markdown,
-                     format_state_stats_markdown, scan_state_runs, summarize_run)
+                     format_replay_markdown, format_state_stats_markdown,
+                     scan_state_runs, simulate_replay, summarize_run)
 from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
                       DEFAULT_REASONING_MAX_TOKENS, ERROR_RECOVERY_REASONING_MAX_TOKENS,
                       ERROR_SIGNAL_SUBSTRINGS, FP8_PROVIDER_ROUTING, GLM_51_PROVIDER_ROUTING,
                       GLM_53_FLASH_PROVIDER_ROUTING, LATE_TURN_REASONING_MAX_TOKENS,
                       LATE_TURN_START, MODELS, MODEL_PROVIDER_PREFS, MODEL_REQUEST_CAPS,
-                      QUIET_LATE_TURN_REASONING_MAX_TOKENS, ProviderHealthStore,
-                      apply_provider_routing)
+                      QUIET_LATE_TURN_REASONING_MAX_TOKENS, TEACHER_MODELS,
+                      ProviderHealthStore, apply_provider_routing, select_escalated_model)
 from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
                         HarnessTracer, format_trace_tree,
                         sync_state_traces_to_phoenix, synthesize_spans_from_run_dir)
