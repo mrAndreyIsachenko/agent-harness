@@ -30,9 +30,9 @@ from .guards import (
 )
 from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
                     STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
-from .report import (aggregate_benchmark_runs, compute_state_insights,
-                     format_benchmark_markdown, format_replay_markdown,
-                     format_state_insights_markdown,
+from .report import (aggregate_benchmark_runs, build_repo_memory_hint,
+                     compute_state_insights, format_benchmark_markdown,
+                     format_replay_markdown, format_state_insights_markdown,
                      format_state_stats_markdown, scan_state_runs,
                      simulate_replay, summarize_run)
 from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
@@ -73,7 +73,7 @@ __all__ = [
     'DEFAULT_PROVIDER_HEALTH_TTL_SECONDS',
     'summarize_run', 'aggregate_benchmark_runs', 'format_benchmark_markdown',
     'scan_state_runs', 'format_state_stats_markdown',
-    'compute_state_insights', 'format_state_insights_markdown',
+    'compute_state_insights', 'build_repo_memory_hint', 'format_state_insights_markdown',
     'DEFAULT_PHOENIX_ENDPOINT', 'OPENINFERENCE_SPAN_KINDS', 'HarnessTracer',
     'format_trace_tree', 'synthesize_spans_from_run_dir', 'sync_state_traces_to_phoenix',
     'DB', 'LIMITS', 'STATE', 'CLI',
