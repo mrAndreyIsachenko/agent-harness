@@ -49,7 +49,7 @@ from harness.guards import (FORBIDDEN_EGRESS_KEYS, _EDIT_FAILURE_HINT,
 from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
                             format_replay_markdown, format_state_stats_markdown,
                             scan_state_runs, simulate_replay, summarize_run)
-from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
+from harness.routing import (DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
                              ERROR_RECOVERY_MAX_TOKENS_CAP,
                              ERROR_RECOVERY_REASONING_MAX_TOKENS, LATE_TURN_REASONING_MAX_TOKENS,
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
@@ -60,8 +60,8 @@ from harness.sandbox import (GuardError, _snapshot_files_for_feedback,
                              compute_repair_max_steps, config_for, execute,
                              file_hashes, isolated_worktree, locks,
                              main as sandbox_main, model_run, owned_process,
-                             preflight, run_task, stop_group, validate_task,
-                             verify_permissions)
+                             preflight, run_best_of_2, run_task, stop_group,
+                             validate_task, verify_permissions)
 from harness.telemetry import OPENINFERENCE_SPAN_KINDS, HarnessTracer, format_trace_tree
 
 GLM = 'openrouter/z-ai/glm-5.3-flash'
@@ -2479,6 +2479,9 @@ if argv[:2] == ['debug', 'agents']:
 if argv and argv[0] == 'run':
     sid = argv[argv.index('--session') + 1]
     prompt = argv[-1]
+    if os.environ.get('STUB_CLI_PROMPT_DUMP'):
+        with open(os.environ['STUB_CLI_PROMPT_DUMP'], 'w', encoding='utf-8') as fh:
+            fh.write(prompt)
     files = []
     for line in prompt.splitlines():
         if line.startswith('['):
@@ -2691,12 +2694,12 @@ sys.exit(1)
     def test_run_task_command_and_patch_modes(self):
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
-            cli_path = self._write_stub_cli(tmp)
+            cli_path = TestSandboxExecutionAndFinopsSettlement._write_stub_cli(self, tmp)
             db_path = os.path.join(tmp, 'opencode.db')
-            self._init_db(db_path)
+            TestSandboxExecutionAndFinopsSettlement._init_db(self, db_path)
             state_dir = os.path.join(tmp, 'state')
             repo = os.path.join(tmp, 'repo')
-            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            target = TestSandboxExecutionAndFinopsSettlement._init_git_repo(self, repo, 'target.py', 'VALUE = 0\n')
 
             cmd_task_path = os.path.join(tmp, 'cmd_task.json')
             with open(cmd_task_path, 'w', encoding='utf-8') as fh:
@@ -2801,6 +2804,117 @@ sys.exit(1)
             self.assertEqual(json.loads(buf.getvalue())['reason'], 'read_only_file_modified')
             with open(ro_path, 'r', encoding='utf-8') as fh:
                 self.assertEqual(fh.read(), 'REF = 0\n')
+
+    def test_validate_task_strategy_and_candidate_models(self):
+        from harness import DEFAULT_MODEL, MODELS, TEACHER_MODELS
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            base = {
+                'task_id': 'strategy-1',
+                'directory': tmp,
+                'files': [target],
+                'prompt': 'edit ' + target,
+                'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+            }
+            with self.assertRaisesRegex(GuardError, 'invalid_strategy'):
+                validate_task(dict(base, strategy='best_of_3'))
+            with self.assertRaisesRegex(GuardError, 'invalid_candidate_models'):
+                validate_task(dict(base, candidate_models=['not-a-model']))
+            with self.assertRaisesRegex(GuardError, 'invalid_candidate_models'):
+                validate_task(dict(base, candidate_models=['a', 'b', 'c']))
+            t = validate_task(dict(base, strategy='best_of_2'))
+            self.assertEqual(t['candidate_models'],
+                             [DEFAULT_MODEL, 'openrouter/deepseek/deepseek-v4.1-flash-1017'])
+            good = sorted(MODELS | TEACHER_MODELS)[0]
+            t2 = validate_task(dict(base, candidate_models=[good]))
+            self.assertEqual(t2['candidate_models'], [good])
+            t3 = validate_task(dict(base, strategy='single'))
+            self.assertEqual(t3['strategy'], 'single')
+
+    def test_run_task_best_of_2_early_exit(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'bo2-early',
+                    'directory': tmp,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'strategy': 'best_of_2',
+                }, fh)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path,
+                                              'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n'}):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(buf.getvalue().strip().splitlines()), 1)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            self.assertEqual(out['candidates_run'], 1)
+            self.assertEqual(out['steps'], 1)
+            self.assertEqual(out['winning_model'], DEFAULT_MODEL)
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
+
+    def test_run_best_of_2_fallback_to_candidate_2(self):
+        import harness.sandbox as sandbox_module
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'bo2-fallback',
+                    'directory': tmp,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'strategy': 'best_of_2',
+                }, fh)
+            real_run_task = sandbox_module.run_task
+            calls = []
+
+            def staged(path, **kwargs):
+                calls.append(path)
+                if len(calls) == 1:
+                    os.environ['STUB_CLI_NO_CHANGE'] = '1'
+                else:
+                    os.environ.pop('STUB_CLI_NO_CHANGE', None)
+                return real_run_task(path, **kwargs)
+
+            buf = io.StringIO()
+            with mock.patch.object(sandbox_module, 'run_task', side_effect=staged):
+                with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path,
+                                                  'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n'}):
+                    with contextlib.redirect_stdout(buf):
+                        rc = run_best_of_2(task_path, cli=cli_path, db=db_path, state=state_dir)
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            self.assertEqual(out['candidates_run'], 2)
+            self.assertEqual(out['winning_model'], 'openrouter/deepseek/deepseek-v4.1-flash-1017')
+            self.assertEqual(out['steps'], 1)
+            self.assertAlmostEqual(out['cost'], 0.015)
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
 
     def test_finops_fetch_generation_settled_and_unexposed_settlement(self):
         from unittest import mock
@@ -4263,12 +4377,12 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
     def test_micro_repair_adaptive_steps(self):
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
-            cli_path = self._write_stub_cli(tmp)
+            cli_path = TestSandboxExecutionAndFinopsSettlement._write_stub_cli(self, tmp)
             db_path = os.path.join(tmp, 'opencode.db')
-            self._init_db(db_path)
+            TestSandboxExecutionAndFinopsSettlement._init_db(self, db_path)
             state_dir = os.path.join(tmp, 'state')
             repo = os.path.join(tmp, 'repo')
-            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            target = TestSandboxExecutionAndFinopsSettlement._init_git_repo(self, repo, 'target.py', 'VALUE = 0\n')
             second = os.path.join(repo, 'b.py')
             with open(second, 'w', encoding='utf-8') as fh:
                 fh.write('b = 1\n')
@@ -4643,6 +4757,107 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertTrue(cli_out)
             self.assertIn('tests_failed', cli_out)
             self.assertIn('Average reads before first edit', cli_out)
+
+
+class TestH35RepoMemoryHint(HarnessTestCase):
+    def _make_run(self, state, name, result, spans=(), task=None):
+        run_dir = os.path.join(state, 'runs', name)
+        os.makedirs(run_dir)
+        with open(os.path.join(run_dir, 'result.json'), 'w') as fh:
+            json.dump(result, fh)
+        if spans:
+            with open(os.path.join(run_dir, 'traces.jsonl'), 'w') as fh:
+                for span in spans:
+                    fh.write(json.dumps(span) + '\n')
+        if task is not None:
+            with open(os.path.join(run_dir, 'task.json'), 'w') as fh:
+                json.dump(task, fh)
+        return run_dir
+
+    @staticmethod
+    def _error_span(tool, message, start_ns):
+        return {'name': tool, 'span_id': 'd' * 16, 'trace_id': 'e' * 32,
+                'parent_span_id': None, 'start_time_ns': start_ns,
+                'end_time_ns': start_ns + 100, 'status': 'ERROR',
+                'attributes': {'openinference.span.kind': 'TOOL',
+                               'tool.name': tool, 'output.value': message}}
+
+    def test_hint_empty_below_min_occurrences(self):
+        from harness.report import build_repo_memory_hint
+        state = self.path('state-empty')
+        self._make_run(state, 'r1', {'task_id': 'r1', 'status': 'blocked', 'reason': 'task_budget_exhausted'})
+        self._make_run(state, 'r2', {'task_id': 'r2', 'status': 'succeeded'})
+        self.assertEqual(build_repo_memory_hint(state), '')
+        self.assertEqual(build_repo_memory_hint(self.path('nonexistent'), min_occurrences=1), '')
+
+    def test_hint_formats_recurring_block_and_tool_error(self):
+        from harness.report import build_repo_memory_hint
+        state = self.path('state-hint')
+        self._make_run(state, 'r1', {'task_id': 'r1', 'status': 'blocked', 'reason': 'task_budget_exhausted'},
+                       spans=[self._error_span('edit_file', 'invalid_edit\nmore', 1000)])
+        self._make_run(state, 'r2', {'task_id': 'r2', 'status': 'blocked', 'reason': 'task_budget_exhausted'},
+                       spans=[self._error_span('edit_file', 'invalid_edit\nmore', 2000)])
+        hint = build_repo_memory_hint(state)
+        self.assertIn('[REPO MEMORY HINT', hint)
+        self.assertIn('- Recurring block reason: task_budget_exhausted (2x)', hint)
+        self.assertIn('- Recurring tool error in edit_file: invalid_edit (2x).', hint)
+        self.assertIn('avoid repeating this failure mode', hint)
+        # Directory filtering: no prior task.json matches this directory -> falls back to all runs.
+        hint_dir = build_repo_memory_hint(state, self.path('nowhere'), min_occurrences=1)
+        self.assertIn('[REPO MEMORY HINT', hint_dir)
+        self.assertLessEqual(len(build_repo_memory_hint(state, max_chars=50)), 50)
+
+    def test_run_task_injects_repo_memory_hint_and_logs_event(self):
+        from harness.report import build_repo_memory_hint  # noqa: F401 (import parity)
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = TestSandboxExecutionAndFinopsSettlement._write_stub_cli(self, tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            TestSandboxExecutionAndFinopsSettlement._init_db(self, db_path)
+            state_dir = os.path.join(tmp, 'state')
+            repo = os.path.join(tmp, 'repo')
+            target = TestSandboxExecutionAndFinopsSettlement._init_git_repo(self, repo, 'target.py', 'VALUE = 0\n')
+            # Two prior blocked runs for the same directory -> recurring block reason.
+            for name in ('prior-1', 'prior-2'):
+                self._make_run(state_dir, name,
+                               {'task_id': name, 'status': 'blocked', 'reason': 'task_budget_exhausted'},
+                               task={'task_id': name, 'directory': os.path.realpath(repo)})
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repo-hint-1',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'worktree': True,
+                    'include_repo_memory': True,
+                }, fh)
+            prompt_dump = os.path.join(tmp, 'prompt.txt')
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {
+                'HARNESS_TEST_DB': db_path,
+                'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n',
+                'STUB_CLI_PROMPT_DUMP': prompt_dump,
+            }):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            with open(prompt_dump, 'r', encoding='utf-8') as fh:
+                prompt = fh.read()
+            self.assertIn('[REPO MEMORY HINT', prompt)
+            self.assertIn('Recurring block reason: task_budget_exhausted', prompt)
+            injected = False
+            for run_name in sorted(os.listdir(os.path.join(state_dir, 'runs'))):
+                run_dir = os.path.join(state_dir, 'runs', run_name)
+                for fname in os.listdir(run_dir):
+                    try:
+                        with open(os.path.join(run_dir, fname), 'r', encoding='utf-8', errors='ignore') as fh:
+                            if 'repo_memory_hint_injected' in fh.read():
+                                injected = True
+                    except OSError:
+                        continue
+            self.assertTrue(injected)
 
 
 class TestH31SwePruner(unittest.TestCase):

@@ -439,6 +439,8 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-31** | MiniMax/DeepSeek `SWE-Pruner` Lite: in-proxy `prune_noisy_tool_outputs` compacting bloated pytest/traceback tool results before context-window compaction | `guards.py`, `proxy.py` |
 | **H-32** | Z.ai-style edit-oscillation & plateau guard (`detect_edit_oscillation`: `revert_cycle` A→B→A and `untested_edit_streak`) wired into `ERROR_SIGNAL_SUBSTRINGS` | `guards.py`, `proxy.py`, `routing.py` |
 | **H-33** | `TrajSpec` retry distillation: Python AST symbol-level `before`/`after` diff and guardrail event summary prioritized in `build_prior_attempt_feedback` | `sandbox.py` |
+| **H-34** | DeepSeek R1 / SWE-Gym verifier-guided `best_of_2` strategy (`run_best_of_2`, `candidate_models`) with file snapshot/restore and early exit on clean pass | `sandbox.py` |
+| **H-35** | Kimi / ZCode-style learned repo memory hints (`build_repo_memory_hint`, `include_repo_memory`) auto-injected from recurring workspace block reasons and tool errors | `report.py`, `sandbox.py` |
 
 ## Quickstart
 
@@ -464,5 +466,5 @@ return `429 guard_stop` — that is the supervisor's budget/deadline hook.
 No third-party dependencies: Python ≥ 3.10 standard library only.
 
 ```console
-$ pytest -q tests/test_harness.py    # H-1..H-33 contract suite (110 unittest/pytest cases)
+$ pytest -q tests/test_harness.py    # H-1..H-35 contract suite (119 unittest/pytest cases)
 ```

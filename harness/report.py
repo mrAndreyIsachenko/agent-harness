@@ -28,6 +28,7 @@ __all__ = [
     "scan_state_runs",
     "format_state_stats_markdown",
     "compute_state_insights",
+    "build_repo_memory_hint",
     "format_state_insights_markdown",
     "simulate_replay",
     "format_replay_markdown",
@@ -582,6 +583,109 @@ def format_state_insights_markdown(state_dir: str | Path) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def build_repo_memory_hint(
+    state_dir: str | Path,
+    directory: str | Path | None = None,
+    *,
+    min_occurrences: int = 2,
+    max_chars: int = 600,
+) -> str:
+    """Learn a short hint from prior state runs for the same workspace directory.
+
+    Counts recurring blocked reasons and tool errors (plus the average
+    reads-before-first-edit ratio) and returns a prompt suffix, or ``''`` when
+    nothing recurred at least ``min_occurrences`` times.
+    """
+    records = list(_iter_run_records(state_dir))
+    if not records:
+        return ""
+
+    selected: list[tuple[Path, dict]] = []
+    if directory is not None:
+        target = str(Path(directory).resolve())
+        for run_dir, result in records:
+            try:
+                task_path = run_dir / "task.json"
+                if not task_path.is_file():
+                    continue
+                with task_path.open("r", encoding="utf-8") as handle:
+                    task = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if isinstance(task, dict) and task.get("directory") == target:
+                selected.append((run_dir, result))
+        if len(selected) < min_occurrences:
+            selected = records
+    else:
+        selected = records
+
+    blocked_counter: Counter[str] = Counter()
+    tool_error_counter: Counter[tuple[str, str]] = Counter()
+    reads_before_edit_samples: list[int] = []
+
+    for run_dir, result in selected:
+        if str(result.get("status") or "") == "blocked":
+            blocked_counter[str(result.get("reason") or "unknown")] += 1
+
+        spans = _load_tool_spans(run_dir)
+        if not spans:
+            continue
+        for span in spans:
+            if span.get("status") != "ERROR":
+                continue
+            attrs = span.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            tool_name = str(attrs.get("tool.name") or span.get("name") or "unknown")
+            error_text = str(
+                attrs.get("output.value")
+                or attrs.get("error.message")
+                or span.get("status_message")
+                or "error"
+            )
+            error_prefix = error_text.splitlines()[0][:80] if error_text else "error"
+            tool_error_counter[(tool_name, error_prefix)] += 1
+
+        reads = 0
+        seen_edit = False
+        for span in spans:
+            attrs = span.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            tool_name = str(attrs.get("tool.name") or span.get("name") or "unknown")
+            lowered = tool_name.lower()
+            if lowered in _EDIT_TOOL_NAMES:
+                seen_edit = True
+                break
+            if lowered in _READ_TOOL_NAMES:
+                reads += 1
+        if seen_edit:
+            reads_before_edit_samples.append(reads)
+
+    bullets: list[str] = []
+    for reason, count in blocked_counter.most_common():
+        if count >= min_occurrences:
+            bullets.append(
+                f"- Recurring block reason: {reason} ({count}x) — avoid repeating this failure mode."
+            )
+    for (tool_name, error_prefix), count in tool_error_counter.most_common():
+        if count >= min_occurrences:
+            bullets.append(f"- Recurring tool error in {tool_name}: {error_prefix} ({count}x).")
+    if reads_before_edit_samples:
+        avg_reads = sum(reads_before_edit_samples) / len(reads_before_edit_samples)
+        if avg_reads >= 4.0:
+            bullets.append(
+                "- High read-before-edit ratio — batch file reads in turn 1 and edit directly."
+            )
+
+    if not bullets:
+        return ""
+    hint = "\n\n[REPO MEMORY HINT — learned from prior runs in this workspace]:\n" + "\n".join(
+        bullets[:5]
+    )
+    return hint[:max_chars]
 
 
 def _compact_context_window(messages: list[dict], *, max_context_tokens: int) -> list[dict]:

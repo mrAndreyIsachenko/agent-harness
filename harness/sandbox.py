@@ -61,6 +61,7 @@ from .finops import (
 from .guards import (build_file_skeletons, build_preloaded_file_excerpts,
                      extract_compact_test_failure)
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
+from .report import build_repo_memory_hint
 from .routing import DEFAULT_MODEL, MODELS, TEACHER_MODELS, ProviderHealthStore
 
 MAX_STEPS = LIMITS['max_steps'][1]
@@ -159,6 +160,18 @@ def validate_task(raw):
     t.setdefault('model', DEFAULT_MODEL)
     if t['model'] not in MODELS | TEACHER_MODELS:
         raise GuardError('unsupported_model')
+    t.setdefault('strategy', 'single')
+    if t['strategy'] not in ('single', 'best_of_2'):
+        raise GuardError('invalid_strategy')
+    t.setdefault('candidate_models', None)
+    if t['candidate_models'] is not None:
+        cm = t['candidate_models']
+        if (not isinstance(cm, list) or not 1 <= len(cm) <= 2
+                or any(not isinstance(m, str) or m not in MODELS | TEACHER_MODELS for m in cm)):
+            raise GuardError('invalid_candidate_models')
+    if t['strategy'] == 'best_of_2' and t['candidate_models'] is None:
+        t['candidate_models'] = [t['model'],
+                                 t.get('fallback_teacher_model') or 'openrouter/deepseek/deepseek-v4.1-flash-1017']
     t.setdefault('max_context_tokens', 32000)
     if t['max_context_tokens'] is not None:
         if type(t['max_context_tokens']) is not int or t['max_context_tokens'] < 0:
@@ -192,6 +205,9 @@ def validate_task(raw):
             raise GuardError('worktree_files_must_be_under_directory')
         if any(not Path(f).is_relative_to(Path(t['directory'])) for f in t['read_only_files']):
             raise GuardError('worktree_files_must_be_under_directory')
+    t.setdefault('include_repo_memory', True)
+    if not isinstance(t['include_repo_memory'], bool):
+        raise GuardError('invalid_include_repo_memory_flag')
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
         raise GuardError('invalid_auto_micro_repair_flag')
@@ -662,13 +678,23 @@ def compute_repair_max_steps(task: dict) -> int:
     return min(MAX_STEPS, max(6, 4 + 2 * len(task.get('files', ()))))
 
 
-def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None):
+def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None,
+             _quiet=False, _return_result=False):
     if cli is None:
         cli = CLI
     if db is None:
         db = DB
     if state is None:
         state = STATE
+    if not check:
+        try:
+            raw_strategy = json.loads(Path(task_path).read_text())
+        except (OSError, ValueError):
+            raw_strategy = {}
+        if isinstance(raw_strategy, dict) and raw_strategy.get('strategy') == 'best_of_2' \
+                and raw_strategy.get('mode', 'model') == 'model':
+            return run_best_of_2(task_path, cli=cli, db=db, state=state,
+                                 upstream_url=upstream_url, fetch=fetch)
     result = {'status': 'rejected', 'reason': '', 'artifact': None}
     reconciled_cost = None
     _fh = getattr(sys.modules.get('opencode_guard'), 'file_hashes', file_hashes)
@@ -768,6 +794,11 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             if prior_feedback:
                                 task['prompt'] += prior_feedback
                                 event(run_dir, 'prior_attempt_feedback_injected')
+                        if task.get('include_repo_memory', True):
+                            repo_hint = build_repo_memory_hint(state, task.get('directory'))
+                            if repo_hint:
+                                task['prompt'] += repo_hint
+                                event(run_dir, 'repo_memory_hint_injected')
                         try:
                             model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
                         except GuardError as exc:
@@ -916,8 +947,128 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
     out = {k: result.get(k) for k in ('status', 'reason', 'artifact', 'cost', 'observed_cost', 'steps')}
     if reconciled_cost is not None:
         out['reconciled_cost'] = reconciled_cost
-    print(json.dumps(out))
+    if _return_result:
+        return result
+    if not _quiet:
+        print(json.dumps(out))
     return 0 if result['status'] in ('validation_passed_review_required', 'patch_ready_review_required', 'configuration_verified_no_model_call') else 1
+
+def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None, fetch=None):
+    """Verifier-guided best_of_2 strategy: run candidate 1; only if it does not
+    pass validation cleanly, restore the original file bytes and run candidate 2.
+    Keep the best candidate by validation outcome, then absence of salvage,
+    then lower steps, then lower cost."""
+    if cli is None:
+        cli = CLI
+    if db is None:
+        db = DB
+    if state is None:
+        state = STATE
+    first_bytes = None
+    try:
+        raw_task = json.loads(Path(task_path).read_text())
+        task = validate_task(raw_task)
+        candidates = task['candidate_models']
+
+        def _snapshot():
+            snap = {}
+            for name in task['files']:
+                p = Path(name)
+                snap[name] = p.read_bytes() if p.exists() else None
+            return snap
+
+        def _restore(snap):
+            for name, data in snap.items():
+                p = Path(name)
+                if data is None:
+                    if p.exists():
+                        p.unlink()
+                else:
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    p.write_bytes(data)
+
+        originals = _snapshot()
+
+        def _passes(res):
+            return res.get('status') == 'validation_passed_review_required'
+
+        def _better(a, b):
+            pa, pb = _passes(a[0]), _passes(b[0])
+            if pa != pb:
+                return a if pa else b
+            if pa:
+                sa = not a[0].get('salvaged_from')
+                sb = not b[0].get('salvaged_from')
+                if sa != sb:
+                    return a if sa else b
+                ka = (a[0].get('steps') or 0,
+                      float('inf') if a[0].get('cost') is None else a[0]['cost'])
+                kb = (b[0].get('steps') or 0,
+                      float('inf') if b[0].get('cost') is None else b[0]['cost'])
+                return a if ka <= kb else b
+            return a
+
+        results = []
+        for index, model in enumerate(candidates):
+            candidate_path = Path(task_path).with_name(
+                Path(task_path).stem + ('.candidate%d.json' % (index + 1)))
+            candidate_task = dict(raw_task, strategy='single', model=model)
+            candidate_task.pop('candidate_models', None)
+            candidate_path.write_text(json.dumps(candidate_task))
+            try:
+                res = run_task(candidate_path, cli=cli, db=db, state=state,
+                               upstream_url=upstream_url, fetch=fetch,
+                               _quiet=True, _return_result=True)
+            finally:
+                try:
+                    candidate_path.unlink()
+                except OSError:
+                    pass
+            results.append((res, model))
+            if _passes(res) and not res.get('salvaged_from'):
+                break
+            if index == 0 and len(candidates) > 1:
+                first_bytes = _snapshot()
+                _restore(originals)
+        winner = results[0]
+        for other in results[1:]:
+            winner = _better(winner, other)
+        if len(results) > 1 and winner is results[0] and first_bytes is not None:
+            _restore(first_bytes)
+
+        # H-34 fix: aggregate across ALL executed candidates, not just passed ones.
+        def _sum(key):
+            pool = [r[0] for r in results]
+            vals = [r.get(key) for r in pool]
+            if key == 'steps':
+                return sum(v or 0 for v in vals)
+            # For cost keys, fall back per-candidate to observed_cost when
+            # the settled cost was never recorded (e.g. a blocked attempt).
+            if key == 'cost' and any(v is None for v in vals):
+                vals = [v if v is not None else r.get('observed_cost')
+                        for r, v in zip(pool, vals)]
+            if all(v is None for v in vals):
+                return None
+            total = sum(v for v in vals if v is not None)
+            return round(total, 8) if key == 'cost' else total
+        summary = {
+            'status': winner[0].get('status'),
+            'reason': winner[0].get('reason', ''),
+            'artifact': winner[0].get('artifact'),
+            'winning_model': winner[1],
+            'candidates_run': len(results),
+            'cost': _sum('cost'),
+            'observed_cost': _sum('observed_cost'),
+            'steps': _sum('steps'),
+        }
+        print(json.dumps(summary))
+        return 0 if _passes(winner[0]) else 1
+    except (GuardError, OSError, ValueError, TypeError, sqlite3.Error, KeyError) as exc:
+        error = str(exc) if isinstance(exc, GuardError) else type(exc).__name__
+        print(json.dumps({'status': 'blocked', 'reason': error, 'candidates_run': 0,
+                          'winning_model': None, 'artifact': None,
+                          'cost': None, 'observed_cost': None, 'steps': None}))
+        return 1
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

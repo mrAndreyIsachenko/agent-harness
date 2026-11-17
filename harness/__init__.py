@@ -53,7 +53,7 @@ from .sandbox import (
     connect, event, execute, executable_argv, fetch_generation, fetch_generation_settled,
     file_hashes, interruptions, isolated_worktree, locks, main, metrics, model_run,
     number, owned_process, preflight, prior_cost, private_log, private_write,
-    reconcile_run, request_records, resolved_cost, run_task, snapshot, stop_group,
+    reconcile_run, request_records, resolved_cost, run_best_of_2, run_task, snapshot, stop_group,
     validate_task, verify_db, verify_permissions, violation,
 )
 
@@ -82,6 +82,6 @@ __all__ = [
     'connect', 'event', 'execute', 'executable_argv', 'fetch_generation', 'fetch_generation_settled',
     'file_hashes', 'interruptions', 'isolated_worktree', 'locks', 'main', 'metrics', 'model_run',
     'number', 'owned_process', 'preflight', 'prior_cost', 'private_log', 'private_write',
-    'reconcile_run', 'request_records', 'resolved_cost', 'run_task', 'snapshot', 'stop_group',
+    'reconcile_run', 'request_records', 'resolved_cost', 'run_best_of_2', 'run_task', 'snapshot', 'stop_group',
     'validate_task', 'verify_db', 'verify_permissions', 'violation',
 ]
