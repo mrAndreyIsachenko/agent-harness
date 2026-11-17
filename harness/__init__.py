@@ -14,6 +14,7 @@ from .guards import (
     _message_text,
     _sql_skeleton_lines,
     build_file_skeletons,
+    build_preloaded_file_excerpts,
     check_allowed_files_syntax,
     check_egress_payload,
     check_readonly_sql_tool_calls,
@@ -27,9 +28,11 @@ from .guards import (
 )
 from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
                     STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
-from .report import (aggregate_benchmark_runs, format_benchmark_markdown,
-                     format_replay_markdown, format_state_stats_markdown,
-                     scan_state_runs, simulate_replay, summarize_run)
+from .report import (aggregate_benchmark_runs, compute_state_insights,
+                     format_benchmark_markdown, format_replay_markdown,
+                     format_state_insights_markdown,
+                     format_state_stats_markdown, scan_state_runs,
+                     simulate_replay, summarize_run)
 from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
                       DEFAULT_REASONING_MAX_TOKENS, ERROR_RECOVERY_REASONING_MAX_TOKENS,
                       ERROR_SIGNAL_SUBSTRINGS, FP8_PROVIDER_ROUTING, GLM_51_PROVIDER_ROUTING,
@@ -55,7 +58,7 @@ __all__ = [
     '__version__',
     'check_allowed_files_syntax', 'check_sql_syntax', 'collect_python_top_symbols',
     '_message_text', 'detect_duplicate_tool_calls', '_sql_skeleton_lines',
-    'build_file_skeletons', 'extract_compact_test_failure', 'compact_stale_reads',
+    'build_file_skeletons', 'build_preloaded_file_excerpts', 'extract_compact_test_failure', 'compact_stale_reads',
     'OPENROUTER_UPSTREAM', 'GEN_ID_RE', 'STREAM_COST_RE', 'PROVIDER_LATENCY_THRESHOLD_SECONDS',
     'GuardError', 'OpenRouterGuardProxy', 'openrouter_proxy',
     'DEFAULT_MODEL', 'MODELS', 'FP8_PROVIDER_ROUTING', 'GLM_53_FLASH_PROVIDER_ROUTING',
@@ -66,6 +69,7 @@ __all__ = [
     'DEFAULT_PROVIDER_HEALTH_TTL_SECONDS',
     'summarize_run', 'aggregate_benchmark_runs', 'format_benchmark_markdown',
     'scan_state_runs', 'format_state_stats_markdown',
+    'compute_state_insights', 'format_state_insights_markdown',
     'DEFAULT_PHOENIX_ENDPOINT', 'OPENINFERENCE_SPAN_KINDS', 'HarnessTracer',
     'format_trace_tree', 'synthesize_spans_from_run_dir', 'sync_state_traces_to_phoenix',
     'DB', 'LIMITS', 'STATE', 'CLI',

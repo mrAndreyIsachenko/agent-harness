@@ -1251,6 +1251,109 @@ def build_file_skeletons(files: Iterable[str], *, line_threshold: int = 250) -> 
     return "[FILE SKELETON MAP -- read only target line ranges]\n" + "\n".join(chunks) + "\n"
 
 
+_LINE_RANGE_PATTERNS = (
+    re.compile(r"lines?\s+(\d+)\s*[-–—to]+\s*(\d+)", re.IGNORECASE),
+    re.compile(r"L(\d+)\s*[-–—]\s*L?(\d+)", re.IGNORECASE),
+    re.compile(r"строк[аиуе]?\s+(\d+)\s*[-–—]+\s*(\d+)", re.IGNORECASE),
+)
+
+
+def _parse_prompt_line_ranges(prompt: str) -> list[tuple[int, int]]:
+    """Extract normalized ``(lo, hi)`` line ranges (1-based, inclusive) from a prompt."""
+    ranges: list[tuple[int, int]] = []
+    for pattern in _LINE_RANGE_PATTERNS:
+        for match in pattern.finditer(prompt):
+            lo = int(match.group(1))
+            hi = int(match.group(2))
+            if lo > hi:
+                lo, hi = hi, lo
+            ranges.append((lo, hi))
+    return ranges
+
+
+def build_preloaded_file_excerpts(
+    files: Iterable[str],
+    prompt: str = "",
+    *,
+    short_file_max_lines: int = 150,
+    max_total_chars: int = 12000,
+) -> str:
+    """Build pre-loaded exact-line excerpts for ``files`` guided by ``prompt``.
+
+    Files at or under ``short_file_max_lines`` are included whole; longer files
+    contribute only the line ranges parsed from ``prompt`` (expanded by ``+-5``
+    context lines, capped at 120 lines per window). The total output is capped
+    at ``max_total_chars``. Returns a prompt-ready string (empty when nothing
+    was collected).
+    """
+    ranges = _parse_prompt_line_ranges(prompt)
+    seen: set[str] = set()
+    chunks: list[str] = []
+    total_chars = 0
+    header = (
+        "[PRELOADED_FILE_EXCERPTS — exact current lines; apply your edit "
+        "directly without re-reading these lines first]:\n"
+    )
+    for path in files:
+        if path in seen:
+            continue
+        seen.add(path)
+        file_path = Path(path)
+        try:
+            if not file_path.is_file():
+                continue
+            text = file_path.read_bytes().decode("utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        all_lines = text.splitlines()
+        line_count = len(all_lines)
+        included: list[str] = []
+        if line_count <= short_file_max_lines:
+            included = [f"{lineno}: {line}" for lineno, line in enumerate(all_lines, 1)]
+        else:
+            windows: list[tuple[int, int]] = []
+            for lo, hi in ranges:
+                start = max(1, lo - 5)
+                end = hi + 5
+                if end - start + 1 > 120:
+                    end = start + 119
+                if not (1 <= start <= line_count):
+                    continue
+                end = min(line_count, end)
+                windows.append((start, end))
+            if not windows:
+                continue
+            windows.sort()
+            merged: list[list[int]] = []
+            for start, end in windows:
+                if merged and start <= merged[-1][1] + 1:
+                    merged[-1][1] = max(merged[-1][1], end)
+                else:
+                    merged.append([start, end])
+            for start, end in merged:
+                included.extend(
+                    f"{lineno}: {all_lines[lineno - 1]}"
+                    for lineno in range(start, end + 1)
+                )
+        if not included:
+            continue
+        prefix = f"--- {path} ({line_count} lines)\n"
+        chunk = prefix + "\n".join(included)
+        remaining = max_total_chars - total_chars
+        if remaining <= 0:
+            break
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining].rstrip()
+            chunks.append(chunk)
+            total_chars = max_total_chars
+            break
+        chunks.append(chunk)
+        total_chars += len(chunk)
+    if not chunks:
+        return ""
+    return header + "\n".join(chunks) + "\n\n"
+
+
 def extract_compact_test_failure(stdout: str, stderr: str, max_lines: int = 25) -> str:
     """Compact, bounded digest of a test failure for a micro-repair prompt.
 

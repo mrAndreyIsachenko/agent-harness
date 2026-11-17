@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import statistics
+from collections import Counter
 from pathlib import Path
 
 from harness.guards import (
@@ -26,6 +27,8 @@ __all__ = [
     "format_benchmark_markdown",
     "scan_state_runs",
     "format_state_stats_markdown",
+    "compute_state_insights",
+    "format_state_insights_markdown",
     "simulate_replay",
     "format_replay_markdown",
 ]
@@ -146,7 +149,7 @@ def summarize_run(result: dict, proxy_summary: dict | None = None) -> dict:
     if cost is None:
         cost = _first(proxy, ("cost_usd", "cost"))
 
-    micro_repair = _first(result, ("micro_repair_used", "micro_repair", "used_micro_repair", "microRepairUsed"))
+    micro_repair = _first(result, ("micro_repair_used", "micro_repair_attempted", "micro_repair", "used_micro_repair", "microRepairUsed"))
     if micro_repair is None:
         # Proxy may report either a flag or a repair-event count.
         count = _first(proxy, ("micro_repair_count", "micro_repairs", "micro_repair"))
@@ -372,6 +375,212 @@ def format_state_stats_markdown(state_dir: str | Path) -> str:
     ]
     lines.extend(_row(model, groups[model]) for model in sorted(groups))
     lines.append(_row("ALL", runs))
+    return "\n".join(lines)
+
+
+_RESOLVED_STATUSES = frozenset(
+    {"validation_passed_review_required", "patch_ready_review_required", "succeeded"}
+)
+
+_READ_TOOL_NAMES = frozenset({"read", "read_file"})
+_EDIT_TOOL_NAMES = frozenset({"edit", "write", "edit_file", "write_file", "apply_patch"})
+
+
+def _iter_run_records(state_dir: str | Path):
+    """Yield ``(run_dir, result_dict)`` for readable state runs, oldest-first by mtime."""
+    runs_dir = Path(state_dir) / "runs"
+    if not runs_dir.is_dir():
+        return
+    run_dirs: list[tuple[float, Path]] = []
+    for child in runs_dir.iterdir():
+        try:
+            if not child.is_dir() or not (child / "result.json").is_file():
+                continue
+            run_dirs.append((child.stat().st_mtime, child))
+        except OSError:
+            continue
+    run_dirs.sort(key=lambda entry: entry[0])
+    for _, run_dir in run_dirs:
+        try:
+            with (run_dir / "result.json").open("r", encoding="utf-8") as handle:
+                result = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(result, dict):
+            continue
+        if result.get("status") == "configuration_verified_no_model_call":
+            continue
+        yield run_dir, result
+
+
+def _load_tool_spans(run_dir: Path) -> list[dict]:
+    """Load TOOL-kind spans from a run's traces.jsonl, sorted by start time."""
+    traces_path = run_dir / "traces.jsonl"
+    if not traces_path.is_file():
+        return []
+    spans: list[dict] = []
+    try:
+        with traces_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    span = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(span, dict):
+                    continue
+                attrs = span.get("attributes") or {}
+                if not isinstance(attrs, dict):
+                    continue
+                if attrs.get("openinference.span.kind") != "TOOL":
+                    continue
+                spans.append(span)
+    except OSError:
+        return []
+    spans.sort(key=lambda span: span.get("start_time_ns", 0))
+    return spans
+
+
+def compute_state_insights(state_dir: str | Path) -> dict:
+    """Compute task-funnel, blocked-reason and tool-error insights from a state directory."""
+    task_order: list[str] = []
+    task_runs: dict[str, list[dict]] = {}
+
+    blocked_counter: Counter[str] = Counter()
+    tool_error_counter: Counter[tuple[str, str]] = Counter()
+    reads_before_edit_samples: list[int] = []
+
+    for run_dir, result in _iter_run_records(state_dir):
+        task_id = str(result.get("task_id") or run_dir.name)
+        if task_id not in task_runs:
+            task_order.append(task_id)
+            task_runs[task_id] = []
+        task_runs[task_id].append(result)
+
+        status = str(result.get("status") or "")
+        if status == "blocked":
+            blocked_counter[str(result.get("reason") or "unknown")] += 1
+
+        spans = _load_tool_spans(run_dir)
+        if not spans:
+            continue
+        for span in spans:
+            if span.get("status") != "ERROR":
+                continue
+            attrs = span.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            tool_name = str(attrs.get("tool.name") or span.get("name") or "unknown")
+            error_text = str(
+                attrs.get("output.value")
+                or attrs.get("error.message")
+                or span.get("status_message")
+                or "error"
+            )
+            error_prefix = error_text.splitlines()[0][:80] if error_text else "error"
+            tool_error_counter[(tool_name, error_prefix)] += 1
+
+        reads = 0
+        seen_edit = False
+        for span in spans:
+            attrs = span.get("attributes") or {}
+            if not isinstance(attrs, dict):
+                attrs = {}
+            tool_name = str(attrs.get("tool.name") or span.get("name") or "unknown")
+            lowered = tool_name.lower()
+            if lowered in _EDIT_TOOL_NAMES:
+                seen_edit = True
+                break
+            if lowered in _READ_TOOL_NAMES:
+                reads += 1
+        if seen_edit:
+            reads_before_edit_samples.append(reads)
+
+    funnel = {
+        "total_tasks": len(task_order),
+        "resolved_tasks": 0,
+        "first_try_ok": 0,
+        "retry_or_escalation_ok": 0,
+        "micro_repair_ok": 0,
+        "salvaged_ok": 0,
+        "unresolved_tasks": 0,
+    }
+    for task_id in task_order:
+        runs = task_runs[task_id]
+        first_resolved_idx = next(
+            (idx for idx, run in enumerate(runs) if run.get("status") in _RESOLVED_STATUSES),
+            None,
+        )
+        if first_resolved_idx is None:
+            funnel["unresolved_tasks"] += 1
+            continue
+        funnel["resolved_tasks"] += 1
+        if first_resolved_idx > 0:
+            funnel["retry_or_escalation_ok"] += 1
+            continue
+        run = runs[first_resolved_idx]
+        micro_repair_attempted = bool(run.get("micro_repair_attempted")) or bool(run.get("micro_repair_used"))
+        auto_repairs = _to_int(run.get("auto_repairs"))
+        salvaged = bool(run.get("salvaged")) or bool(run.get("salvaged_from"))
+        salvage_reason = run.get("salvage_reason")
+        if micro_repair_attempted or auto_repairs > 0:
+            funnel["micro_repair_ok"] += 1
+        elif salvaged or salvage_reason:
+            funnel["salvaged_ok"] += 1
+        else:
+            funnel["first_try_ok"] += 1
+
+    avg_reads = (
+        sum(reads_before_edit_samples) / len(reads_before_edit_samples)
+        if reads_before_edit_samples
+        else 0.0
+    )
+
+    return {
+        "task_funnel": funnel,
+        "top_blocked_reasons": blocked_counter.most_common(10),
+        "top_tool_errors": tool_error_counter.most_common(10),
+        "avg_reads_before_first_edit": float(avg_reads),
+    }
+
+
+def format_state_insights_markdown(state_dir: str | Path) -> str:
+    """Render the state-directory insights report as Markdown."""
+    insights = compute_state_insights(state_dir)
+    funnel = insights["task_funnel"]
+    lines = [
+        "## Task Resolution Funnel",
+        "",
+        f"- Total tasks: {funnel['total_tasks']}",
+        f"- Resolved: {funnel['resolved_tasks']}",
+        f"  - First try: {funnel['first_try_ok']}",
+        f"  - Retry/escalation: {funnel['retry_or_escalation_ok']}",
+        f"  - Micro repair: {funnel['micro_repair_ok']}",
+        f"  - Salvaged: {funnel['salvaged_ok']}",
+        f"- Unresolved: {funnel['unresolved_tasks']}",
+        "",
+        "## Top Blocked Reasons",
+        "",
+    ]
+    if insights["top_blocked_reasons"]:
+        for reason, count in insights["top_blocked_reasons"]:
+            lines.append(f"- {reason}: {count}")
+    else:
+        lines.append("- None")
+    lines.extend(["", "## Top Tool Errors", ""])
+    if insights["top_tool_errors"]:
+        for (tool_name, error_prefix), count in insights["top_tool_errors"]:
+            lines.append(f"- {tool_name}: {error_prefix} ({count})")
+    else:
+        lines.append("- None")
+    lines.extend(
+        [
+            "",
+            f"Average reads before first edit: {insights['avg_reads_before_first_edit']:.2f}",
+        ]
+    )
     return "\n".join(lines)
 
 

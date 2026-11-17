@@ -5,7 +5,8 @@ Subcommands:
     skeleton <file>...    Print line-threshold skeletons for the given files.
     bench-report          Render a Markdown benchmark comparison from two
                           JSON files of run records.
-    stats [--state-dir]   Summarize live state-directory runs as Markdown.
+    stats [--state-dir] [--insights]
+                          Summarize live state-directory runs as Markdown.
     replay                Run offline A/B replay simulation over episodes
                           or a state directory.
     trace [path]          Print a trace tree from traces.jsonl (or a run
@@ -31,6 +32,7 @@ from harness.proxy import OPENROUTER_UPSTREAM, openrouter_proxy
 from harness.report import (
     format_benchmark_markdown,
     format_replay_markdown,
+    format_state_insights_markdown,
     format_state_stats_markdown,
     simulate_replay,
 )
@@ -182,6 +184,8 @@ def _load_trace_spans(path: str) -> list:
 
 def _run_stats(args: argparse.Namespace) -> int:
     print(format_state_stats_markdown(args.state_dir))
+    if getattr(args, "insights", False):
+        print("\n" + format_state_insights_markdown(args.state_dir))
     return 0
 
 
@@ -382,6 +386,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--state-dir",
         default=default_state_dir,
         help="state directory containing runs/ (default: %(default)s)",
+    )
+    stats.add_argument(
+        "--insights",
+        action="store_true",
+        help="also print task-funnel, blocked-reason and tool-error insights",
     )
     stats.set_defaults(handler=_run_stats)
 

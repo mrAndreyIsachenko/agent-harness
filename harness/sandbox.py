@@ -58,7 +58,8 @@ from .finops import (
     verify_db,
     violation,
 )
-from .guards import build_file_skeletons, extract_compact_test_failure
+from .guards import (build_file_skeletons, build_preloaded_file_excerpts,
+                     extract_compact_test_failure)
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
 from .routing import DEFAULT_MODEL, MODELS
 
@@ -356,19 +357,28 @@ def preflight(cli, task, run_dir, *, base_url=None):
 def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref=None):
     sid = result['session_id']
     skeletons = build_file_skeletons(task['files'])
+    ro_line = ''
+    if task.get('read_only_files'):
+        ro_line = ('\nRead-only reference files (do NOT edit): '
+                   + json.dumps(task['read_only_files']))
     prompt = ('Read/edit ONLY the listed files; do NOT run find/glob or search for Python interpreters.\n'
               'Batch all needed file reads into your first turn and batch edits together; do not loop one small read/edit per turn.\n'
-              + json.dumps(task['files']) + '\n' + task['prompt']
+              + json.dumps(task['files']) + ro_line + '\n' + task['prompt']
               + '\nNo shell is available. The supervisor runs this exact validation AFTER you exit: '
               + json.dumps(task['test_argv'])
               + '\nDo not claim tests passed. Stop immediately after the required edits.')
     if task['mode'] == 'patch':
-        prompt = ('Read ONLY these source files: ' + json.dumps(task['files']) + '\n' + task['prompt']
+        prompt = ('Read ONLY these source files: ' + json.dumps(task['files']) + ro_line + '\n' + task['prompt']
                   + '\nWrite ONLY a small unified diff to ' + task['patch_file']
                   + '. Source files are read-only. Do not reconstruct whole files. '
                   'No shell or network. Exit immediately after writing the patch; no extra summary call. '
                   'The supervisor checks the patch without applying it; testing follows reviewed application.')
-    prompt = skeletons + prompt
+    if '[CURRENT_PATCH]' not in task['prompt']:
+        excerpts = build_preloaded_file_excerpts(
+            list(task['files']) + list(task.get('read_only_files', ())), task['prompt'])
+    else:
+        excerpts = ''
+    prompt = skeletons + excerpts + prompt
     argv = [str(cli), 'run', '--standalone', '--auto', '--format', 'json', '--agent', 'guarded_worker',
             '--session', sid, '--title', task['task_id'], '--model', task['model'], prompt]
     result['cost'] = None
@@ -448,6 +458,52 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
 
 def file_hashes(files):
     return {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() if Path(p).exists() else None for p in files}
+
+def build_prior_attempt_feedback(state, task_id, *, max_patch_chars=1500):
+    """Compact feedback from earlier completed runs of the same task_id."""
+    runs_dir = Path(state) / 'runs'
+    matches = []
+    for result_path in runs_dir.glob('*/result.json'):
+        try:
+            res = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            continue
+        if res.get('task_id') == task_id and res.get('status') not in (
+                'configuration_verified_no_model_call', 'pending', None):
+            try:
+                matches.append((res, result_path.parent))
+            except OSError:
+                continue
+    if not matches:
+        return ''
+    matches.sort(key=lambda item: (str(item[0].get('started_at') or ''),
+                                   item[1].stat().st_mtime))
+    last_res, last_dir = matches[-1]
+    if last_res.get('status') in ('validation_passed_review_required',
+                                  'patch_ready_review_required', 'succeeded'):
+        return ''
+    if last_res.get('status') != 'blocked':
+        return ''
+    reason = str(last_res.get('reason') or 'blocked')
+    model = str(last_res.get('model') or 'unknown')
+    sections = ''
+    try:
+        test_log = last_dir / 'test.log'
+        if test_log.is_file() and test_log.stat().st_size:
+            sections += '\n[Test failure]:\n' + extract_compact_test_failure(
+                test_log.read_text(errors='replace'), '')
+    except OSError:
+        pass
+    try:
+        patch_file = last_dir / 'changes.patch'
+        if patch_file.is_file() and patch_file.stat().st_size:
+            sections += '\n[Previous patch (truncated)]:\n' + patch_file.read_text(
+                errors='replace')[:max_patch_chars]
+    except OSError:
+        pass
+    return (f'\n\n[PRIOR_ATTEMPT_FEEDBACK — previous run on this task_id failed with '
+            f'reason={reason} on model={model}; avoid repeating the same mistake]:'
+            + sections)
 
 @contextmanager
 def isolated_worktree(task, run_dir):
@@ -603,6 +659,11 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                         if snapshot(db, sid) is not None:
                             raise GuardError('session_id_collision')
                         result['session_id'] = sid
+                        if task.get('include_prior_feedback', True):
+                            prior_feedback = build_prior_attempt_feedback(state, task['task_id'])
+                            if prior_feedback:
+                                task['prompt'] += prior_feedback
+                                event(run_dir, 'prior_attempt_feedback_injected')
                         try:
                             model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
                         except GuardError as exc:

@@ -4224,6 +4224,304 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             body, '/v1/chat/completions', turn_index=3))
         self.assertEqual(out['max_tokens'], ERROR_RECOVERY_MAX_TOKENS_CAP)
 
+    def test_h26_build_preloaded_file_excerpts_short_and_ranges(self):
+        from harness import build_preloaded_file_excerpts as _build
+
+        def _excerpts(prompt, files, **kw):
+            # Be tolerant about positional order between the prompt and the
+            # file list across harness versions.
+            for order in ((prompt, files), (files, prompt)):
+                try:
+                    result = _build(*order, **kw)
+                except TypeError:
+                    continue
+                if isinstance(result, str):
+                    return result
+            return ''
+
+        with tempfile.TemporaryDirectory() as tmp:
+            short = os.path.join(tmp, 'short.py')
+            with open(short, 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join('line %d body' % i for i in range(1, 21)))
+            long_path = os.path.join(tmp, 'long.py')
+            with open(long_path, 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join('row %d body' % i for i in range(1, 201)))
+            # Short file (<=150 lines): full inclusion with line-number prefix.
+            out = _excerpts('please fix line 3', [short])
+            self.assertIn('1: ', out)
+            self.assertIn('line 3 body', out)
+            self.assertIn('20: ', out)
+            # Long file with an explicit range in three notations (+-5 context).
+            for marker in ('lines 80-90', 'L80-L90', 'строки 80-90'):
+                out = _excerpts('see %s for details' % marker, [long_path])
+                self.assertIn('75: ', out, marker)
+                self.assertIn('row 80 body', out)
+                self.assertIn('row 90 body', out)
+                self.assertIn('95: ', out, marker)
+            # max_total_chars caps the result (the harness may add a small
+            # per-file header on top of the budget, so compare sized outputs).
+            unbounded = _excerpts('lines 80-90', [long_path])
+            capped = _excerpts('lines 80-90', [long_path], max_total_chars=50)
+            self.assertTrue(capped)
+            self.assertLess(len(capped), len(unbounded))
+            # No relevant match -> empty string. (`short` is <=150 lines so it
+            # is always preloaded; only the long file can yield nothing.)
+            self.assertEqual(
+                _excerpts('totally unrelated xyzzy query', [long_path]), '')
+
+    def test_h26_model_run_preloaded_excerpts_and_read_only_files(self):
+        import sys
+        from pathlib import Path
+        from unittest import mock
+        from harness.sandbox import model_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            argv_dump = os.path.join(tmp, 'argv.txt')
+            stub = os.path.join(tmp, 'stub_cli.py')
+            with open(stub, 'w', encoding='utf-8') as fh:
+                fh.write(
+                    '#!/usr/bin/env python3\n'
+                    'import sys\n'
+                    'with open(%r, "w", encoding="utf-8") as out:\n'
+                    '    out.write(sys.argv[-1] if len(sys.argv) > 1 else "")\n'
+                    % argv_dump)
+            os.chmod(stub, 0o755)
+            target_file = os.path.join(tmp, 'target.py')
+            with open(target_file, 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join('line %d body' % i for i in range(1, 201)))
+            readonly = os.path.join(tmp, 'ref.py')
+            with open(readonly, 'w', encoding='utf-8') as fh:
+                fh.write('\n'.join('ref_%d = %d' % (i, i) for i in range(1, 41)))
+            run_dir = os.path.join(tmp, 'state', 'runs', 'r1')
+            os.makedirs(run_dir)
+            result = {'session_id': 'ses_test_h26', 'cost': None}
+            budget = 0.15
+            task = {
+                'task_id': 'h26',
+                'mode': 'model',
+                'model': 'openrouter/z-ai/glm-5.3-flash',
+                'files': [target_file],
+                'read_only_files': [readonly],
+                'test_argv': ['/usr/bin/true'],
+                'timeout_seconds': 30,
+                'max_steps': 8,
+                'prompt': 'Implement the change.',
+            }
+            with mock.patch('harness.sandbox.snapshot',
+                            return_value={'id': 'ses_test_h26'}), \
+                    mock.patch('harness.sandbox.metrics',
+                               return_value={'steps': 1, 'cost': 0.001,
+                                             'unfinished': False,
+                                             'model_error': False}), \
+                    mock.patch('harness.sandbox.violation',
+                               lambda *a, **k: None), \
+                    mock.patch('harness.sandbox.capture_requests',
+                               lambda *a, **k: None), \
+                    mock.patch('harness.sandbox.capture_files',
+                               lambda *a, **k: None):
+                model_run(Path(stub), Path(tmp) / 'opencode.db', task,
+                          Path(run_dir), result, budget)
+            with open(argv_dump, encoding='utf-8') as fh:
+                prompt = fh.read()
+            self.assertIn('Read-only reference files (do NOT edit):', prompt)
+            self.assertIn('[PRELOADED_FILE_EXCERPTS', prompt)
+            # A task that already carries a current patch skips preloading.
+            task['prompt'] = 'Implement the change.\n[CURRENT_PATCH]\n--- a\n+++ b\n'
+            with mock.patch('harness.sandbox.snapshot',
+                            return_value={'id': 'ses_test_h26'}), \
+                    mock.patch('harness.sandbox.metrics',
+                               return_value={'steps': 1, 'cost': 0.001,
+                                             'unfinished': False,
+                                             'model_error': False}), \
+                    mock.patch('harness.sandbox.violation',
+                               lambda *a, **k: None), \
+                    mock.patch('harness.sandbox.capture_requests',
+                               lambda *a, **k: None), \
+                    mock.patch('harness.sandbox.capture_files',
+                               lambda *a, **k: None):
+                model_run(Path(stub), Path(tmp) / 'opencode.db', task,
+                          Path(run_dir), result, budget)
+            with open(argv_dump, encoding='utf-8') as fh:
+                prompt_with_patch = fh.read()
+            self.assertIn('[CURRENT_PATCH]', prompt_with_patch)
+            self.assertNotIn('[PRELOADED_FILE_EXCERPTS', prompt_with_patch)
+
+    def test_h27_build_prior_attempt_feedback_and_run_task_injection(self):
+        import time
+        from unittest import mock
+        from harness.sandbox import build_prior_attempt_feedback, run_task
+
+        def _feedback(fn, candidates):
+            for args in candidates:
+                try:
+                    result = fn(*args)
+                except TypeError:
+                    continue
+                if result:
+                    return result, args
+            return '', candidates[0]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, 'state')
+            prev = os.path.join(state, 'runs', 'run_prev')
+            os.makedirs(prev)
+            with open(os.path.join(prev, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'status': 'blocked', 'reason': 'tests_failed',
+                           'model': 'm1', 'task_id': 't1'}, fh)
+            with open(os.path.join(prev, 'test.log'), 'w', encoding='utf-8') as fh:
+                fh.write('FAILED tests/test_x.py::test_y\nE   AssertionError: boom\n')
+            with open(os.path.join(prev, 'changes.patch'), 'w', encoding='utf-8') as fh:
+                fh.write('--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-a\n+b\n')
+            feedback, winning = _feedback(
+                build_prior_attempt_feedback,
+                [(state, 't1'), ('t1', state), (prev,), (state,)])
+            self.assertTrue(feedback)
+            self.assertIn('[PRIOR_ATTEMPT_FEEDBACK', feedback)
+            self.assertIn('tests_failed', feedback)
+            self.assertIn('m1', feedback)
+            self.assertIn('boom', feedback)
+            self.assertIn('--- a/x.py', feedback)
+            # A newer successful attempt suppresses the feedback.
+            newer = os.path.join(state, 'runs', 'run_new')
+            os.makedirs(newer)
+            with open(os.path.join(newer, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'status': 'succeeded', 'task_id': 't1',
+                           'model': 'm1'}, fh)
+            os.utime(os.path.join(newer, 'result.json'),
+                     (time.time() + 10, time.time() + 10))
+            self.assertEqual(build_prior_attempt_feedback(*winning), '')
+
+            # run_task must inject the feedback into task['prompt'] and log it.
+            state2 = os.path.join(tmp, 'state2')
+            blocked2 = os.path.join(state2, 'runs', 'run_prev2')
+            os.makedirs(blocked2)
+            with open(os.path.join(blocked2, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'status': 'blocked', 'reason': 'tests_failed',
+                           'model': 'm1', 'task_id': 't2', 'cost': 0.01}, fh)
+            with open(os.path.join(blocked2, 'test.log'), 'w', encoding='utf-8') as fh:
+                fh.write('E   AssertionError: boom2\n')
+            from pathlib import Path
+            from unittest import mock
+
+            captured = {}
+
+            def _fake_model_run(*args, **kwargs):
+                for value in list(args) + list(kwargs.values()):
+                    if isinstance(value, dict) and 'prompt' in value:
+                        captured['task'] = value
+                return {'status': 'succeeded', 'steps': 1}
+
+            target_file = os.path.join(tmp, 'target2.py')
+            with open(target_file, 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            task = {
+                'task_id': 't2',
+                'directory': tmp,
+                'files': [target_file],
+                'test_argv': ['/usr/bin/true'],
+                'prompt': 'Implement the change.',
+                'worktree': False,
+            }
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump(task, fh)
+            with mock.patch('harness.sandbox.model_run', _fake_model_run), \
+                    mock.patch('harness.sandbox.preflight',
+                               lambda *a, **k: None), \
+                    mock.patch('harness.sandbox.verify_db',
+                               lambda *a, **k: None), \
+                    mock.patch('harness.sandbox.snapshot', return_value=None), \
+                    mock.patch('harness.sandbox.execute', return_value=0), \
+                    mock.patch('harness.sandbox.file_hashes',
+                               side_effect=lambda files: {'f': 'h2' if captured else 'h1'}):
+                run_task(task_path, cli=Path('/usr/bin/true'),
+                         db=Path(tmp) / 'opencode.db', state=Path(state2))
+            injected = captured.get('task', {}).get('prompt', '')
+            self.assertIn('[PRIOR_ATTEMPT_FEEDBACK', injected)
+            events = []
+            for root, _dirs, names in os.walk(state2):
+                if 'events.jsonl' in names:
+                    with open(os.path.join(root, 'events.jsonl'), encoding='utf-8') as fh:
+                        events.append(fh.read())
+            self.assertTrue(any('prior_attempt_feedback_injected' in chunk
+                                for chunk in events))
+
+    def test_h28_compute_state_insights_and_cli_stats_insights(self):
+        from harness import compute_state_insights, format_state_insights_markdown
+        from harness.cli import main as cli_main
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = os.path.join(tmp, 'runs')
+            layouts = {
+                'first': {'task_id': 'first', 'status': 'succeeded',
+                          'model': 'm1', 'steps': 2},
+                'repair': {'task_id': 'repair', 'status': 'succeeded',
+                           'model': 'm1', 'steps': 4, 'micro_repair_used': True},
+                'salvaged': {'task_id': 'salvaged',
+                             'status': 'validation_passed_review_required',
+                             'model': 'm1', 'steps': 8, 'salvaged': True},
+                'escalated': {'task_id': 'escalated', 'status': 'succeeded',
+                              'model': 'm2', 'steps': 5,
+                              'escalated_from': 'm1'},
+                'blocked': {'task_id': 'blocked', 'status': 'blocked',
+                            'reason': 'tests_failed', 'model': 'm1'},
+                'cached': {'task_id': 'cached',
+                           'status': 'configuration_verified_no_model_call',
+                           'model': 'm1'},
+            }
+            for name, payload in layouts.items():
+                run_dir = os.path.join(runs, name)
+                os.makedirs(run_dir)
+                with open(os.path.join(run_dir, 'result.json'), 'w',
+                          encoding='utf-8') as fh:
+                    json.dump(payload, fh)
+                if name == 'blocked':
+                    spans = [
+                        {'name': 'tool.read', 'span_id': 'a' * 16,
+                         'trace_id': 'b' * 32, 'parent_span_id': None,
+                         'start_time_ns': 1, 'end_time_ns': 2,
+                         'status': 'ERROR',
+                         'attributes': {'openinference.span.kind': 'TOOL',
+                                        'tool.name': 'read'}},
+                        {'name': 'tool.edit', 'span_id': 'c' * 16,
+                         'trace_id': 'b' * 32, 'parent_span_id': 'a' * 16,
+                         'start_time_ns': 3, 'end_time_ns': 4, 'status': 'OK',
+                         'attributes': {'openinference.span.kind': 'TOOL',
+                                        'tool.name': 'edit'}},
+                    ]
+                    with open(os.path.join(run_dir, 'traces.jsonl'), 'w',
+                              encoding='utf-8') as fh:
+                        for span in spans:
+                            fh.write(json.dumps(span) + '\n')
+
+            insights = compute_state_insights(tmp)
+            if isinstance(insights, str):
+                text = insights
+            else:
+                try:
+                    text = json.dumps(insights, ensure_ascii=False)
+                except TypeError:
+                    text = str(insights)
+            try:
+                markdown = format_state_insights_markdown(tmp)
+            except Exception:
+                markdown = format_state_insights_markdown(insights)
+            blob = text + '\n' + markdown
+            self.assertIn('tests_failed', blob)
+            self.assertIn('blocked', blob)
+            self.assertIn('read', blob)
+            self.assertTrue('first_try' in blob or 'first-try' in blob)
+            self.assertTrue('micro_repair' in blob or 'micro-repair' in blob)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.assertEqual(
+                    cli_main(['stats', '--insights', '--state-dir', tmp]), 0)
+            cli_out = buf.getvalue()
+            self.assertTrue(cli_out)
+            self.assertIn('tests_failed', cli_out)
+            self.assertIn('Average reads before first edit', cli_out)
+
 
 if __name__ == '__main__':
     unittest.main()
