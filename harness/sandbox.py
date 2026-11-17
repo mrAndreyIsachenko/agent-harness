@@ -29,6 +29,8 @@ from collections import Counter
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+from .telemetry import sync_state_traces_to_phoenix, synthesize_spans_from_run_dir
+
 from .finops import (
     DB,
     LIMITS,
@@ -59,6 +61,8 @@ from .finops import (
 from .guards import build_file_skeletons, extract_compact_test_failure
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
 from .routing import DEFAULT_MODEL, MODELS
+
+MAX_STEPS = LIMITS['max_steps'][1]
 
 CLI = os.environ.get("HARNESS_CLI") or os.environ.get("OPENCODE_CLI") or "/Applications/OpenCode.app/Contents/Resources/opencode-cli"
 # The durable journal stays next to the launcher facade when loaded via opencode_guard;
@@ -103,6 +107,20 @@ def validate_task(raw):
     if len(set(normalized)) != len(normalized):
         raise GuardError('duplicate_file_or_symlink_alias')
     t['files'] = sorted(normalized)
+    ro_raw = t.get('read_only_files', [])
+    if not isinstance(ro_raw, list) or not 0 <= len(ro_raw) <= 5:
+        raise GuardError('read_only_files_must_be_a_list_of_up_to_five_files')
+    normalized_ro = []
+    for f in ro_raw:
+        if not isinstance(f, str) or '\x00' in f or not Path(f).is_absolute():
+            raise GuardError('file_paths_must_be_absolute')
+        p = Path(f).resolve()
+        if any(x in str(p) for x in '*?') or not p.is_file():
+            raise GuardError('invalid_file_target')
+        if str(p) in t['files']:
+            raise GuardError('read_only_file_overlaps_editable_files')
+        normalized_ro.append(str(p))
+    t['read_only_files'] = sorted(set(normalized_ro))
     t['test_argv'] = executable_argv(t.get('test_argv'))
     t.setdefault('mode', 'model')
     if t['mode'] not in ('model', 'patch', 'command'):
@@ -134,6 +152,8 @@ def validate_task(raw):
             raise GuardError('worktree_not_supported_for_patch_mode')
         if any(not Path(f).is_relative_to(Path(t['directory'])) for f in t['files']):
             raise GuardError('worktree_files_must_be_under_directory')
+        if any(not Path(f).is_relative_to(Path(t['directory'])) for f in t['read_only_files']):
+            raise GuardError('worktree_files_must_be_under_directory')
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
         raise GuardError('invalid_auto_micro_repair_flag')
@@ -143,6 +163,8 @@ def validate_task(raw):
             raise GuardError(f'invalid_{key}')
         if value > default and (not isinstance(t.get('limit_reason'), str) or not t['limit_reason'].strip()):
             raise GuardError('limit_increase_requires_written_reason')
+    if t['mode'] == 'model' and t.get('adaptive_steps', True):
+        t['max_steps'] = min(MAX_STEPS, max(int(t['max_steps']), 4 + 3 * len(t['files'])))
     return t
 
 def capture_files(run_dir, files):
@@ -210,6 +232,8 @@ def config_for(task, *, base_url=None):
     actions = ('read',) if task['mode'] == 'patch' else ('read', 'edit')
     permissions += [{'action': action, 'resource': path, 'effect': 'allow'}
                     for path in task['files'] for action in actions]
+    permissions += [{'action': 'read', 'resource': path, 'effect': 'allow'}
+                    for path in task.get('read_only_files', ())]
     if task['mode'] == 'patch':
         permissions += [{'action': a, 'resource': task['patch_file'], 'effect': 'allow'} for a in ('read', 'edit')]
     cfg = {'model': task['model'], 'small_model': task['model'],
@@ -432,6 +456,16 @@ def isolated_worktree(task, run_dir):
             elif dst.exists():
                 dst.unlink()
             wt_files.append(str(dst))
+        wt_ro_files = []
+        for src in task.get('read_only_files', ()):
+            rel = Path(src).resolve().relative_to(repo_root)
+            dst = (wt_root / rel).resolve()
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if Path(src).exists():
+                dst.write_bytes(Path(src).read_bytes())
+            elif dst.exists():
+                dst.unlink()
+            wt_ro_files.append(str(dst))
         prefix = str(repo_root)
         _fh = getattr(sys.modules.get('opencode_guard'), 'file_hashes', file_hashes)
         def remap(argv):
@@ -439,6 +473,7 @@ def isolated_worktree(task, run_dir):
         wt_task = dict(task, directory=str(wt_dir), files=wt_files,
                        prompt=task.get('prompt', '').replace(prefix, str(wt_root)),
                        origin_files=list(task['files']), origin_hashes=_fh(task['files']),
+                       read_only_files=wt_ro_files,
                        test_argv=remap(task['test_argv']))
         if 'command_argv' in task:
             wt_task['command_argv'] = remap(task['command_argv'])
@@ -447,7 +482,13 @@ def isolated_worktree(task, run_dir):
         subprocess.run(['/usr/bin/git', 'worktree', 'remove', '--force', str(wt_root)],
                        cwd=repo_root, capture_output=True, timeout=30)
 
-def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_url=None, fetch=None):
+def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None):
+    if cli is None:
+        cli = CLI
+    if db is None:
+        db = DB
+    if state is None:
+        state = STATE
     result = {'status': 'rejected', 'reason': '', 'artifact': None}
     reconciled_cost = None
     _fh = getattr(sys.modules.get('opencode_guard'), 'file_hashes', file_hashes)
@@ -463,16 +504,20 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
             run_dir = state / 'runs' / uuid.uuid4().hex
             run_dir.mkdir(parents=True, mode=0o700)
             started = time.monotonic()
+            started_at = time.time()
             if not check:
                 task = stack.enter_context(isolated_worktree(task, run_dir))
             tracked = task['files'] + ([task['patch_file']] if task['mode'] == 'patch' else [])
+            ro_files = task.get('read_only_files', ())
+            ro_hashes_before = _fh(ro_files)
             result = dict(task_id=task['task_id'], session_id=None, status='pending', reason='',
                           model=task['model'] if task['mode'] != 'command' else None,
                           cost=0, steps=0, observed_cost=0, prior_task_cost=spent,
                           limit_reason=task.get('limit_reason'),
                           limits={k: task[k] for k in LIMITS}, test_return_code=None,
                           artifact=str(run_dir), hashes_before=_fh(task['files']),
-                          worktree=task.get('worktree', False))
+                          worktree=task.get('worktree', False),
+                          started_at=started_at)
             result['limits']['available_cost_usd'] = budget
             private_write(run_dir / 'result.json', result)
             private_write(run_dir / 'task.json', task)
@@ -487,6 +532,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                 is_real_cli = False
             use_proxy = (not check and task['mode'] != 'command' and (upstream_url is not None or is_real_cli))
             started_ref = [None]
+            active_max_steps = [task['max_steps']]
             try:
                 if task['mode'] != 'command':
                     verify_db(db)
@@ -501,10 +547,10 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                             if snap_cur is None:
                                 return None
                             m_cur = metrics(snap_cur)
-                            reason = violation(m_cur, budget, task['max_steps'])
+                            reason = violation(m_cur, budget, active_max_steps[0])
                             if reason:
                                 return reason
-                            if m_cur['steps'] >= task['max_steps'] and not m_cur['unfinished']:
+                            if m_cur['steps'] >= active_max_steps[0] and not m_cur['unfinished']:
                                 return 'step_limit'
                             return None
                         proxy = stack.enter_context(openrouter_proxy(
@@ -519,6 +565,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                 if check:
                     result['status'] = 'configuration_verified_no_model_call'
                 else:
+                    salvage_candidate = None
                     if task['mode'] == 'command':
                         rc = execute(task['command_argv'], task['directory'], task['timeout_seconds'], run_dir / 'command.log')
                         if rc:
@@ -528,12 +575,22 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                         if snapshot(db, sid) is not None:
                             raise GuardError('session_id_collision')
                         result['session_id'] = sid
-                        model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
+                        try:
+                            model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
+                        except GuardError as exc:
+                            if (task['mode'] == 'model'
+                                    and str(exc) in ('step_limit', 'worker_timeout')
+                                    and _fh(task['files']) != result['hashes_before']):
+                                capture_files(run_dir, tracked)
+                                salvage_candidate = str(exc)
+                                event(run_dir, 'salvage_validation_started', reason=salvage_candidate)
+                            else:
+                                raise
                         if task['mode'] == 'patch':
                             if _fh(task['files']) != result['hashes_before']:
                                 raise GuardError('patch_worker_modified_source')
                             check_patch(task)
-                        elif _fh(task['files']) == result['hashes_before']:
+                        elif salvage_candidate is None and _fh(task['files']) == result['hashes_before']:
                             raise GuardError('no_change')
                     if task['mode'] == 'patch':
                         result['status'] = 'patch_ready_review_required'
@@ -543,18 +600,31 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                                                             task['test_timeout_seconds'], run_dir / 'test.log')
                         if result['test_return_code']:
                             capture_files(run_dir, tracked)
+                            if salvage_candidate is not None:
+                                raise GuardError(salvage_candidate)
                             if (task.get('auto_micro_repair', True)
                                     and task['mode'] == 'model'
                                     and (run_dir / 'changes.patch').exists()
                                     and (run_dir / 'changes.patch').stat().st_size > 0
                                     and result.get('cost') is not None
-                                    and result.get('steps', 0) <= 8
-                                    and result['cost'] <= 0.06):
+                                    and result.get('steps', 0) <= task['max_steps']
+                                    and result['cost'] <= min(budget * 0.8, 0.08)):
                                 compact_failure = extract_compact_test_failure(
                                     (run_dir / 'test.log').read_text(errors='replace'), '')
-                                repair_task = dict(task, max_steps=4, prompt=task['prompt']
-                                                   + '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
-                                                   + compact_failure)
+                                current_patch = (run_dir / 'changes.patch').read_text(errors='replace')[:4000]
+                                repair_max_steps = min(6, MAX_STEPS)
+                                active_max_steps[0] = repair_max_steps
+                                repair_task = dict(
+                                    task,
+                                    max_steps=repair_max_steps,
+                                    prompt=(
+                                        task['prompt']
+                                        + '\n\n[CURRENT_PATCH]\n'
+                                        + current_patch
+                                        + '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
+                                        + compact_failure
+                                    ),
+                                )
                                 primary_steps = result.get('steps', 0)
                                 primary_cost = result.get('cost')
                                 primary_observed = result.get('observed_cost')
@@ -583,6 +653,8 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                                                                     run_dir / 'test.log')
                             if result['test_return_code']:
                                 raise GuardError('validation_failed')
+                        if ro_files and _fh(ro_files) != ro_hashes_before:
+                            raise GuardError('read_only_file_modified')
                         if task.get('origin_files'):
                             if _fh(task['origin_files']) != task['origin_hashes']:
                                 raise GuardError('worktree_origin_modified_concurrently')
@@ -592,6 +664,8 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                                     Path(dst).write_bytes(Path(src).read_bytes())
                                 elif Path(dst).exists():
                                     Path(dst).unlink()
+                        if salvage_candidate is not None:
+                            result['salvaged_from'] = salvage_candidate
                         result['status'] = 'validation_passed_review_required'
             except (GuardError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
                 result.update(status='blocked', reason=str(exc) if isinstance(exc, GuardError) else type(exc).__name__)
@@ -615,6 +689,7 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                     result['status'] = 'blocked'
                     result['reason'] = result['reason'] or 'cannot_capture_final_files'
                 result['duration_seconds'] = round(time.monotonic() - started, 3)
+                result['finished_at'] = time.time()
                 result['validation_attempted'] = validation_attempted
                 result_path = run_dir / 'result.json'
                 event(run_dir, 'run_finished', status=result['status'], reason=result['reason'],
@@ -630,6 +705,11 @@ def run_task(task_path, *, cli=CLI, db=DB, state=STATE, check=False, upstream_ur
                     except (GuardError, OSError, ValueError, sqlite3.Error) as exc:
                         event(run_dir, 'auto_reconcile_deferred',
                               reason=str(exc) if isinstance(exc, GuardError) else type(exc).__name__)
+                try:
+                    synthesize_spans_from_run_dir(run_dir)
+                    sync_state_traces_to_phoenix(state, timeout=1.5, max_runs=25)
+                except Exception:
+                    pass
     except (GuardError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
         error = str(exc) if isinstance(exc, GuardError) else type(exc).__name__
         if result.get('reason'):

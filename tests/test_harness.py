@@ -26,18 +26,25 @@ import urllib.request
 
 from harness import OpenRouterGuardProxy
 from harness.cli import main as cli_main
-from harness.finops import (auto_reconcile_from_proxy, can_settle_from_proxy_local,
-                            capture_requests, connect, export_sml_cost_manifest,
-                            locks as finops_locks, metrics, number, prior_cost,
-                            reconcile_run, request_records, resolved_cost,
-                            snapshot, verify_db, violation)
+from harness.finops import (auto_reconcile_from_proxy,
+                            build_unexposed_settlement_evidence,
+                            can_settle_from_proxy_local, capture_requests,
+                            connect, export_sml_cost_manifest,
+                            fetch_generation_settled, locks as finops_locks,
+                            metrics, number, prior_cost, reconcile_run,
+                            request_records, resolved_cost, snapshot,
+                            verify_db, violation)
 from harness.guards import (FORBIDDEN_EGRESS_KEYS, build_file_skeletons,
                             check_allowed_files_syntax, check_egress_payload,
                             check_readonly_sql_tool_calls, check_sql_syntax,
-                            collect_python_top_symbols, compact_stale_reads,
-                            detect_duplicate_tool_calls, extract_compact_test_failure)
+                            collect_python_top_symbols, compact_context_window,
+                            compact_stale_reads, detect_duplicate_tool_calls,
+                            estimate_messages_tokens, extract_compact_test_failure,
+                            inject_edit_failure_hints,
+                            inject_read_guard_hints)
 from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
-                            format_state_stats_markdown, scan_state_runs, summarize_run)
+                            format_replay_markdown, format_state_stats_markdown,
+                            scan_state_runs, simulate_replay, summarize_run)
 from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASONING_MAX_TOKENS,
                              ERROR_RECOVERY_REASONING_MAX_TOKENS, LATE_TURN_REASONING_MAX_TOKENS,
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
@@ -45,7 +52,9 @@ from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASON
                              select_escalated_model)
 from harness.sandbox import (GuardError, capture_files, config_for, execute,
                              file_hashes, isolated_worktree, locks,
-                             validate_task, verify_permissions)
+                             main as sandbox_main, model_run, owned_process,
+                             preflight, run_task, stop_group, validate_task,
+                             verify_permissions)
 from harness.telemetry import OPENINFERENCE_SPAN_KINDS, HarnessTracer, format_trace_tree
 
 GLM = 'openrouter/z-ai/glm-5.3-flash'
@@ -97,6 +106,14 @@ def _post_chat(base_url, body):
 class HarnessTestCase(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix='harness-test-')
+        self._prev_otel_disabled = os.environ.get('HARNESS_OTEL_DISABLED')
+        os.environ['HARNESS_OTEL_DISABLED'] = '1'
+
+    def tearDown(self):
+        if self._prev_otel_disabled is None:
+            os.environ.pop('HARNESS_OTEL_DISABLED', None)
+        else:
+            os.environ['HARNESS_OTEL_DISABLED'] = self._prev_otel_disabled
 
     def path(self, name):
         import os
@@ -720,42 +737,461 @@ class TestTelemetry(HarnessTestCase):
         spans = received['body']['resourceSpans'][0]['scopeSpans'][0]['spans']
         self.assertEqual(spans[0]['name'], 'gen_ai.chat')
 
-    def test_flush_otlp_falls_back_to_protobuf_on_http_415(self):
-        attempts = []
+    def test_flush_otlp_sends_protobuf_by_default_and_falls_back_on_415(self):
+        seen = []
 
-        class _PhoenixCollector(http.server.BaseHTTPRequestHandler):
+        class _ProtobufCollector(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 return
 
             def do_POST(self):
                 length = int(self.headers.get('Content-Length') or '0')
-                body = self.rfile.read(length)
-                ctype = self.headers.get('Content-Type') or ''
-                attempts.append((ctype, body))
-                if ctype == 'application/json':
-                    err = b'Unsupported content type: application/json'
-                    self.send_response(415)
-                    self.send_header('Content-Type', 'text/plain')
-                    self.send_header('Content-Length', str(len(err)))
-                    self.end_headers()
-                    self.wfile.write(err)
-                    return
+                seen.append((self.headers.get('Content-Type'), self.rfile.read(length)))
                 self.send_response(200)
-                self.send_header('Content-Length', '0')
                 self.end_headers()
 
-        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PhoenixCollector)
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _ProtobufCollector)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        tracer = HarnessTracer(service_name='harness-tests', project_name='agent-harness')
-        tracer.record_span('gen_ai.chat', kind='LLM', attributes={'gen_ai.request.model': GLM, 'cost': 0.01, 'ok': True})
+        tracer = HarnessTracer(service_name='pb-test', trace_id='01' * 16)
+        tracer.record_span('harness.task', kind='AGENT', start_time_ns=1000, end_time_ns=5000,
+                           status='ERROR', attributes={'llm.cost.total': 0.05, 'harness.steps': 3})
         try:
             ok = tracer.flush_otlp(endpoint='http://127.0.0.1:%d/v1/traces' % server.server_port)
         finally:
-            server.shutdown(); server.server_close()
+            server.shutdown()
+            server.server_close()
         self.assertTrue(ok)
-        self.assertEqual([c for c, _ in attempts], ['application/json', 'application/x-protobuf'])
-        self.assertIn(b'agent-harness', attempts[1][1])
-        self.assertIn(b'gen_ai.chat', attempts[1][1])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], 'application/x-protobuf')
+        self.assertIn(bytes.fromhex('01' * 16), seen[0][1])
+        self.assertIn(b'harness.task', seen[0][1])
+
+        # Verify 415 fallback to application/json.
+        seen_fb = []
+
+        class _JsonOnlyCollector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                ctype = self.headers.get('Content-Type')
+                body = self.rfile.read(length)
+                seen_fb.append(ctype)
+                if ctype == 'application/x-protobuf':
+                    self.send_response(415)
+                    self.end_headers()
+                    return
+                json.loads(body)
+                self.send_response(200)
+                self.end_headers()
+
+        srv2 = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _JsonOnlyCollector)
+        threading.Thread(target=srv2.serve_forever, daemon=True).start()
+        try:
+            ok2 = tracer.flush_otlp(endpoint='http://127.0.0.1:%d/v1/traces' % srv2.server_port)
+        finally:
+            srv2.shutdown()
+            srv2.server_close()
+        self.assertTrue(ok2)
+        self.assertEqual(seen_fb, ['application/x-protobuf', 'application/json'])
+
+    def test_synthesize_spans_openinference_status_tokens_cost_and_resynthesis(self):
+        from pathlib import Path
+        from harness.telemetry import synthesize_spans_from_run_dir
+
+        run_dir = Path(self.path('synth-run'))
+        run_dir.mkdir()
+        (run_dir / 'task.json').write_text(json.dumps({
+            'task_id': 't-synth', 'model': GLM, 'files': ['a.py'], 'prompt': 'Fix a.py',
+        }))
+        (run_dir / 'result.json').write_text(json.dumps({
+            'task_id': 't-synth', 'status': 'blocked', 'reason': 'step_limit',
+            'model': GLM, 'cost': 0.012, 'steps': 2, 'test_return_code': 1,
+        }))
+        (run_dir / 'events.jsonl').write_text(
+            json.dumps({'time': 1700000000.0, 'event': 'run_started'}) + '\n'
+            + json.dumps({'time': 1700000010.5, 'event': 'run_finished'}) + '\n'
+        )
+        (run_dir / 'requests.json').write_text(json.dumps({
+            'requests': [{
+                'ordinal': 1,
+                'time': {'created': 1700000001000, 'completed': 1700000004000},
+                'state': 'finished',
+                'finish': 'stop',
+                'cost': 0.012,
+                'tokens': {'input': 100, 'output': 20, 'reasoning': 5, 'cache': {'read': 50, 'write': 0}},
+                'provider_request_ids': ['gen-1'],
+            }]
+        }))
+        # Seed an old incomplete traces.jsonl to verify automatic re-synthesis.
+        (run_dir / 'traces.jsonl').write_text(json.dumps({
+            'name': 'harness.task', 'span_id': 'a' * 16, 'trace_id': 'b' * 32,
+            'parent_span_id': None, 'start_time_ns': 100, 'end_time_ns': 100,
+            'status': 'OK', 'attributes': {'openinference.span.kind': 'AGENT'},
+        }) + '\n')
+
+        spans = synthesize_spans_from_run_dir(run_dir)
+        self.assertEqual(len(spans), 2)
+        root, child = spans[0], spans[1]
+        self.assertEqual(root['name'], 'harness.task')
+        self.assertEqual(root['status'], 'ERROR')
+        self.assertEqual(root['status_message'], 'step_limit')
+        self.assertEqual(root['end_time_ns'] - root['start_time_ns'], int(10.5 * 1e9))
+        self.assertEqual(root['attributes']['otel.status_code'], 'ERROR')
+        self.assertEqual(root['attributes']['otel.status_description'], 'step_limit')
+        self.assertEqual(root['attributes']['llm.cost.total'], 0.012)
+        self.assertEqual(root['attributes']['llm.token_count.prompt'], 150)
+        self.assertEqual(root['attributes']['llm.token_count.completion'], 25)
+        self.assertEqual(root['attributes']['llm.token_count.total'], 175)
+        self.assertIn('Fix a.py', root['attributes']['input.value'])
+        self.assertIn('step_limit', root['attributes']['output.value'])
+
+        self.assertEqual(child['name'], 'gen_ai.chat')
+        self.assertEqual(child['end_time_ns'] - child['start_time_ns'], 3_000_000_000)
+        self.assertEqual(child['attributes']['llm.token_count.total'], 175)
+        self.assertEqual(child['attributes']['llm.cost.total'], 0.012)
+
+    def test_flush_otlp_disabled_env(self):
+        seen = []
+
+        class _Collector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                self.rfile.read(length)
+                seen.append(1)
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        tracer = HarnessTracer(service_name='otel-disabled-test')
+        tracer.record_span('gen_ai.chat', kind='LLM', attributes={'gen_ai.request.model': GLM})
+        try:
+            blocked = tracer.flush_otlp(endpoint=None)
+            self.assertFalse(blocked)
+            self.assertEqual(seen, [])
+            explicit = tracer.flush_otlp(endpoint='http://127.0.0.1:%d' % server.server_port)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertTrue(explicit)
+        self.assertEqual(len(seen), 1)
+
+    def test_sync_state_traces_ledger_base_and_disabled_skip(self):
+        from pathlib import Path
+        from harness.telemetry import sync_state_traces_to_phoenix
+
+        state_dir = Path(self.path('state'))
+        seen = []
+
+        class _Collector(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                self.rfile.read(length)
+                seen.append(1)
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Collector)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        endpoint = 'http://127.0.0.1:%d' % server.server_port
+
+        def make_run(run_id):
+            run_dir = state_dir / 'runs' / run_id
+            run_dir.mkdir(parents=True)
+            (run_dir / 'task.json').write_text(json.dumps({
+                'task_id': run_id, 'model': GLM, 'files': ['a.py'], 'prompt': 'Fix a.py',
+            }))
+            (run_dir / 'result.json').write_text(json.dumps({
+                'task_id': run_id, 'status': 'succeeded', 'model': GLM,
+                'cost': 0.01, 'steps': 1,
+            }))
+            (run_dir / 'events.jsonl').write_text(
+                json.dumps({'time': 1700000000.0, 'event': 'run_started'}) + '\n'
+                + json.dumps({'time': 1700000010.0, 'event': 'run_finished'}) + '\n'
+            )
+            return run_dir
+
+        make_run('run-sync-1')
+        try:
+            result = sync_state_traces_to_phoenix(state_dir / 'runs' / 'run-sync-1',
+                                                  endpoint=endpoint)
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(result['newly_synced'], 1)
+        self.assertEqual(len(seen), 1)
+        # The ledger lands next to `runs/`, not inside the run directory.
+        ledger = state_dir / 'phoenix-sync-state.json'
+        self.assertTrue(ledger.is_file())
+        synced = json.loads(ledger.read_text())['synced']
+        self.assertIn('run-sync-1', synced)
+        self.assertFalse((state_dir / 'runs' / 'run-sync-1'
+                          / 'phoenix-sync-state.json').exists())
+
+        # HARNESS_OTEL_DISABLED=1 (set in setUp) skips the network entirely.
+        make_run('run-sync-2')
+        blocked = sync_state_traces_to_phoenix(state_dir, endpoint=None)
+        self.assertEqual(blocked['newly_synced'], 0)
+        self.assertEqual(blocked['pending_unsynced'], 1)
+        self.assertFalse(blocked['collector_reachable'])
+        self.assertEqual(len(seen), 1)  # no additional POST
+        synced2 = json.loads(ledger.read_text())['synced']
+        self.assertNotIn('run-sync-2', synced2)
+
+    def test_record_tool_span_and_format_trace_tree(self):
+        tracer = HarnessTracer(service_name='tool-test', trace_id='02' * 16)
+        tracer.record_span('harness.task', kind='AGENT', start_time_ns=1_000_000, end_time_ns=5_000_000)
+        long_arg = 'x' * 2500
+        long_out = 'y' * 2500
+        ok_span = tracer.record_tool_span(
+            'edit',
+            arguments={'file': 'a.py', 'data': long_arg},
+            output=long_out,
+            status='OK',
+            start_time_ns=1_500_000,
+            end_time_ns=2_500_000,
+            step_index=1,
+        )
+        err_span = tracer.record_tool_span(
+            'bash',
+            arguments='pytest -q',
+            output='exit code 1',
+            status='ERROR',
+            start_time_ns=2_600_000,
+            end_time_ns=3_000_000,
+        )
+        self.assertEqual(ok_span['parent_span_id'], tracer.root_span_id)
+        self.assertEqual(ok_span['attributes']['openinference.span.kind'], 'TOOL')
+        self.assertEqual(ok_span['attributes']['tool.name'], 'edit')
+        self.assertEqual(len(ok_span['attributes']['tool.parameters']), 2000)
+        self.assertEqual(len(ok_span['attributes']['output.value']), 2000)
+        self.assertEqual(ok_span['attributes']['harness.turn_index'], 1)
+        self.assertEqual(err_span['status'], 'ERROR')
+
+        # Parent tool spans to the recorded root span for tree rendering.
+        root = tracer.spans[0]
+        ok_span['parent_span_id'] = root['span_id']
+        err_span['parent_span_id'] = root['span_id']
+        tree = format_trace_tree(tracer.spans)
+        self.assertIn('[TOOL] edit (OK)', tree)
+        self.assertIn('[TOOL] bash (ERROR)', tree)
+
+    def test_synthesize_spans_from_run_dir_with_tool_spans(self):
+        from pathlib import Path
+        from harness.telemetry import _deterministic_hex, synthesize_spans_from_run_dir
+
+        run_dir = Path(self.path('synth-tools-run'))
+        run_dir.mkdir()
+        (run_dir / 'task.json').write_text(json.dumps({
+            'task_id': 't-tools', 'model': GLM, 'files': ['a.py'], 'prompt': 'Edit a.py',
+        }))
+        (run_dir / 'result.json').write_text(json.dumps({
+            'task_id': 't-tools', 'status': 'succeeded', 'model': GLM, 'cost': 0.01, 'steps': 1,
+        }))
+        (run_dir / 'requests.json').write_text(json.dumps({
+            'requests': [{
+                'ordinal': 1,
+                'time': {'created': 1700000000000, 'completed': 1700000005000},
+                'state': 'finished',
+                'cost': 0.01,
+                'tokens': {'input': 50, 'output': 10, 'reasoning': 0, 'cache': {'read': 0, 'write': 0}},
+            }],
+            'messages': [
+                {
+                    'role': 'assistant',
+                    'parts': [
+                        {
+                            'type': 'tool',
+                            'tool': 'edit',
+                            'state': {
+                                'status': 'completed',
+                                'input': {'filePath': 'a.py'},
+                                'output': 'edited a.py',
+                                'time': {'start': 1700000001000, 'end': 1700000002000},
+                            },
+                        },
+                        {
+                            'type': 'tool',
+                            'tool': 'bash',
+                            'state': {
+                                'status': 'error',
+                                'input': {'command': 'pytest'},
+                                'error': 'failed',
+                                'time': {'start': 1700000002500, 'end': 1700000003500},
+                            },
+                        },
+                    ],
+                },
+                {
+                    'role': 'assistant',
+                    'tool_calls': [
+                        {
+                            'id': 'call_3',
+                            'type': 'function',
+                            'function': {'name': 'read', 'arguments': '{"path": "a.py"}'},
+                        },
+                    ],
+                },
+            ],
+        }))
+
+        spans = synthesize_spans_from_run_dir(run_dir)
+        tool_spans = [s for s in spans if (s.get('attributes') or {}).get('openinference.span.kind') == 'TOOL']
+        llm_spans = [s for s in spans if (s.get('attributes') or {}).get('openinference.span.kind') == 'LLM']
+        self.assertEqual(len(llm_spans), 1)
+        self.assertEqual(len(tool_spans), 3)
+        self.assertEqual(tool_spans[0]['span_id'], _deterministic_hex('synth-tools-run:tool:0', 16))
+        self.assertEqual(tool_spans[1]['span_id'], _deterministic_hex('synth-tools-run:tool:1', 16))
+        self.assertEqual(tool_spans[2]['span_id'], _deterministic_hex('synth-tools-run:tool:2', 16))
+        self.assertEqual(tool_spans[0]['attributes']['tool.name'], 'edit')
+        self.assertEqual(tool_spans[0]['status'], 'OK')
+        self.assertIn('filePath', tool_spans[0]['attributes']['tool.parameters'])
+        self.assertEqual(tool_spans[0]['attributes']['output.value'], 'edited a.py')
+        self.assertEqual(tool_spans[1]['attributes']['tool.name'], 'bash')
+        self.assertEqual(tool_spans[1]['status'], 'ERROR')
+        self.assertEqual(tool_spans[2]['attributes']['tool.name'], 'read')
+
+        tree = format_trace_tree(spans)
+        self.assertIn('[TOOL] edit (OK)', tree)
+        self.assertIn('[TOOL] bash (ERROR)', tree)
+        self.assertIn('[TOOL] read (OK)', tree)
+
+    def test_worker_log_tool_spans_resynthesis_and_replay(self):
+        from pathlib import Path
+
+        from harness.report import simulate_replay
+        from harness.telemetry import _needs_resynthesis, synthesize_spans_from_run_dir
+
+        # --- synthesize_spans_from_run_dir extracts TOOL spans from worker.log ---
+        run_dir = Path(self.path('worker-log-run'))
+        run_dir.mkdir()
+        (run_dir / 'task.json').write_text(json.dumps({
+            'task_id': 't-wlog', 'model': GLM, 'files': ['a.py'], 'prompt': 'Edit a.py',
+        }))
+        (run_dir / 'result.json').write_text(json.dumps({
+            'task_id': 't-wlog', 'status': 'succeeded', 'model': GLM, 'cost': 0.02, 'steps': 1,
+        }))
+        (run_dir / 'requests.json').write_text(json.dumps({
+            'requests': [{
+                'ordinal': 1,
+                'time': {'created': 1700000000000, 'completed': 1700000005000},
+                'state': 'finished',
+                'cost': 0.02,
+                'tokens': {'input': 40, 'output': 8, 'reasoning': 0,
+                           'cache': {'read': 0, 'write': 0}},
+            }],
+        }))
+        tool_line = {
+            'type': 'tool_use', 'timestamp': 1700000001000,
+            'part': {'type': 'tool', 'tool': 'read',
+                     'state': {'status': 'completed', 'input': {'path': 'a.py'},
+                               'output': 'contents of a.py'}},
+        }
+        (run_dir / 'worker.log').write_text(json.dumps(tool_line) + '\n' + 'not json\n')
+
+        # No TOOL spans + tool events in worker.log -> resynthesis required.
+        self.assertTrue(_needs_resynthesis([], run_dir))
+        spans = synthesize_spans_from_run_dir(run_dir)
+        tool_spans = [s for s in spans
+                      if (s.get('attributes') or {}).get('openinference.span.kind') == 'TOOL']
+        self.assertEqual(len(tool_spans), 1)
+        self.assertEqual(tool_spans[0]['attributes']['tool.name'], 'read')
+        self.assertEqual(tool_spans[0]['attributes']['output.value'], 'contents of a.py')
+
+        cached_llm_only = [{
+            'name': 'gen_ai.chat', 'span_id': 'a' * 16, 'trace_id': 'b' * 32,
+            'parent_span_id': None, 'start_time_ns': 1000, 'end_time_ns': 2000,
+            'status': 'OK',
+            'attributes': {'openinference.span.kind': 'LLM', 'gen_ai.request.model': GLM},
+        }]
+        self.assertTrue(_needs_resynthesis(cached_llm_only, run_dir))
+        self.assertFalse(_needs_resynthesis(spans, run_dir))
+
+        # --- simulate_replay loads episodes from worker.log in a state_dir ---
+        state = self.path('replay-state')
+        os.makedirs(os.path.join(state, 'runs', 'r1'))
+        with open(os.path.join(state, 'runs', 'r1', 'result.json'), 'w') as fh:
+            json.dump({'task_id': 'r1', 'status': 'succeeded', 'model': GLM}, fh)
+        tool_args = {'command': 'SELECT 1'}
+        with open(os.path.join(state, 'runs', 'r1', 'worker.log'), 'w') as fh:
+            fh.write(json.dumps({
+                'type': 'tool_use', 'timestamp': 1700000001000,
+                'part': {'type': 'tool', 'tool': 'bash',
+                         'state': {'status': 'completed', 'input': tool_args,
+                                   'output': '1 row'}},
+            }) + '\n')
+        summary = simulate_replay(state)
+        self.assertEqual(summary['total_episodes'], 1)
+        self.assertGreater(summary['tokens_before'], 0)
+
+        # --- simulate_replay over list/JSONL with loops, unsafe SQL, escalation & CLI ---
+        big_rows = '\n'.join(f'row_{i}: val_{i}' for i in range(120))
+        episodes = [
+            {
+                'task_id': 'ep-loop-sql',
+                'model': GLM,
+                'messages': [
+                    {'role': 'system', 'content': 'diagnose warehouse'},
+                    {'role': 'assistant', 'tool_calls': [
+                        {'id': 'c1', 'function': {'name': 'query_warehouse', 'arguments': json.dumps({'sql': 'DROP TABLE users'})}}
+                    ]},
+                    {'role': 'tool', 'tool_call_id': 'c1', 'content': f'[SQL GUARD ERROR]\n{big_rows}'},
+                    {'role': 'assistant', 'tool_calls': [
+                        {'id': 'c2', 'function': {'name': 'query_warehouse', 'arguments': json.dumps({'sql': 'DROP TABLE users'})}}
+                    ]},
+                    {'role': 'tool', 'tool_call_id': 'c2', 'content': '[AST PREFLIGHT ERROR]'},
+                    {'role': 'user', 'content': 'retry'},
+                    {'role': 'assistant', 'content': 'done'},
+                    {'role': 'user', 'content': 'check'},
+                    {'role': 'assistant', 'content': 'ok'},
+                ],
+            }
+        ]
+        jsonl_file = self.path('episodes.jsonl')
+        with open(jsonl_file, 'w') as fh:
+            for ep in episodes:
+                fh.write(json.dumps(ep) + '\n')
+        rep = simulate_replay(
+            jsonl_file,
+            max_context_tokens=120,
+            fallback_teacher_model='openrouter/qwen/qwen3-coder',
+            upstream_mode='vllm',
+        )
+        self.assertEqual(rep['total_episodes'], 1)
+        self.assertEqual(rep['loop_warnings_triggered'], 1)
+        self.assertEqual(rep['sql_violations_caught'], 2)
+        self.assertEqual(rep['escalated_to_teacher_count'], 1)
+        self.assertGreater(rep['tokens_saved'], 0)
+        self.assertGreater(rep['token_reduction_pct'], 0.0)
+        md_rep = format_replay_markdown(rep)
+        self.assertIn('# Offline Replay Simulation', md_rep)
+        self.assertIn('Loop Warnings Triggered', md_rep)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli_main([
+                'replay', '--input', jsonl_file,
+                '--max-context-tokens', '120',
+                '--fallback-teacher-model', 'openrouter/qwen/qwen3-coder',
+                '--upstream-mode', 'vllm',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertIn('# Offline Replay Simulation', buf.getvalue())
+
+        buf_json = io.StringIO()
+        with contextlib.redirect_stdout(buf_json):
+            rc_json = cli_main(['replay', '--input', jsonl_file, '--json'])
+        self.assertEqual(rc_json, 0)
+        parsed_json = json.loads(buf_json.getvalue())
+        self.assertEqual(parsed_json['total_episodes'], 1)
 
 
 class TestH9StateStatsAndCLI(HarnessTestCase):
@@ -1033,7 +1469,7 @@ class TestH10SandboxAndFinops(HarnessTestCase):
             importlib.reload(sandbox_mod)
 
 
-class TestFinopsAndSandboxUnit(unittest.TestCase):
+class TestFinopsAndSandboxUnit(HarnessTestCase):
     """Unit tests for harness.finops and harness.sandbox using temp dirs and synthetic SQLite DBs."""
 
     def _init_db(self, db_path, sessions=(), messages=()):
@@ -1331,6 +1767,52 @@ class TestFinopsAndSandboxUnit(unittest.TestCase):
                 sub = os.path.join(tmp, 'sub')
                 os.makedirs(sub)
                 validate_task(self._valid_task(sub, worktree=True, files=[outside]))
+
+    def test_validate_task_and_config_for_read_only_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ro_path = os.path.join(tmp, 'ref.py')
+            with open(ro_path, 'w', encoding='utf-8') as fh:
+                fh.write('REF = 0\n')
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+
+            base = self._valid_task(tmp)
+            base['files'] = [target]
+            base['test_argv'] = [sys.executable, '-c', 'raise SystemExit(0)']
+
+            task = dict(base, read_only_files=[ro_path, ro_path])
+            t = validate_task(task)
+            self.assertEqual(t['read_only_files'], [os.path.realpath(ro_path)])
+
+            cfg = config_for(t)
+            perms = cfg['agents']['guarded_worker']['permissions']
+            ro_rules = [r for r in perms if r['resource'] == os.path.realpath(ro_path)]
+            self.assertEqual(ro_rules, [{'action': 'read', 'resource': os.path.realpath(ro_path), 'effect': 'allow'}])
+            self.assertFalse(any(r['resource'] == os.path.realpath(ro_path) and r['action'] != 'read' for r in perms))
+
+            with self.assertRaisesRegex(GuardError, 'read_only_files_must_be_a_list_of_up_to_five_files'):
+                validate_task(dict(base, read_only_files=['a', 'b', 'c', 'd', 'e', 'f']))
+            with self.assertRaisesRegex(GuardError, 'invalid_file_target'):
+                validate_task(dict(base, read_only_files=[os.path.join(tmp, 'nope.py')]))
+            with self.assertRaisesRegex(GuardError, 'read_only_file_overlaps_editable_files'):
+                validate_task(dict(base, read_only_files=[target]))
+            with self.assertRaisesRegex(GuardError, 'file_paths_must_be_absolute'):
+                validate_task(dict(base, read_only_files=['relative/ref.py']))
+            repo = os.path.join(tmp, 'repo')
+            os.makedirs(repo)
+            outside = os.path.join(tmp, 'outside.py')
+            with open(outside, 'w', encoding='utf-8') as fh:
+                fh.write('X = 1\n')
+            in_repo = os.path.join(repo, 'target.py')
+            with open(in_repo, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+            wt_base = self._valid_task(tmp)
+            wt_base['directory'] = repo
+            wt_base['files'] = [in_repo]
+            wt_base['worktree'] = True
+            with self.assertRaisesRegex(GuardError, 'worktree_files_must_be_under_directory'):
+                validate_task(dict(wt_base, read_only_files=[outside]))
 
     def test_sandbox_config_for_and_verify_permissions(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1706,6 +2188,1910 @@ class TestSmlCostManifestAndEscalation(HarnessTestCase):
                 conn.close()
             self.assertIsNone(row[0])
             self.assertEqual(row[1], 'failed')
+
+
+class TestContextBudgetCompaction(HarnessTestCase):
+    def test_estimate_messages_tokens(self):
+        self.assertEqual(estimate_messages_tokens(None), 1)
+        self.assertEqual(estimate_messages_tokens([]), 1)
+        msgs = [
+            {'role': 'user', 'content': 'a' * 400},
+            {
+                'role': 'assistant',
+                'content': '',
+                'tool_calls': [{'id': 'c1', 'function': {'name': 'run_sql', 'arguments': '{"q": "SELECT 1"}'}}],
+            },
+        ]
+        tokens = estimate_messages_tokens(msgs)
+        self.assertGreater(tokens, 100)
+        self.assertEqual(estimate_messages_tokens([{'role': 'user', 'content': 'abcd' * 10}]), 10)
+
+    def test_compact_context_window_preserves_headers_tail_and_recent(self):
+        table_lines = ['col_a | col_b | col_c', '------+-------+------']
+        table_lines.extend(f'row_{i:03d} | val_{i:03d} | extra_{i:03d}' for i in range(60))
+        big_table = '\n'.join(table_lines)
+        recent_table = '\n'.join(f'recent_{i:02d} | ok' for i in range(35))
+        messages = [
+            {'role': 'system', 'content': 'System instructions'},
+            {'role': 'user', 'content': 'Query the table'},
+            {'role': 'tool', 'tool_call_id': 'c1', 'content': big_table},
+            {'role': 'assistant', 'content': 'Got it'},
+            {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': 'c2', 'content': big_table}]},
+            {'role': 'assistant', 'content': 'Next step'},
+            {'role': 'tool', 'tool_call_id': 'c3', 'content': recent_table},
+            {'role': 'user', 'content': 'Summarize'},
+        ]
+
+        # Under budget: no truncation.
+        unchanged, stats_ok = compact_context_window(messages, max_context_tokens=10000)
+        self.assertEqual(stats_ok['truncated_messages'], 0)
+        self.assertEqual(unchanged[2]['content'], big_table)
+
+        # Over budget: compacts oldest tool outputs first, keeps system & last 4 messages untouched.
+        compacted, stats = compact_context_window(
+            messages, max_context_tokens=450, keep_recent_messages=4, head_lines=4, tail_lines=3
+        )
+        self.assertGreater(stats['truncated_messages'], 0)
+        self.assertLess(stats['tokens_after'], stats['tokens_before'])
+        self.assertEqual(compacted[0]['content'], 'System instructions')
+        old_tool = compacted[2]['content']
+        self.assertIn('[HARNESS CONTEXT BUDGET: truncated', old_tool)
+        self.assertIn('col_a | col_b | col_c', old_tool)
+        self.assertIn('row_059 | val_059 | extra_059', old_tool)
+        self.assertNotIn('row_030 | val_030 | extra_030', old_tool)
+        # Recent messages (last 4) remain untouched.
+        self.assertEqual(compacted[-2]['content'], recent_table)
+
+    def test_proxy_context_budget_compaction_and_span(self):
+        big_output = '\n'.join(['header_1 | header_2'] + [f'r{i} | data_{i}_padding_text' for i in range(80)])
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(
+            lambda: None,
+            upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+            max_context_tokens=300,
+        )
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            body = json.dumps({
+                'model': GLM,
+                'messages': [
+                    {'role': 'system', 'content': 'sys'},
+                    {'role': 'tool', 'tool_call_id': 't1', 'content': big_output},
+                    {'role': 'assistant', 'content': 'a1'},
+                    {'role': 'user', 'content': 'u2'},
+                    {'role': 'assistant', 'content': 'a2'},
+                    {'role': 'user', 'content': 'u3'},
+                ],
+            }).encode()
+            status = _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(len(captured), 1)
+        forwarded_tool = captured[0]['messages'][1]['content']
+        self.assertIn('[HARNESS CONTEXT BUDGET: truncated', forwarded_tool)
+        self.assertIn('header_1 | header_2', forwarded_tool)
+        summary = proxy.summary()
+        self.assertEqual(summary['compacted_reads'], 1)
+        budget_spans = [s for s in summary['spans'] if s.get('name') == 'guard.context_budget']
+        self.assertEqual(len(budget_spans), 1)
+        self.assertEqual(budget_spans[0]['attributes']['openinference.span.kind'], 'GUARDRAIL')
+
+
+class TestSandboxExecutionAndFinopsSettlement(HarnessTestCase):
+    """End-to-end sandbox and finops tests using temp git repos and synthetic CLI stubs."""
+
+    def _init_db(self, db_path, sessions=(), messages=()):
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL, time_busy REAL, idle_outcome TEXT)')
+            conn.execute('CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT)')
+            conn.executemany(
+                'INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES (?, ?, NULL, NULL)',
+                sessions,
+            )
+            conn.executemany(
+                'INSERT INTO session_message (session_id, type, data) VALUES (?, ?, ?)',
+                [(sid, kind, json.dumps(data)) for sid, kind, data in messages],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_git_repo(self, repo_dir, filename='target.py', content='VALUE = 0\n'):
+        import subprocess
+        os.makedirs(repo_dir, exist_ok=True)
+        target = os.path.join(repo_dir, filename)
+        with open(target, 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        for cmd in (
+            ['/usr/bin/git', 'init'],
+            ['/usr/bin/git', 'config', 'user.email', 'test@example.com'],
+            ['/usr/bin/git', 'config', 'user.name', 'Test User'],
+            ['/usr/bin/git', 'add', filename],
+            ['/usr/bin/git', 'commit', '-m', 'init'],
+        ):
+            subprocess.run(cmd, cwd=repo_dir, check=True, capture_output=True)
+        return target
+
+    def _write_stub_cli(self, directory):
+        cli_path = os.path.join(directory, 'stub_opencode_cli.py')
+        script = '''#!{python}
+import json
+import os
+import sqlite3
+import sys
+
+argv = sys.argv[1:]
+if argv[:4] == ['api', '--standalone', 'GET', '/api/agent']:
+    if os.environ.get('STUB_CLI_BAD_CONFIG') == '1':
+        sys.exit(1)
+    if os.environ.get('STUB_CLI_BAD_JSON') == '1':
+        print('not-json')
+        sys.exit(0)
+    if os.environ.get('STUB_CLI_BAD_PERMS') == '1':
+        print(json.dumps({{'data': [{{'id': 'guarded_worker', 'steps': 1, 'permissions': []}}]}}))
+        sys.exit(0)
+    if os.environ.get('STUB_CLI_FALLBACK_AGENTS') == '1':
+        print(json.dumps({{'data': []}}))
+        sys.exit(0)
+    with open(os.path.join(os.getcwd(), 'opencode.jsonc'), 'r', encoding='utf-8') as fh:
+        cfg = json.load(fh)
+    gw = cfg['agents']['guarded_worker']
+    print(json.dumps({{'data': [{{'id': 'guarded_worker', 'steps': gw['steps'], 'permissions': gw['permissions']}}]}}))
+    sys.exit(0)
+
+if argv[:2] == ['debug', 'agents']:
+    with open(os.path.join(os.getcwd(), 'opencode.jsonc'), 'r', encoding='utf-8') as fh:
+        cfg = json.load(fh)
+    gw = cfg['agents']['guarded_worker']
+    print(json.dumps([{{'id': 'guarded_worker', 'steps': gw['steps'], 'permissions': gw['permissions']}}]))
+    sys.exit(0)
+
+if argv and argv[0] == 'run':
+    sid = argv[argv.index('--session') + 1]
+    prompt = argv[-1]
+    files = []
+    for line in prompt.splitlines():
+        if line.startswith('['):
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, list) and parsed and all(isinstance(x, str) for x in parsed):
+                    files = parsed
+                    break
+            except ValueError:
+                pass
+    db_path = os.environ['HARNESS_TEST_DB']
+    cost = float(os.environ.get('STUB_CLI_COST', '0.015'))
+    finish = os.environ.get('STUB_CLI_FINISH', 'stop')
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES (?, ?, 1.0, NULL)', (sid, cost))
+        msg = {{
+            'id': 'gen-' + sid,
+            'cost': cost,
+            'tokens': {{'input': 80, 'output': 20}},
+            'content': [],
+        }}
+        if finish:
+            msg['finish'] = finish
+        conn.execute('INSERT INTO session_message (session_id, type, data) VALUES (?, ?, ?)', (sid, 'assistant', json.dumps(msg)))
+        conn.commit()
+    finally:
+        conn.close()
+    if os.environ.get('STUB_CLI_PATCH_CONTENT') and os.environ.get('HARNESS_TEST_PATCH_FILE'):
+        with open(os.environ['HARNESS_TEST_PATCH_FILE'], 'w', encoding='utf-8') as fh:
+            fh.write(os.environ['STUB_CLI_PATCH_CONTENT'])
+    elif os.environ.get('STUB_CLI_NO_CHANGE') != '1' and files:
+        content = (
+            os.environ.get('STUB_CLI_REPAIR_CONTENT', 'VALUE = 2\\n')
+            if '[TEST_ARGV FAILURE' in prompt
+            else os.environ.get('STUB_CLI_INITIAL_CONTENT', 'VALUE = 1\\n')
+        )
+        with open(files[0], 'w', encoding='utf-8') as fh:
+            fh.write(content)
+    sys.exit(int(os.environ.get('STUB_CLI_EXIT', '0')))
+
+sys.exit(1)
+'''.format(python=sys.executable)
+        with open(cli_path, 'w', encoding='utf-8') as fh:
+            fh.write(script)
+        os.chmod(cli_path, 0o755)
+        return cli_path
+
+    def test_isolated_worktree_lifecycle_and_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            non_git = os.path.join(tmp, 'plain')
+            os.makedirs(non_git)
+            plain_file = os.path.join(non_git, 'a.py')
+            with open(plain_file, 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            run_dir = os.path.join(tmp, 'state', 'runs', 'r-plain')
+            os.makedirs(run_dir)
+            plain_task = validate_task({
+                'task_id': 'wt-plain',
+                'directory': non_git,
+                'files': [plain_file],
+                'prompt': 'edit',
+                'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                'worktree': True,
+            })
+            with self.assertRaisesRegex(GuardError, 'worktree_requires_git_repository'):
+                with isolated_worktree(plain_task, run_dir):
+                    pass
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task = validate_task({
+                'task_id': 'wt-git',
+                'directory': repo,
+                'files': [target],
+                'prompt': 'edit ' + target,
+                'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                'worktree': True,
+            })
+            wt_run_dir = os.path.join(tmp, 'state', 'runs', 'r-wt')
+            os.makedirs(wt_run_dir)
+            wt_root = os.path.join(tmp, 'state', 'worktrees', 'r-wt')
+            with isolated_worktree(task, wt_run_dir) as wt_task:
+                self.assertTrue(os.path.isdir(wt_root))
+                self.assertNotEqual(wt_task['files'][0], target)
+                self.assertEqual(wt_task['origin_files'], [os.path.realpath(target)])
+                with open(wt_task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 99\n')
+            self.assertFalse(os.path.exists(wt_root))
+
+    def test_owned_process_stop_group_and_preflight(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            run_dir = os.path.join(tmp, 'run')
+            os.makedirs(run_dir)
+            task = validate_task({
+                'task_id': 'preflight-1',
+                'directory': tmp,
+                'files': [target],
+                'prompt': 'edit target.py',
+                'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+            })
+
+            from pathlib import Path
+            preflight(cli_path, task, Path(run_dir))
+
+            with mock.patch.dict(os.environ, {'STUB_CLI_FALLBACK_AGENTS': '1'}):
+                preflight(cli_path, task, Path(run_dir))
+
+            with mock.patch.dict(os.environ, {'STUB_CLI_BAD_CONFIG': '1'}):
+                with self.assertRaisesRegex(GuardError, 'configuration_check_failed'):
+                    preflight(cli_path, task, Path(run_dir))
+
+            with mock.patch.dict(os.environ, {'STUB_CLI_BAD_JSON': '1'}):
+                with self.assertRaisesRegex(GuardError, 'configuration_response_invalid'):
+                    preflight(cli_path, task, Path(run_dir))
+
+            with mock.patch.dict(os.environ, {'STUB_CLI_BAD_PERMS': '1'}):
+                with self.assertRaisesRegex(GuardError, 'effective_agent_or_steps_mismatch'):
+                    preflight(cli_path, task, Path(run_dir))
+
+            log_path = os.path.join(tmp, 'proc.log')
+            with open(log_path, 'w', encoding='utf-8') as log_fh:
+                with owned_process([sys.executable, '-c', 'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(5)'], tmp, log_fh) as proc:
+                    self.assertIsNone(proc.poll())
+                self.assertIsNotNone(proc.poll())
+
+    def test_run_task_check_full_worktree_sync_and_micro_repair(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'run-task-ok',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'worktree': True,
+                }, fh)
+
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_check = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=True)
+            self.assertEqual(rc_check, 0)
+            self.assertEqual(json.loads(buf.getvalue())['status'], 'configuration_verified_no_model_call')
+
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path, 'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n'}):
+                with contextlib.redirect_stdout(buf):
+                    rc_run = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc_run, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            self.assertAlmostEqual(out['cost'], 0.015)
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
+            wt_dir = os.path.join(state_dir, 'worktrees')
+            self.assertEqual(os.listdir(wt_dir), [])
+
+            # Micro-repair path: first test_argv fails with assertion error, second passes after repair
+            repo2 = os.path.join(tmp, 'repo2')
+            target2 = self._init_git_repo(repo2, 'target.py', 'VALUE = 0\n')
+            repair_task_path = os.path.join(tmp, 'task_repair.json')
+            test_code = (
+                "import pathlib, sys; "
+                "txt = pathlib.Path('target.py').read_text(); "
+                "print('E   AssertionError: expected VALUE = 2') if 'VALUE = 2' not in txt else None; "
+                "sys.exit(0 if 'VALUE = 2' in txt else 1)"
+            )
+            with open(repair_task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'run-task-repair',
+                    'directory': repo2,
+                    'files': [target2],
+                    'prompt': 'Set VALUE = 2 in ' + target2,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                }, fh)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {
+                'HARNESS_TEST_DB': db_path,
+                'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n',
+                'STUB_CLI_REPAIR_CONTENT': 'VALUE = 2\n',
+            }):
+                with contextlib.redirect_stdout(buf):
+                    rc_repair = run_task(repair_task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc_repair, 0)
+            out_repair = json.loads(buf.getvalue())
+            self.assertEqual(out_repair['status'], 'validation_passed_review_required')
+            self.assertEqual(out_repair['steps'], 2)
+            self.assertAlmostEqual(out_repair['cost'], 0.03)
+            with open(os.path.join(out_repair['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res_repair = json.load(fh)
+            self.assertTrue(res_repair['micro_repair_attempted'])
+            with open(target2, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 2\n')
+
+    def test_run_task_command_and_patch_modes(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+
+            cmd_task_path = os.path.join(tmp, 'cmd_task.json')
+            with open(cmd_task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'cmd-task-1',
+                    'directory': repo,
+                    'files': [target],
+                    'mode': 'command',
+                    'command_argv': [sys.executable, '-c', "open('target.py', 'w').write('VALUE = 3\\n')"],
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                }, fh)
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc_cmd = run_task(cmd_task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc_cmd, 0)
+            self.assertEqual(json.loads(buf.getvalue())['status'], 'validation_passed_review_required')
+
+            patch_file = os.path.join(repo, 'proposed.patch')
+            patch_task_path = os.path.join(tmp, 'patch_task.json')
+            with open(patch_task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'patch-task-1',
+                    'directory': repo,
+                    'files': [target],
+                    'mode': 'patch',
+                    'patch_file': patch_file,
+                    'prompt': 'Propose patch',
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                }, fh)
+            patch_text = '--- a/target.py\n+++ b/target.py\n@@ -1 +1 @@\n-VALUE = 3\n+VALUE = 4\n'
+            # Reset target.py to committed content so git apply --check succeeds
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+            patch_text = '--- a/target.py\n+++ b/target.py\n@@ -1 +1 @@\n-VALUE = 0\n+VALUE = 4\n'
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {
+                'HARNESS_TEST_DB': db_path,
+                'HARNESS_TEST_PATCH_FILE': patch_file,
+                'STUB_CLI_PATCH_CONTENT': patch_text,
+            }):
+                with contextlib.redirect_stdout(buf):
+                    rc_patch = run_task(patch_task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc_patch, 0)
+            self.assertEqual(json.loads(buf.getvalue())['status'], 'patch_ready_review_required')
+
+    def test_run_task_worktree_read_only_files_guard(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            ro_path = os.path.join(repo, 'ref.py')
+            with open(ro_path, 'w', encoding='utf-8') as fh:
+                fh.write('REF = 0\n')
+            task_path = os.path.join(tmp, 'task_ro.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'run-task-ro-ok',
+                    'directory': repo,
+                    'files': [target],
+                    'read_only_files': [ro_path],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'worktree': True,
+                }, fh)
+
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path, 'STUB_CLI_INITIAL_CONTENT': 'VALUE = 1\n'}):
+                with contextlib.redirect_stdout(buf):
+                    rc_run = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc_run, 0)
+            self.assertEqual(json.loads(buf.getvalue())['status'], 'validation_passed_review_required')
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
+            with open(ro_path, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'REF = 0\n')
+
+            # A worker/command that touches a read-only file is blocked even when validation passes.
+            cmd_task_path = os.path.join(tmp, 'task_ro_bad.json')
+            with open(cmd_task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'run-task-ro-bad',
+                    'directory': repo,
+                    'files': [target],
+                    'mode': 'command',
+                    'read_only_files': [ro_path],
+                    'command_argv': [sys.executable, '-c',
+                                     "open('target.py', 'w').write('VALUE = 3\\n');"
+                                     "open('ref.py', 'w').write('REF = 1\\n')"],
+                    'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+                    'worktree': True,
+                }, fh)
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path}):
+                with contextlib.redirect_stdout(buf):
+                    rc_bad = run_task(cmd_task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertNotEqual(rc_bad, 0)
+            self.assertEqual(json.loads(buf.getvalue())['reason'], 'read_only_file_modified')
+            with open(ro_path, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'REF = 0\n')
+
+    def test_finops_fetch_generation_settled_and_unexposed_settlement(self):
+        from unittest import mock
+        attempts = {'count': 0}
+
+        class _Resp:
+            def __init__(self, body):
+                self._body = body
+
+            def read(self):
+                return self._body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=15):
+            attempts['count'] += 1
+            if attempts['count'] == 1:
+                return _Resp(b'{}')
+            return _Resp(json.dumps({
+                'data': {
+                    'id': 'gen-retry-1',
+                    'finish_reason': 'stop',
+                    'total_cost': 0.015,
+                    'native_tokens_prompt': 80,
+                    'native_tokens_completion': 20,
+                }
+            }).encode())
+
+        with mock.patch.dict(os.environ, {'OPENROUTER_API_KEY': 'sk-or-test'}):
+            with mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+                settled = fetch_generation_settled('gen-retry-1', delays=(0.0,))
+        self.assertEqual(attempts['count'], 2)
+        self.assertAlmostEqual(settled['total_cost'], 0.015)
+        self.assertEqual(settled['native_tokens_prompt'], 80)
+        self.assertEqual(settled['native_tokens_completion'], 20)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(
+                db_path,
+                sessions=[('ses_unexp', 0.015)],
+                messages=[
+                    ('ses_unexp', 'assistant', {
+                        'id': 'gen-u1',
+                        'finish': 'stop',
+                        'cost': 0.015,
+                        'tokens': {'input': 80, 'output': 20},
+                        'content': [],
+                    }),
+                ],
+            )
+            run_dir = os.path.join(tmp, 'runs', 'run-unexp')
+            os.makedirs(run_dir)
+            with open(os.path.join(run_dir, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 't-unexp',
+                    'session_id': 'ses_unexp',
+                    'status': 'blocked',
+                    'cost': None,
+                    'observed_cost': 0.015,
+                    'limits': {'max_steps': 16},
+                }, fh)
+            with open(os.path.join(run_dir, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_unexp',
+                    'observed_cost': 0.015,
+                    'requests': [{
+                        'ordinal': 1,
+                        'state': 'finished',
+                        'cost': 0.015,
+                        'provider_request_ids': [],
+                    }],
+                    'proxy': {
+                        'dispatched': [],
+                        'blocked': [],
+                    },
+                }, fh)
+
+            evidence = build_unexposed_settlement_evidence(
+                run_dir,
+                verified_by='unit-test',
+                mapping_source='synthetic local telemetry',
+                db=db_path,
+            )
+            self.assertEqual(evidence['session_id'], 'ses_unexp')
+            self.assertTrue(evidence['allow_proxy_stream_fallback'])
+            self.assertEqual(len(evidence['requests']), 1)
+            self.assertEqual(evidence['requests'][0]['verified_by'], 'unit-test')
+            self.assertEqual(evidence['requests'][0]['mapping_source'], 'synthetic local telemetry')
+            self.assertEqual(evidence['requests'][0]['resolution'], 'local_telemetry_finished')
+            rec = reconcile_run(run_dir, evidence, state=tmp, db=db_path)
+            self.assertEqual(rec['schema'], 'verified_billing.v1')
+            self.assertAlmostEqual(rec['cost'], 0.015)
+
+            # can_settle_from_proxy_local negative branches
+            valid_snap = {'cost': 0.01, 'messages': [
+                ('assistant', {'finish': 'stop', 'content': []}),
+                ('assistant', {'error': {'type': 'guard'}, 'content': []}),
+            ]}
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, None))
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, {'blocked_count': 0, 'dispatched': []}))
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, {'blocked_count': 1, 'dispatched': []}))
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, {
+                'blocked_count': 1,
+                'dispatched': [{'completed': False, 'http_status': 200, 'generation_id': 'g1'}],
+            }))
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, {
+                'blocked_count': 1,
+                'dispatched': [{'completed': True, 'http_status': 500, 'generation_id': 'g1'}],
+            }))
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, {
+                'blocked_count': 1,
+                'dispatched': [{'completed': True, 'http_status': 200, 'error': 'err', 'generation_id': 'g1'}],
+            }))
+            self.assertFalse(can_settle_from_proxy_local(valid_snap, {
+                'blocked_count': 1,
+                'dispatched': [{'completed': True, 'http_status': 200, 'error': None, 'generation_id': None}],
+            }))
+
+    def test_sandbox_main_and_validation_edge_cases(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('x = 1\n')
+            base = {
+                'task_id': 'edge-1',
+                'directory': tmp,
+                'files': [target],
+                'prompt': 'Edit target.py',
+                'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+            }
+            for bad, pattern in (
+                ('not-a-dict', 'task_must_be_an_object'),
+                (dict(base, directory=os.path.join(tmp, 'missing')), 'invalid_working_directory'),
+                (dict(base, files=[target, target]), 'duplicate_file_or_symlink_alias'),
+                (dict(base, test_argv='not-a-list'), 'invalid_argv'),
+                (dict(base, mode='unknown'), 'invalid_mode'),
+                (dict(base, mode='command', command_argv=['relative']), 'executable_must_be_an_existing_absolute_path'),
+                (dict(base, prompt='   '), 'prompt_required'),
+                (dict(base, mode='patch', patch_file=target), 'patch_file_must_be_new_absolute_path'),
+                (dict(base, files=[os.path.join(tmp, 'new_target.py')], mode='patch',
+                      patch_file=os.path.join(tmp, 'new_target.py')), 'patch_cannot_replace_source'),
+                (dict(base, model='openrouter/unknown/model'), 'unsupported_model'),
+                (dict(base, reasoning_max_tokens=0), 'invalid_reasoning_max_tokens'),
+                (dict(base, worktree='yes'), 'invalid_worktree_flag'),
+                (dict(base, mode='patch', patch_file=os.path.join(tmp, 'p.patch'), worktree=True), 'worktree_not_supported_for_patch_mode'),
+                (dict(base, auto_micro_repair='no'), 'invalid_auto_micro_repair_flag'),
+            ):
+                with self.assertRaisesRegex(GuardError, pattern):
+                    validate_task(bad)
+
+            bin_file = os.path.join(tmp, 'blob.bin')
+            with open(bin_file, 'wb') as fh:
+                fh.write(b'\xff\xfe\x00\x01')
+            bin_run = os.path.join(tmp, 'bin-run')
+            os.makedirs(bin_run)
+            capture_files(bin_run, [bin_file])
+            with open(bin_file, 'wb') as fh:
+                fh.write(b'\xff\xfe\x00\x02')
+            capture_files(bin_run, [bin_file])
+
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump(base, fh)
+
+            with mock.patch('harness.sandbox.CLI', cli_path), \
+                 mock.patch('harness.sandbox.DB', db_path), \
+                 mock.patch('harness.sandbox.STATE', state_dir):
+                buf = io.StringIO()
+                with mock.patch.object(sys, 'argv', ['opencode_guard', 'check', task_path]):
+                    with contextlib.redirect_stdout(buf):
+                        self.assertEqual(sandbox_main(), 0)
+                self.assertEqual(json.loads(buf.getvalue())['status'], 'configuration_verified_no_model_call')
+
+                buf = io.StringIO()
+                with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path, 'STUB_CLI_NO_CHANGE': '1'}):
+                    with contextlib.redirect_stdout(buf):
+                        rc_no_change = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+                self.assertEqual(rc_no_change, 1)
+                no_change_out = json.loads(buf.getvalue())
+                self.assertEqual(no_change_out['reason'], 'no_change')
+
+                buf = io.StringIO()
+                with mock.patch.object(sys, 'argv', ['opencode_guard', 'inspect', no_change_out['artifact']]):
+                    with contextlib.redirect_stdout(buf):
+                        self.assertEqual(sandbox_main(), 0)
+                self.assertEqual(json.loads(buf.getvalue())['task_id'], 'edge-1')
+
+                ev_path = os.path.join(tmp, 'evidence.json')
+                with open(ev_path, 'w', encoding='utf-8') as fh:
+                    json.dump({'session_id': 'missing', 'requests': []}, fh)
+                buf = io.StringIO()
+                with mock.patch.object(sys, 'argv', ['opencode_guard', 'reconcile', no_change_out['artifact'], '--evidence', ev_path]):
+                    with contextlib.redirect_stdout(buf):
+                        self.assertEqual(sandbox_main(), 1)
+                self.assertEqual(json.loads(buf.getvalue())['status'], 'blocked')
+
+                buf = io.StringIO()
+                with mock.patch.object(sys, 'argv', ['opencode_guard', 'reconcile', no_change_out['artifact']]):
+                    with contextlib.redirect_stdout(buf):
+                        self.assertEqual(sandbox_main(), 1)
+                self.assertEqual(json.loads(buf.getvalue())['reason'], 'evidence_file_required')
+
+                buf = io.StringIO()
+                with mock.patch.object(sys, 'argv', [
+                    'opencode_guard', 'reconcile', no_change_out['artifact'],
+                    '--evidence', ev_path, '--settle-unexposed',
+                ]):
+                    with contextlib.redirect_stdout(buf):
+                        self.assertEqual(sandbox_main(), 1)
+                self.assertEqual(json.loads(buf.getvalue())['reason'], 'choose_either_evidence_or_settle_unexposed')
+
+                # prepared_command_failed & validation_failed
+                fail_cmd_path = os.path.join(tmp, 'fail_cmd.json')
+                with open(fail_cmd_path, 'w', encoding='utf-8') as fh:
+                    json.dump(dict(base, mode='command', command_argv=[sys.executable, '-c', 'raise SystemExit(2)']), fh)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(run_task(fail_cmd_path, cli=cli_path, db=db_path, state=state_dir, check=False), 1)
+
+                fail_val_path = os.path.join(tmp, 'fail_val.json')
+                with open(fail_val_path, 'w', encoding='utf-8') as fh:
+                    json.dump(dict(
+                        base,
+                        auto_micro_repair=False,
+                        test_argv=[sys.executable, '-c', 'raise SystemExit(3)'],
+                    ), fh)
+                with mock.patch.dict(os.environ, {'HARNESS_TEST_DB': db_path, 'STUB_CLI_INITIAL_CONTENT': 'x = 2\n'}):
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(run_task(fail_val_path, cli=cli_path, db=db_path, state=state_dir, check=False), 1)
+
+                # run_task with upstream_url + auto_reconcile_from_proxy when finish='tool-calls'
+                upstream, _ = _scripted_upstream([{'status': 200}])
+                try:
+                    with open(target, 'w', encoding='utf-8') as fh:
+                        fh.write('x = 1\n')
+                    with mock.patch.dict(os.environ, {
+                        'HARNESS_TEST_DB': db_path,
+                        'STUB_CLI_INITIAL_CONTENT': 'x = 9\n',
+                        'STUB_CLI_FINISH': '',
+                        'STUB_CLI_EXIT': '1',
+                    }):
+                        buf = io.StringIO()
+                        with contextlib.redirect_stdout(buf):
+                            rc_proxy = run_task(
+                                task_path,
+                                cli=cli_path,
+                                db=db_path,
+                                state=state_dir,
+                                check=False,
+                                upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                                fetch=lambda gid: {
+                                    'id': gid,
+                                    'finish_reason': 'stop',
+                                    'total_cost': 0.015,
+                                    'native_tokens_prompt': 80,
+                                    'native_tokens_completion': 20,
+                                },
+                            )
+                    self.assertEqual(rc_proxy, 1)
+                finally:
+                    upstream.shutdown()
+                    upstream.server_close()
+
+    def test_finops_reconcile_proxy_fallback_and_manifest_edge_cases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(
+                db_path,
+                sessions=[('ses_f1', 0.02), ('ses_f2', 0.0)],
+                messages=[
+                    ('ses_f1', 'assistant', {
+                        'id': 'gen-f1',
+                        'finish': 'tool-calls',
+                        'cost': 0.02,
+                        'tokens': {'input': 40, 'output': 10},
+                        'content': [],
+                    }),
+                ],
+            )
+
+            # 1. reconcile_run with proxy stream fallback + blocked_locally
+            run1 = os.path.join(tmp, 'runs', 'run-f1')
+            os.makedirs(run1)
+            with open(os.path.join(run1, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-f1', 'session_id': 'ses_f1', 'cost': None, 'observed_cost': 0.02}, fh)
+            with open(os.path.join(run1, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_f1',
+                    'requests': [
+                        {'ordinal': 1, 'state': 'finished', 'cost': 0.02, 'provider_request_ids': []},
+                    ],
+                    'proxy': {
+                        'dispatched': [{'generation_id': 'gen-stream-1', 'completed': True, 'stream_cost': 0.02}],
+                        'blocked': [{'reason': 'loop'}],
+                    },
+                }, fh)
+            rec1 = reconcile_run(
+                run1,
+                {
+                    'session_id': 'ses_f1',
+                    'allow_proxy_stream_fallback': True,
+                    'requests': [{'ordinal': 1, 'resolution': 'local_telemetry_finished', 'verified_by': 'u', 'mapping_source': 'm'}],
+                },
+                state=tmp,
+                db=db_path,
+            )
+            self.assertAlmostEqual(rec1['cost'], 0.02)
+
+            # 2. auto_reconcile_from_proxy when blocked_count > 0 and dispatched == 0 -> cost 0.0
+            run2 = os.path.join(tmp, 'runs', 'run-f2')
+            os.makedirs(run2)
+            res2_path = os.path.join(run2, 'result.json')
+            res2 = {'task_id': 't-f2', 'session_id': 'ses_f2', 'cost': None, 'observed_cost': 0.0}
+            with open(res2_path, 'w', encoding='utf-8') as fh:
+                json.dump(res2, fh)
+            with open(os.path.join(run2, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_f2',
+                    'requests': [{'ordinal': 1, 'state': 'blocked_locally', 'cost': 0.0, 'provider_request_ids': []}],
+                    'proxy': {
+                        'dispatched_count': 0,
+                        'blocked_count': 1,
+                        'dispatched': [],
+                        'blocked': [{'reason': 'egress_guard_blocked'}],
+                    },
+                }, fh)
+            rec2 = auto_reconcile_from_proxy(run2, res2_path, res2, fetch=lambda gid: {}, db=db_path)
+            if rec2 is not None:
+                self.assertEqual(rec2['cost'], 0.0)
+
+            # 3. auto_reconcile_from_proxy with multiple dispatched generation_ids
+            run3 = os.path.join(tmp, 'runs', 'run-f3')
+            os.makedirs(run3)
+            res3_path = os.path.join(run3, 'result.json')
+            res3 = {'task_id': 't-f3', 'session_id': 'ses_f3', 'cost': None, 'observed_cost': 0.0}
+            with open(res3_path, 'w', encoding='utf-8') as fh:
+                json.dump(res3, fh)
+            with open(os.path.join(run3, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_f3',
+                    'requests': [
+                        {'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-a']},
+                        {'ordinal': 2, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-b']},
+                    ],
+                    'proxy': {
+                        'dispatched': [
+                            {'generation_id': 'gen-a', 'completed': True},
+                            {'generation_id': 'gen-b', 'completed': True},
+                        ],
+                    },
+                }, fh)
+            rec3 = auto_reconcile_from_proxy(
+                run3,
+                res3_path,
+                res3,
+                fetch=lambda gid: {
+                    'id': gid,
+                    'finish_reason': 'stop',
+                    'total_cost': 0.01,
+                    'native_tokens_prompt': 10,
+                    'native_tokens_completion': 5,
+                },
+                db=db_path,
+            )
+            self.assertIsNotNone(rec3)
+            self.assertAlmostEqual(rec3['cost'], 0.02)
+
+            # 4. export_sml_cost_manifest with unknown cost (no proxy-requests.json)
+            run4 = os.path.join(tmp, 'runs', 'run-f4')
+            os.makedirs(run4)
+            with open(os.path.join(run4, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-f4', 'session_id': 'ses_f4', 'cost': None}, fh)
+            manifest4 = export_sml_cost_manifest(run4)
+            self.assertEqual(manifest4['api_cost_usd'], 0.0)
+            self.assertEqual(manifest4['cost_accounting_status'], 'unreconciled')
+
+            # 5. build_unexposed_settlement_evidence with dispatched generation_id & blocked
+            run5 = os.path.join(tmp, 'runs', 'run-f5')
+            os.makedirs(run5)
+            with open(os.path.join(run5, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-f5', 'session_id': 'ses_f1', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run5, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_f1',
+                    'requests': [
+                        {'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-p1']},
+                        {'ordinal': 2, 'state': 'blocked_locally', 'cost': 0.0, 'provider_request_ids': []},
+                    ],
+                    'proxy': {
+                        'dispatched': [{'generation_id': 'gen-p1', 'completed': True, 'stream_cost': 0.01}],
+                        'blocked': [{'reason': 'loop'}],
+                    },
+                }, fh)
+            ev1 = build_unexposed_settlement_evidence(
+                run5,
+                verified_by='unit-test',
+                mapping_source='proxy-stream',
+                db=db_path,
+            )
+            self.assertEqual(ev1['session_id'], 'ses_f1')
+            self.assertGreaterEqual(len(ev1['requests']), 1)
+
+            # 5b. reconcile_run rejects unexposed resolution on exposed request, then succeeds with generation_id
+            with self.assertRaisesRegex(GuardError, 'finished_request_must_use_actual_cost'):
+                reconcile_run(run5, ev1, fetch=lambda gid: {}, state=tmp, db=db_path)
+
+            run5b = os.path.join(tmp, 'runs', 'run-f5b')
+            os.makedirs(run5b)
+            with open(os.path.join(run5b, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-f5b', 'session_id': 'ses_f1', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run5b, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_f1',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-p1']}],
+                }, fh)
+            rec5 = reconcile_run(
+                run5b,
+                {'session_id': 'ses_f1', 'requests': [{'ordinal': 1, 'generation_id': 'gen-p1'}]},
+                fetch=lambda gid: {
+                    'id': gid,
+                    'finish_reason': 'stop',
+                    'total_cost': 0.01,
+                    'native_tokens_prompt': 20,
+                    'native_tokens_completion': 10,
+                },
+                state=tmp,
+                db=db_path,
+            )
+            self.assertAlmostEqual(rec5['cost'], 0.01)
+
+            # 5c. resolved_cost via billing-reconciliation.json & prior_cost across runs
+            self.assertAlmostEqual(
+                resolved_cost(os.path.join(run5b, 'result.json'), {'task_id': 't-f5b', 'session_id': 'ses_f1', 'cost': None}),
+                0.01,
+            )
+            self.assertAlmostEqual(prior_cost(tmp, 't-f5b'), 0.01)
+
+            # 5d. clear_session_busy False cases + metrics/violation edge cases
+            from harness.finops import clear_session_busy, fetch_generation
+            self.assertFalse(clear_session_busy(db_path, 'ses_f1'))
+            self.assertFalse(clear_session_busy(os.path.join(tmp, 'no-such.db'), 'ses_f1'))
+            m_err = metrics({'cost': 0.01, 'messages': [
+                ('assistant', {'error': {'type': 'api'}, 'finish': 'stop', 'content': []}),
+            ]})
+            self.assertTrue(m_err['model_error'])
+            self.assertEqual(violation(m_err, 0.15, 16), 'model_error')
+            m_unfin = metrics({'cost': 0.01, 'messages': [
+                ('assistant', {'content': []}),
+            ]})
+            self.assertTrue(m_unfin['unfinished'])
+
+            # 5e. fetch_generation missing key / HTTPError / exhausted retries
+            from unittest import mock
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(GuardError):
+                    fetch_generation('gen-nokey')
+            with mock.patch.dict(os.environ, {'OPENROUTER_API_KEY': 'sk-or-test'}):
+                err = urllib.error.HTTPError('http://x', 502, 'bad', {}, None)
+                with mock.patch('urllib.request.urlopen', side_effect=err):
+                    with self.assertRaises(GuardError):
+                        fetch_generation('gen-http-err')
+                    with self.assertRaises(GuardError):
+                        fetch_generation_settled('gen-exhaust', attempts=2, delays=(0.0,))
+
+            # 5f. resolved_cost tampered reconciliation & prior_cost with multiple runs
+            recon_path = os.path.join(run5b, 'billing-reconciliation.json')
+            with open(recon_path, 'r', encoding='utf-8') as fh:
+                recon_obj = json.load(fh)
+            recon_obj['result_sha256'] = '0' * 64
+            with open(recon_path, 'w', encoding='utf-8') as fh:
+                json.dump(recon_obj, fh)
+            with self.assertRaises(GuardError):
+                resolved_cost(os.path.join(run5b, 'result.json'), {'task_id': 't-f5b', 'session_id': 'ses_f1', 'cost': None})
+
+            run_paid = os.path.join(tmp, 'runs', 'run-paid')
+            os.makedirs(run_paid)
+            with open(os.path.join(run_paid, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-multi', 'session_id': 'ses_m1', 'cost': 0.025}, fh)
+            run_other = os.path.join(tmp, 'runs', 'run-other')
+            os.makedirs(run_other)
+            with open(os.path.join(run_other, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-other', 'session_id': 'ses_o1', 'cost': 0.05}, fh)
+            self.assertAlmostEqual(prior_cost(tmp, 't-multi'), 0.025)
+
+            # 5g. auto_reconcile_from_proxy early returns & reconcile_run edge errors
+            self.assertIsNone(auto_reconcile_from_proxy(run_paid, os.path.join(run_paid, 'result.json'), {'cost': 0.025}, db=db_path))
+            self.assertIsNone(auto_reconcile_from_proxy(run4, os.path.join(run4, 'result.json'), {'cost': None}, db=db_path))
+            with self.assertRaises(GuardError):
+                reconcile_run(run_paid, {'session_id': 'ses_m1', 'requests': []}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': 'bad'}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 'x'}]}, state=tmp, db=db_path)
+
+            # 6. reconcile_run validation / error branches
+            with self.assertRaises(GuardError):
+                reconcile_run(os.path.join(tmp, 'missing-run'), {'session_id': 'x', 'requests': []}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'wrong', 'requests': []}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, 'not-a-dict', state=tmp, db=db_path)
+            with open(os.path.join(run4, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_f4',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': []}],
+                }, fh)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': []}, state=tmp, db=db_path)
+
+            # 7. export_sml_cost_manifest with billing-reconciliation.json & missing result.json
+            with open(os.path.join(run1, 'billing-reconciliation.json'), 'r', encoding='utf-8') as fh:
+                recon_data = json.load(fh)
+            self.assertIn('cost', recon_data)
+            m1 = export_sml_cost_manifest(run1, gpu_hours=1.0, gpu_hourly_rate_usd=2.0)
+            self.assertEqual(m1['cost_accounting_status'], 'settled')
+            self.assertAlmostEqual(m1['compute_cost_usd'], 2.0)
+
+            empty_run = os.path.join(tmp, 'runs', 'empty-run')
+            os.makedirs(empty_run)
+            m_empty = export_sml_cost_manifest(empty_run)
+            self.assertEqual(m_empty['cost_accounting_status'], 'unreconciled')
+
+            # 8. Additional finops coverage: request_records, reconcile_run validation, fetch_generation non-dict
+            recs = request_records(
+                {
+                    'cost': 0.01,
+                    'messages': [
+                        ('assistant', {'finish': 'tool-calls', 'cost': 0.01, 'tokens': {'prompt_tokens': 10, 'completion_tokens': 5}}),
+                    ],
+                },
+                {'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': None}], 'blocked_count': 0},
+            )
+            self.assertEqual(len(recs), 1)
+
+            with self.assertRaises(FileNotFoundError):
+                reconcile_run(empty_run, {'session_id': 'x', 'requests': []}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 1, 'generation_id': 'g1'}, {'ordinal': 1, 'generation_id': 'g2'}]}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 1}]}, state=tmp, db=db_path)
+            with self.assertRaises(GuardError):
+                reconcile_run(run4, {'session_id': 'ses_f4', 'requests': [{'ordinal': 99, 'generation_id': 'g1'}]}, state=tmp, db=db_path)
+
+            # 10. auto_reconcile_from_proxy when fetch fails -> returns None; prior_cost rejects corrupt run
+            corrupt_state = os.path.join(tmp, 'corrupt-state')
+            corrupt_run = os.path.join(corrupt_state, 'runs', 'run-corrupt')
+            os.makedirs(corrupt_run)
+            with open(os.path.join(corrupt_run, 'result.json'), 'w', encoding='utf-8') as fh:
+                fh.write('{bad json')
+            with self.assertRaisesRegex(GuardError, 'unreadable_cost_journal'):
+                prior_cost(corrupt_state, 't-multi')
+
+            run_fail_fetch = os.path.join(tmp, 'runs', 'run-fail-fetch')
+            os.makedirs(run_fail_fetch)
+            res_ff_path = os.path.join(run_fail_fetch, 'result.json')
+            res_ff = {'task_id': 't-ff', 'session_id': 'ses_ff', 'cost': None, 'observed_cost': 0.0}
+            with open(res_ff_path, 'w', encoding='utf-8') as fh:
+                json.dump(res_ff, fh)
+            with open(os.path.join(run_fail_fetch, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_ff',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-bad']}],
+                    'proxy': {'dispatched': [{'generation_id': 'gen-bad', 'completed': True}]},
+                }, fh)
+            with self.assertRaisesRegex(GuardError, 'billing_not_final_or_wrong_identity'):
+                auto_reconcile_from_proxy(run_fail_fetch, res_ff_path, res_ff, fetch=lambda gid: {}, db=db_path)
+
+            # 11. number() validation, snapshot with NULL cost, and manifest fallback branches
+            for bad_num in (True, float('nan'), 'abc'):
+                with self.assertRaises(GuardError):
+                    number(bad_num, 'max_cost_usd')
+
+            import sqlite3
+            conn_null = sqlite3.connect(db_path)
+            try:
+                conn_null.execute("INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES ('ses_null', NULL, NULL, NULL)")
+                conn_null.commit()
+            finally:
+                conn_null.close()
+            with self.assertRaisesRegex(GuardError, 'invalid_telemetry_cost'):
+                snapshot(db_path, 'ses_null')
+
+            run_proxy_only = os.path.join(tmp, 'runs', 'run-proxy-only')
+            os.makedirs(run_proxy_only)
+            with open(os.path.join(run_proxy_only, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-po', 'session_id': 'ses_po', 'cost': None, 'started_at': 10.0}, fh)
+            with open(os.path.join(run_proxy_only, 'proxy-requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'dispatched': [{'stream_cost': 0.005, 'usage': {'input': 10, 'output': 5}}]}, fh)
+            m_po = export_sml_cost_manifest(run_proxy_only)
+            self.assertAlmostEqual(m_po['api_cost_usd'], 0.005)
+            self.assertEqual(m_po['prompt_tokens'], 10)
+            self.assertEqual(m_po['completion_tokens'], 5)
+
+            # 12. request_records with non-gen id + error+tokens
+            recs_err = request_records(
+                {'cost': 0.01, 'messages': [
+                    ('assistant', {'id': 'msg_local_1', 'finish': 'stop', 'tokens': {'input': 5, 'output': 2}}),
+                    ('assistant', {'error': {'type': 'api'}, 'tokens': {'input': 5, 'output': 0}}),
+                ]},
+                {'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': 'gen-from-proxy'}], 'blocked_count': 1},
+            )
+            self.assertEqual(len(recs_err), 2)
+            self.assertEqual(recs_err[0]['provider_request_ids'], ['gen-from-proxy'])
+
+            # 13. build_unexposed_settlement_evidence error cases
+            with self.assertRaisesRegex(GuardError, 'verified_by_required'):
+                build_unexposed_settlement_evidence(run5, verified_by='', mapping_source='m', db=db_path)
+            with self.assertRaises(GuardError):
+                build_unexposed_settlement_evidence(run5, verified_by='u', mapping_source='', db=db_path)
+
+            # 13b. reconcile_run invalid generation_id, wrong-identity fetch & blocked_locally-only run
+            with self.assertRaisesRegex(GuardError, 'invalid_or_duplicate_generation_id'):
+                reconcile_run(
+                    run4,
+                    {'session_id': 'ses_f4', 'requests': [{'ordinal': 1, 'generation_id': 'bad-id'}]},
+                    fetch=lambda gid: {},
+                    state=tmp,
+                    db=db_path,
+                )
+            with self.assertRaisesRegex(GuardError, 'mapping_evidence_required'):
+                reconcile_run(
+                    run4,
+                    {'session_id': 'ses_f4', 'requests': [{'ordinal': 1, 'generation_id': 'gen-want'}]},
+                    fetch=lambda gid: {'id': 'gen-other', 'finish_reason': 'stop', 'total_cost': 0.01},
+                    state=tmp,
+                    db=db_path,
+                )
+            run_wrong = os.path.join(tmp, 'runs', 'run-wrong')
+            os.makedirs(run_wrong)
+            with open(os.path.join(run_wrong, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-w', 'session_id': 'ses_w', 'cost': None}, fh)
+            with open(os.path.join(run_wrong, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_w',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': ['gen-want']}],
+                }, fh)
+            with self.assertRaisesRegex(GuardError, 'billing_not_final_or_wrong_identity'):
+                reconcile_run(
+                    run_wrong,
+                    {'session_id': 'ses_w', 'requests': [{'ordinal': 1, 'generation_id': 'gen-want'}]},
+                    fetch=lambda gid: {'id': 'gen-other', 'finish_reason': 'stop', 'total_cost': 0.01},
+                    state=tmp,
+                    db=db_path,
+                )
+            run_blk = os.path.join(tmp, 'runs', 'run-blk')
+            os.makedirs(run_blk)
+            with open(os.path.join(run_blk, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-blk', 'session_id': 'ses_blk', 'cost': None}, fh)
+            with open(os.path.join(run_blk, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_blk',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': 0.0, 'provider_request_ids': []}],
+                    'proxy': {'dispatched': [], 'blocked': [{'reason': 'loop'}]},
+                }, fh)
+            ev_blk = build_unexposed_settlement_evidence(run_blk, verified_by='u', mapping_source='m', db=db_path)
+            rec_blk = reconcile_run(run_blk, ev_blk, state=tmp, db=db_path)
+            self.assertEqual(rec_blk['cost'], 0.0)
+
+            # 13c. metrics with tool_use/compact/read & prior_cost with unknown cost run
+            m_reads = metrics({'cost': 0.01, 'messages': [
+                ('assistant', {'finish': 'stop', 'content': [
+                    {'type': 'tool', 'name': 'bash', 'state': {'status': 'completed'}},
+                ]}),
+            ]})
+            self.assertEqual(m_reads['reads'], 0)
+            with self.assertRaisesRegex(GuardError, 'prior_cost_unknown_reconcile_before_retry'):
+                prior_cost(tmp, 't-f4')
+
+            # 13. build_unexposed_settlement_evidence when result.json has no session_id -> GuardError
+            run_nosid = os.path.join(tmp, 'runs', 'run-nosid')
+            os.makedirs(run_nosid)
+            with open(os.path.join(run_nosid, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-ns', 'session_id': None}, fh)
+            with self.assertRaises(GuardError):
+                build_unexposed_settlement_evidence(run_nosid, verified_by='u', mapping_source='m', db=db_path)
+
+            # 14. auto_reconcile_from_proxy with auth_bearer + requests with missing provider_request_ids
+            run_noid = os.path.join(tmp, 'runs', 'run-noid')
+            os.makedirs(run_noid)
+            res_noid_path = os.path.join(run_noid, 'result.json')
+            res_noid = {'task_id': 't-noid', 'session_id': 'ses_noid', 'cost': None}
+            with open(res_noid_path, 'w', encoding='utf-8') as fh:
+                json.dump(res_noid, fh)
+            with open(os.path.join(run_noid, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_noid',
+                    'requests': [{'ordinal': 1, 'state': 'finished', 'cost': None, 'provider_request_ids': []}],
+                    'proxy': {'dispatched': []},
+                }, fh)
+            rec_noid = auto_reconcile_from_proxy(run_noid, res_noid_path, res_noid, fetch=lambda gid: {}, db=db_path)
+            self.assertIsNotNone(rec_noid)
+            self.assertAlmostEqual(rec_noid['cost'], 0.01)
+
+            run_dur = os.path.join(tmp, 'runs', 'run-dur')
+            os.makedirs(run_dur)
+            with open(os.path.join(run_dur, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-dur', 'session_id': 'ses_d', 'cost': 0.01, 'duration_seconds': 12.5}, fh)
+            with open(os.path.join(run_dur, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'requests': [{'ordinal': 1, 'tokens': {'prompt_tokens': 30, 'completion_tokens': 12}}]}, fh)
+            m_dur = export_sml_cost_manifest(run_dur)
+            self.assertEqual(m_dur['wall_clock_seconds'], 12.5)
+            self.assertEqual(m_dur['prompt_tokens'], 30)
+            self.assertEqual(m_dur['completion_tokens'], 12)
+
+            # 9. fetch_generation returning non-dict JSON & urllib.error.URLError
+            class _RespJson:
+                def __init__(self, body):
+                    self._body = body
+                def read(self):
+                    return self._body
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    return False
+
+            with mock.patch.dict(os.environ, {'OPENROUTER_API_KEY': 'sk-or-test'}):
+                with mock.patch('urllib.request.urlopen', return_value=_RespJson(b'[1, 2]')):
+                    with self.assertRaises(TypeError):
+                        fetch_generation('gen-list')
+                with mock.patch('urllib.request.urlopen', side_effect=urllib.error.URLError('down')):
+                    with self.assertRaises(GuardError):
+                        fetch_generation('gen-url-err')
+
+            # 15. reconcile_run with conservative_step_cap
+            run_cap = os.path.join(tmp, 'runs', 'run-cap')
+            os.makedirs(run_cap)
+            with open(os.path.join(run_cap, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-cap', 'session_id': 'ses_cap2', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run_cap, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_cap2',
+                    'requests': [{'ordinal': 1, 'state': 'dispatched', 'cost': None, 'provider_request_ids': []}],
+                }, fh)
+            rec_cap = reconcile_run(
+                run_cap,
+                {
+                    'session_id': 'ses_cap2',
+                    'requests': [{
+                        'ordinal': 1,
+                        'resolution': 'conservative_step_cap',
+                        'capped_cost': 0.01,
+                        'verified_by': 'u',
+                        'mapping_source': 'm',
+                    }],
+                },
+                state=tmp,
+                db=db_path,
+            )
+            self.assertAlmostEqual(rec_cap['cost'], 0.01)
+
+            # 16. build_unexposed_settlement_evidence with unfinished/dispatched request + stream_cost
+            run_unfin = os.path.join(tmp, 'runs', 'run-unfin')
+            os.makedirs(run_unfin)
+            with open(os.path.join(run_unfin, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-unfin', 'session_id': 'ses_unfin', 'cost': None, 'limits': {'max_steps': 16}}, fh)
+            with open(os.path.join(run_unfin, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'session_id': 'ses_unfin',
+                    'requests': [{'ordinal': 1, 'state': 'dispatched', 'cost': None, 'provider_request_ids': []}],
+                    'proxy': {'dispatched': [{'completed': True, 'stream_cost': 0.007, 'generation_id': None}], 'blocked': []},
+                }, fh)
+            ev_unfin = build_unexposed_settlement_evidence(run_unfin, verified_by='u', mapping_source='m', db=db_path)
+            self.assertEqual(ev_unfin['session_id'], 'ses_unfin')
+            rec_unfin = reconcile_run(run_unfin, ev_unfin, state=tmp, db=db_path)
+            self.assertGreater(rec_unfin['cost'], 0.0)
+
+            # 17. export_sml_cost_manifest with requests.json usage + out_path
+            run_usage = os.path.join(tmp, 'runs', 'run-usage')
+            os.makedirs(run_usage)
+            with open(os.path.join(run_usage, 'result.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'task_id': 't-u', 'session_id': 'ses_u', 'cost': 0.02, 'wall_clock_seconds': 5.0}, fh)
+            with open(os.path.join(run_usage, 'requests.json'), 'w', encoding='utf-8') as fh:
+                json.dump({'requests': [{'ordinal': 1, 'tokens': {'input_tokens': 11, 'output_tokens': 7}}]}, fh)
+            m_u = export_sml_cost_manifest(run_usage, os.path.join(run_usage, 'cost.json'))
+            self.assertEqual(m_u['prompt_tokens'], 11)
+            self.assertEqual(m_u['completion_tokens'], 7)
+
+            # 18. clear_session_busy with outcome='succeeded', old-schema DB, and can_settle_from_proxy_local branches
+            from harness.finops import clear_session_busy as _csb
+            conn_busy = sqlite3.connect(db_path)
+            try:
+                conn_busy.execute("INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES ('ses_busy2', 0.01, 9.0, NULL)")
+                conn_busy.commit()
+            finally:
+                conn_busy.close()
+            self.assertTrue(_csb(db_path, 'ses_busy2', outcome='succeeded'))
+
+            old_db = os.path.join(tmp, 'old.db')
+            c_old = sqlite3.connect(old_db)
+            c_old.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL)')
+            c_old.execute("INSERT INTO session_v2 VALUES ('ses_old', 0.01)")
+            c_old.commit()
+            c_old.close()
+            self.assertFalse(_csb(old_db, 'ses_old'))
+
+            self.assertFalse(can_settle_from_proxy_local(
+                {'cost': 0.01, 'messages': [('assistant', {'finish': 'stop', 'content': []})]},
+                {'blocked_count': 1, 'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': 'gen-1'}]},
+            ))
+            self.assertFalse(can_settle_from_proxy_local(
+                {'cost': 0.01, 'messages': [
+                    ('assistant', {'finish': 'stop', 'content': []}),
+                    ('assistant', {'error': {'type': 'guard'}, 'content': []}),
+                ]},
+                {'blocked_count': 2, 'dispatched': [{'completed': True, 'http_status': 200, 'generation_id': 'gen-1'}]},
+            ))
+
+
+class TestProxyPerTaskSmlManifests(HarnessTestCase):
+    def test_proxy_per_task_id_summaries_and_auto_flush_sml_manifests(self):
+        from harness.proxy import openrouter_proxy
+
+        class _UsageUpstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                self.rfile.read(length)
+                req_idx = self.server.req_idx
+                self.server.req_idx += 1
+                if req_idx == 0:
+                    payload = json.dumps({
+                        'id': 'gen-ep1-a',
+                        'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
+                        'usage': {'prompt_tokens': 100, 'completion_tokens': 25, 'cost': 0.004},
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                elif req_idx == 1:
+                    chunks = (
+                        b'data: {"id":"gen-ep1-b","choices":[{"delta":{"content":"hi"}}]}\n\n'
+                        b'data: {"id":"gen-ep1-b","choices":[],"usage":{"prompt_tokens":60,"completion_tokens":15,"cost":0.002}}\n\n'
+                        b'data: [DONE]\n\n'
+                    )
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Content-Length', str(len(chunks)))
+                    self.end_headers()
+                    self.wfile.write(chunks)
+                else:
+                    payload = json.dumps({
+                        'id': 'gen-ep2-a',
+                        'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
+                        'usage': {'prompt_tokens': 210, 'completion_tokens': 45, 'cost': 0.009},
+                    }).encode()
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Content-Length', str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+        upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _UsageUpstream)
+        upstream.req_idx = 0
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        results_dir = self.path('sml-results')
+
+        def _send(base_url, task_id):
+            body = json.dumps({
+                'model': GLM,
+                'messages': [{'role': 'user', 'content': 'hi'}],
+            }).encode()
+            req = urllib.request.Request(
+                base_url + '/chat/completions',
+                data=body,
+                headers={
+                    'Content-Type': 'application/json',
+                    'X-Harness-Task-Id': task_id,
+                },
+                method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+                return resp.status
+
+        try:
+            with openrouter_proxy(
+                lambda: None,
+                upstream_url=f'http://127.0.0.1:{upstream.server_port}',
+                sml_results_dir=results_dir,
+            ) as proxy:
+                self.assertEqual(_send(proxy.base_url, 'sml-ep-01'), 200)
+                self.assertEqual(_send(proxy.base_url, 'sml-ep-01'), 200)
+                self.assertEqual(_send(proxy.base_url, 'sml-ep-02'), 200)
+                summaries = proxy.task_summaries()
+                spans = list(proxy.tracer.spans)
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+
+        self.assertEqual(summaries['sml-ep-01']['request_count'], 2)
+        self.assertEqual(summaries['sml-ep-01']['prompt_tokens'], 160)
+        self.assertEqual(summaries['sml-ep-01']['completion_tokens'], 40)
+        self.assertEqual(summaries['sml-ep-01']['api_cost_usd'], 0.006)
+        self.assertEqual(summaries['sml-ep-02']['request_count'], 1)
+        self.assertEqual(summaries['sml-ep-02']['prompt_tokens'], 210)
+        self.assertEqual(summaries['sml-ep-02']['completion_tokens'], 45)
+        self.assertEqual(summaries['sml-ep-02']['api_cost_usd'], 0.009)
+        self.assertEqual(
+            [s['attributes'].get('harness.task_id') for s in spans if s['name'] == 'gen_ai.chat'],
+            ['sml-ep-01', 'sml-ep-01', 'sml-ep-02'],
+        )
+
+        ep1_path = os.path.join(results_dir, 'sml-ep-01', 'cost.json')
+        ep2_path = os.path.join(results_dir, 'sml-ep-02', 'cost.json')
+        self.assertTrue(os.path.exists(ep1_path))
+        self.assertTrue(os.path.exists(ep2_path))
+        with open(ep1_path) as fh:
+            ep1 = json.load(fh)
+        with open(ep2_path) as fh:
+            ep2 = json.load(fh)
+        self.assertEqual(ep1['request_count'], 2)
+        self.assertEqual(ep1['prompt_tokens'], 160)
+        self.assertEqual(ep1['completion_tokens'], 40)
+        self.assertEqual(ep1['api_cost_usd'], 0.006)
+        self.assertEqual(ep1['total_cost_usd'], 0.006)
+        self.assertEqual(ep1['cost_accounting_status'], 'estimated')
+        self.assertEqual(ep2['request_count'], 1)
+        self.assertEqual(ep2['prompt_tokens'], 210)
+        self.assertEqual(ep2['completion_tokens'], 45)
+        self.assertEqual(ep2['api_cost_usd'], 0.009)
+        self.assertEqual(ep2['total_cost_usd'], 0.009)
+        self.assertEqual(ep2['cost_accounting_status'], 'estimated')
+
+
+class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
+    def test_step_limit_salvage_passes_when_validation_passes(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_salvage_ok.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 1' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'salvage-pass',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                }, fh)
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 1\n')
+                raise GuardError('step_limit')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertEqual(res['status'], 'validation_passed_review_required')
+            self.assertEqual(res['salvaged_from'], 'step_limit')
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 1\n')
+
+    def test_step_limit_salvage_blocks_and_restores_when_validation_fails(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_salvage_fail.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'salvage-fail',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                }, fh)
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 1\n')
+                raise GuardError('step_limit')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 1)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'blocked')
+            self.assertEqual(out['reason'], 'step_limit')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertEqual(res['status'], 'blocked')
+            self.assertEqual(res['reason'], 'step_limit')
+            self.assertIsNone(res.get('salvaged_from'))
+            self.assertFalse(res.get('micro_repair_attempted', False))
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 0\n')
+
+    def test_validate_task_adaptive_steps_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            f1 = os.path.join(tmp, 'a.py')
+            f2 = os.path.join(tmp, 'b.py')
+            f3 = os.path.join(tmp, 'c.py')
+            for p in (f1, f2, f3):
+                with open(p, 'w', encoding='utf-8') as fh:
+                    fh.write('x = 1\n')
+            base = {
+                'task_id': 'adaptive-1',
+                'directory': tmp,
+                'prompt': 'edit files',
+                'test_argv': [sys.executable, '-c', 'pass'],
+            }
+            self.assertEqual(validate_task(dict(base, files=[f1], max_steps=6))['max_steps'], 7)
+            self.assertEqual(validate_task(dict(base, files=[f1], max_steps=10))['max_steps'], 10)
+            self.assertEqual(validate_task(dict(base, files=[f1, f2], max_steps=6))['max_steps'], 10)
+            self.assertEqual(validate_task(dict(base, files=[f1, f2, f3], max_steps=6))['max_steps'], 13)
+            self.assertEqual(
+                validate_task(dict(base, files=[f1, f2, f3], max_steps=6, adaptive_steps=False))['max_steps'],
+                6,
+            )
+            self.assertEqual(
+                validate_task(dict(
+                    base,
+                    files=[f1, f2, f3],
+                    max_steps=6,
+                    mode='patch',
+                    patch_file=os.path.join(tmp, 'out.patch'),
+                ))['max_steps'],
+                6,
+            )
+
+    def test_auto_micro_repair_triggers_above_8_steps_with_current_patch(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            helper = os.path.join(repo, 'helper.py')
+            with open(helper, 'w', encoding='utf-8') as fh:
+                fh.write('HELPER = 1\n')
+            task_path = os.path.join(tmp, 'task_repair.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repair-10-steps',
+                    'directory': repo,
+                    'files': [target, helper],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'max_steps': 12,
+                    'max_cost_usd': 0.10,
+                }, fh)
+
+            seen_repair_tasks = []
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                if len(seen_repair_tasks) == 0 and not result.get('micro_repair_attempted'):
+                    with open(target, 'w', encoding='utf-8') as fh:
+                        fh.write('VALUE = 1\n')
+                    result['steps'] = 10
+                    result['cost'] = 0.05
+                    return
+                seen_repair_tasks.append(dict(task))
+                with open(target, 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 2\n')
+                result['steps'] = 2
+                result['cost'] = 0.01
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen_repair_tasks), 1)
+            repair_task = seen_repair_tasks[0]
+            self.assertEqual(repair_task['max_steps'], 6)
+            self.assertIn('[CURRENT_PATCH]', repair_task['prompt'])
+            self.assertIn('+VALUE = 1', repair_task['prompt'])
+            out = json.loads(buf.getvalue())
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertTrue(res['micro_repair_attempted'])
+            self.assertEqual(res['steps'], 12)
+            self.assertAlmostEqual(res['cost'], 0.06)
+
+    def test_inject_edit_failure_hints_and_idempotency(self):
+        # Empty / non-list inputs pass through cleanly.
+        self.assertEqual(inject_edit_failure_hints([]), ([], 0))
+
+        # Non-trailing tool error is ignored.
+        non_trailing = [
+            {'role': 'tool', 'tool_call_id': 'e0', 'content': 'oldString not found in file'},
+            {'role': 'assistant', 'content': 'retrying'},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'ok'},
+        ]
+        out, count = inject_edit_failure_hints(non_trailing)
+        self.assertEqual(count, 0)
+        self.assertIs(out, non_trailing)
+
+        # All four mismatch patterns trigger on trailing tool messages (case-insensitive).
+        for phrase in (
+            'Error: oldString not found in content',
+            'old_string not found',
+            'FAILED TO MATCH target block',
+            'No exact match found',
+        ):
+            msgs = [
+                {'role': 'user', 'content': 'edit it'},
+                {'role': 'tool', 'tool_call_id': 'e1', 'content': phrase},
+            ]
+            snapshot = json.dumps(msgs)
+            updated, count = inject_edit_failure_hints(msgs)
+            self.assertEqual(count, 1)
+            self.assertEqual(json.dumps(msgs), snapshot)  # pure: input untouched
+            self.assertIn('[HARNESS_EDIT_HINT:', updated[1]['content'])
+            # Idempotent on re-run.
+            again, count2 = inject_edit_failure_hints(updated)
+            self.assertEqual(count2, 0)
+            self.assertIs(again, updated)
+
+        # Trailing tool_result block in user message is also handled idempotently.
+        block_msgs = [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'e2', 'content': 'oldString not found'},
+                ],
+            }
+        ]
+        updated_blocks, bcount = inject_edit_failure_hints(block_msgs)
+        self.assertEqual(bcount, 1)
+        self.assertIn('[HARNESS_EDIT_HINT:', updated_blocks[0]['content'][0]['content'])
+        again_blocks, bcount2 = inject_edit_failure_hints(updated_blocks)
+        self.assertEqual(bcount2, 0)
+        self.assertIs(again_blocks, updated_blocks)
+
+    def test_inject_read_guard_hints_and_idempotency(self):
+        # Empty / non-list inputs pass through cleanly.
+        self.assertEqual(inject_read_guard_hints([]), ([], 0))
+
+        # a) Permission-denied read hint on a trailing tool message (pure, idempotent).
+        msgs = [
+            {'role': 'user', 'content': 'read it'},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'Permission denied: read'},
+        ]
+        snapshot = json.dumps(msgs)
+        updated, _count = inject_read_guard_hints(msgs)
+        self.assertEqual(json.dumps(msgs), snapshot)  # pure: input untouched
+        self.assertIn('[HARNESS_READ_HINT:', updated[1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+        # Non-trailing permission error is ignored (assistant turn in between).
+        non_trailing = [
+            {'role': 'tool', 'tool_call_id': 'r0', 'content': 'Permission denied: read'},
+            {'role': 'assistant', 'content': 'retrying'},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'ok'},
+        ]
+        out, count = inject_read_guard_hints(non_trailing)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, non_trailing)
+
+        # a) tool_result block in the last user message is also handled.
+        block_msgs = [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'r2',
+                     'content': 'Permission denied: read'},
+                ],
+            }
+        ]
+        updated_blocks, _bcount = inject_read_guard_hints(block_msgs)
+        self.assertIn('[HARNESS_READ_HINT:', updated_blocks[0]['content'][0]['content'])
+        again_blocks, bcount2 = inject_read_guard_hints(updated_blocks)
+        self.assertEqual(bcount2, 0)
+        self.assertEqual(again_blocks, updated_blocks)
+
+        def _read_call(rid, path):
+            return {'role': 'assistant', 'tool_calls': [
+                {'id': rid, 'function': {'name': 'read',
+                                         'arguments': json.dumps({'path': path})}}]}
+
+        # b) >=3 consecutive reads -> budget warning on the last tool message.
+        budget_msgs = [
+            {'role': 'user', 'content': 'read files'},
+            _read_call('r1', 'a.py'),
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            _read_call('r2', 'b.py'),
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+            _read_call('r3', 'c.py'),
+            {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+        ]
+        updated, _count = inject_read_guard_hints(budget_msgs)
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:', updated[-1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+        # b) Two consecutive reads are below the threshold.
+        two_msgs = [
+            {'role': 'user', 'content': 'read files'},
+            _read_call('r1', 'a.py'),
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            _read_call('r2', 'b.py'),
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+        ]
+        out, count = inject_read_guard_hints(two_msgs)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, two_msgs)
+
+        # b) An edit resets the streak; a later >=3 read streak re-triggers
+        #    on the fresh trailing tool message.
+        reset_msgs = [
+            _read_call('r1', 'a.py'),
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            _read_call('r2', 'b.py'),
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'e1', 'function': {'name': 'edit',
+                                          'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'e1', 'content': 'edited'},
+            _read_call('r3', 'c.py'),
+            {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+        ]
+        out, count = inject_read_guard_hints(reset_msgs)
+        self.assertEqual(count, 0)
+        self.assertEqual(out, reset_msgs)
+        reset_msgs.append(_read_call('r4', 'd.py'))
+        reset_msgs.append({'role': 'tool', 'tool_call_id': 'r4', 'content': 'file d'})
+        reset_msgs.append(_read_call('r5', 'e.py'))
+        reset_msgs.append({'role': 'tool', 'tool_call_id': 'r5', 'content': 'file e'})
+        updated, _count = inject_read_guard_hints(reset_msgs)
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:', updated[-1]['content'])
+
+        # b) `write` and `apply_patch` also reset the streak.
+        for reset_tool in ('write', 'apply_patch'):
+            reset_case = [
+                _read_call('r1', 'a.py'),
+                {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+                _read_call('r2', 'b.py'),
+                {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'id': 'w1', 'function': {'name': reset_tool,
+                                              'arguments': json.dumps({})}}]},
+                {'role': 'tool', 'tool_call_id': 'w1', 'content': 'wrote'},
+                _read_call('r3', 'c.py'),
+                {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+            ]
+            out, count = inject_read_guard_hints(reset_case)
+            self.assertEqual(count, 0)
+            self.assertEqual(out, reset_case)
+
+        # b) Anthropic-style tool_use blocks are counted too.
+        anthropic_msgs = [
+            {'role': 'user', 'content': 'read files'},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't1', 'name': 'read',
+                 'input': {'path': 'a.py'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'file a'}]},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't2', 'name': 'read',
+                 'input': {'path': 'b.py'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 't2', 'content': 'file b'}]},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 't3', 'name': 'read',
+                 'input': {'path': 'c.py'}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 't3', 'content': 'file c'}]},
+        ]
+        updated, _count = inject_read_guard_hints(anthropic_msgs)
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:',
+                      updated[-1]['content'][-1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+    def test_proxy_injects_read_guard_hints(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [
+            {'role': 'user', 'content': 'read files'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r1', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'file a'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r2', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'b.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r2', 'content': 'file b'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r3', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'c.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r3', 'content': 'file c'},
+        ]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][-1]['content']
+        self.assertIn('[HARNESS_READ_BUDGET_WARNING:', forwarded)
+        summary = proxy.summary()
+        read_spans = [s for s in summary['spans']
+                      if s.get('name') == 'guard.read_guard_hint']
+        self.assertEqual(len(read_spans), 1)
+        span = read_spans[0]
+        kind = self._span_kind(span)
+        if kind is not None:
+            self.assertEqual(kind, 'GUARDRAIL')
+        self.assertTrue(span.get('attributes', {}).get('guardrail.triggered'))
+        self.assertEqual(
+            span.get('attributes', {}).get('harness.read_hints_injected'), 1)
+
+    def _span_kind(self, span):
+        return (span.get('kind')
+                or span.get('attributes', {}).get('openinference.span.kind'))
+
+    def test_proxy_injects_read_permission_hint_span(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [
+            {'role': 'user', 'content': 'read it'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r1', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r1', 'content': 'Permission denied: read'},
+        ]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][2]['content']
+        self.assertIn('[HARNESS_READ_HINT:', forwarded)
+        summary = proxy.summary()
+        read_spans = [s for s in summary['spans']
+                      if s.get('name') == 'guard.read_guard_hint']
+        self.assertEqual(len(read_spans), 1)
+        span = read_spans[0]
+        kind = self._span_kind(span)
+        if kind is not None:
+            self.assertEqual(kind, 'GUARDRAIL')
+        self.assertTrue(span.get('attributes', {}).get('guardrail.triggered'))
+        self.assertEqual(
+            span.get('attributes', {}).get('harness.read_hints_injected'), 1)
+
+    def test_proxy_injects_edit_failure_hints(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [
+            {'role': 'user', 'content': 'fix function'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'e1', 'function': {'name': 'edit', 'arguments': json.dumps({'path': 'a.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'e1', 'content': 'Error: oldString not found in file'},
+        ]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][2]['content']
+        self.assertIn('[HARNESS_EDIT_HINT:', forwarded)
+        summary = proxy.summary()
+        self.assertEqual(summary['edit_hints_injected'], 1)
+        self.assertTrue(any(s.get('name') == 'guard.edit_failure_hint' for s in summary['spans']))
 
 
 if __name__ == '__main__':

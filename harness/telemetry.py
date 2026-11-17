@@ -11,6 +11,7 @@ and flushes them to an Arize AX or Phoenix collector.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import secrets
@@ -39,6 +40,11 @@ _PREVIEW_ATTR_KEYS = (
     'guardrail.name', 'guardrail.triggered',
     'harness.turn_index', 'harness.reasoning_max_tokens',
 )
+
+
+def _is_otel_disabled() -> bool:
+    """True when ``HARNESS_OTEL_DISABLED`` opts telemetry POSTs out in tests."""
+    return os.environ.get('HARNESS_OTEL_DISABLED', '').strip().lower() in ('1', 'true', 'yes')
 
 
 class HarnessTracer:
@@ -99,6 +105,30 @@ class HarnessTracer:
                     handle.write(json.dumps(span, sort_keys=True) + '\n')
         return span
 
+    def record_tool_span(self, tool_name: str, *, arguments: dict | str | None = None,
+                         output: str | None = None, status: str = 'OK',
+                         start_time_ns: int | None = None, end_time_ns: int | None = None,
+                         step_index: int | None = None) -> dict:
+        """Record an OpenInference TOOL span parented to the root run span."""
+        attributes: dict = {'tool.name': tool_name}
+        if arguments is not None:
+            serialized = (arguments if isinstance(arguments, str)
+                          else json.dumps(arguments, sort_keys=True, default=str))
+            attributes['tool.parameters'] = serialized[:2000]
+        if output is not None:
+            attributes['output.value'] = str(output)[:2000]
+        if step_index is not None:
+            attributes['harness.turn_index'] = step_index
+        return self.record_span(
+            tool_name,
+            kind='TOOL',
+            parent_span_id=self.root_span_id,
+            start_time_ns=start_time_ns,
+            end_time_ns=end_time_ns,
+            status=status,
+            attributes=attributes,
+        )
+
     def to_otlp_payload(self) -> dict:
         """Convert recorded spans into OTLP/HTTP JSON ExportTraceServiceRequest."""
         with self._lock:
@@ -133,6 +163,9 @@ class HarnessTracer:
     @classmethod
     def _span_to_otlp(cls, span: dict) -> dict:
         attributes = span.get('attributes') or {}
+        status_obj = {'code': _OTLP_STATUS_CODES.get(span.get('status', 'OK'), 0)}
+        if span.get('status_message'):
+            status_obj['message'] = str(span['status_message'])
         otlp_span = {
             'traceId': span.get('trace_id', ''),
             'spanId': span.get('span_id', ''),
@@ -142,124 +175,145 @@ class HarnessTracer:
             'endTimeUnixNano': str(span.get('end_time_ns', 0)),
             'attributes': [{'key': key, 'value': cls._otlp_value(value)}
                            for key, value in attributes.items()],
-            'status': {'code': _OTLP_STATUS_CODES.get(span.get('status', 'OK'), 0)},
+            'status': status_obj,
         }
         if span.get('parent_span_id'):
             otlp_span['parentSpanId'] = span['parent_span_id']
         return otlp_span
 
     @staticmethod
-    def _pb_varint(n: int) -> bytes:
-        if n < 0:
-            n &= (1 << 64) - 1
+    def _pb_varint(value: int) -> bytes:
+        value &= 0xFFFFFFFFFFFFFFFF
         out = bytearray()
-        while n > 0x7F:
-            out.append((n & 0x7F) | 0x80)
-            n >>= 7
-        out.append(n & 0x7F)
+        while value > 0x7F:
+            out.append((value & 0x7F) | 0x80)
+            value >>= 7
+        out.append(value)
         return bytes(out)
 
     @classmethod
-    def _pb_ld(cls, field: int, payload: bytes) -> bytes:
-        return cls._pb_varint((field << 3) | 2) + cls._pb_varint(len(payload)) + payload
+    def _pb_tag(cls, field_number: int, wire_type: int) -> bytes:
+        return cls._pb_varint((field_number << 3) | wire_type)
 
     @classmethod
-    def _pb_any_value(cls, val) -> bytes:
-        if isinstance(val, bool):
-            return cls._pb_varint((2 << 3) | 0) + cls._pb_varint(1 if val else 0)
-        if isinstance(val, int):
-            return cls._pb_varint((3 << 3) | 0) + cls._pb_varint(val)
-        if isinstance(val, float):
-            return cls._pb_varint((4 << 3) | 1) + struct.pack('<d', val)
-        text = val if isinstance(val, str) else json.dumps(val, sort_keys=True, default=str)
-        return cls._pb_ld(1, text.encode('utf-8'))
+    def _pb_bytes(cls, field_number: int, data: bytes) -> bytes:
+        return cls._pb_tag(field_number, 2) + cls._pb_varint(len(data)) + data
 
     @classmethod
-    def _pb_kv(cls, key: str, val) -> bytes:
-        return cls._pb_ld(1, key.encode('utf-8')) + cls._pb_ld(2, cls._pb_any_value(val))
+    def _pb_str(cls, field_number: int, text: str) -> bytes:
+        return cls._pb_bytes(field_number, text.encode('utf-8'))
+
+    @classmethod
+    def _pb_any_value(cls, value) -> bytes:
+        if isinstance(value, bool):
+            return cls._pb_tag(2, 0) + cls._pb_varint(1 if value else 0)
+        if isinstance(value, int):
+            return cls._pb_tag(3, 0) + cls._pb_varint(value)
+        if isinstance(value, float):
+            return cls._pb_tag(4, 1) + struct.pack('<d', value)
+        if isinstance(value, str):
+            return cls._pb_str(1, value)
+        return cls._pb_str(1, json.dumps(value, sort_keys=True, default=str))
+
+    @classmethod
+    def _pb_kv(cls, key: str, value) -> bytes:
+        return cls._pb_str(1, key) + cls._pb_bytes(2, cls._pb_any_value(value))
 
     @staticmethod
-    def _pb_hex_bytes(hex_str: str, nbytes: int) -> bytes:
+    def _hex_to_bytes(hex_str: str, length: int) -> bytes:
         try:
-            raw = bytes.fromhex(hex_str)
-            if len(raw) == nbytes:
-                return raw
+            raw = bytes.fromhex(str(hex_str or '').strip())
         except ValueError:
-            pass
-        return hex_str.encode('utf-8')[:nbytes].ljust(nbytes, b'\x00')
+            raw = b''
+        if len(raw) == length:
+            return raw
+        if len(raw) > length:
+            return raw[:length]
+        return raw.rjust(length, b'\x00')
 
     @classmethod
-    def _span_to_otlp_pb(cls, span: dict) -> bytes:
-        attrs = span.get('attributes') or {}
-        out = bytearray()
-        out += cls._pb_ld(1, cls._pb_hex_bytes(str(span.get('trace_id', '')), 16))
-        out += cls._pb_ld(2, cls._pb_hex_bytes(str(span.get('span_id', '')), 8))
+    def _span_to_pb(cls, span: dict) -> bytes:
+        attributes = span.get('attributes') or {}
+        parts = [
+            cls._pb_bytes(1, cls._hex_to_bytes(span.get('trace_id', ''), 16)),
+            cls._pb_bytes(2, cls._hex_to_bytes(span.get('span_id', ''), 8)),
+        ]
         if span.get('parent_span_id'):
-            out += cls._pb_ld(4, cls._pb_hex_bytes(str(span['parent_span_id']), 8))
-        out += cls._pb_ld(5, str(span.get('name', '')).encode('utf-8'))
-        kind = _OTLP_SPAN_KINDS.get(attrs.get('openinference.span.kind'), 1)
-        out += cls._pb_varint((6 << 3) | 0) + cls._pb_varint(kind)
-        out += cls._pb_varint((7 << 3) | 1) + struct.pack('<Q', max(0, int(span.get('start_time_ns', 0))))
-        out += cls._pb_varint((8 << 3) | 1) + struct.pack('<Q', max(0, int(span.get('end_time_ns', 0))))
-        for k, v in attrs.items():
-            out += cls._pb_ld(9, cls._pb_kv(str(k), v))
-        code = _OTLP_STATUS_CODES.get(span.get('status', 'OK'), 0)
-        out += cls._pb_ld(15, cls._pb_varint((2 << 3) | 0) + cls._pb_varint(code))
-        return bytes(out)
+            parts.append(cls._pb_bytes(4, cls._hex_to_bytes(span['parent_span_id'], 8)))
+        parts.append(cls._pb_str(5, str(span.get('name', ''))))
+        kind = _OTLP_SPAN_KINDS.get(attributes.get('openinference.span.kind'), 1)
+        parts.append(cls._pb_tag(6, 0) + cls._pb_varint(kind))
+        start_ns = max(0, int(span.get('start_time_ns') or 0))
+        end_ns = max(0, int(span.get('end_time_ns') or 0))
+        parts.append(cls._pb_tag(7, 1) + struct.pack('<Q', start_ns))
+        parts.append(cls._pb_tag(8, 1) + struct.pack('<Q', end_ns))
+        for key, value in attributes.items():
+            parts.append(cls._pb_bytes(9, cls._pb_kv(str(key), value)))
+        status_code = _OTLP_STATUS_CODES.get(span.get('status', 'OK'), 0)
+        status_parts = []
+        if span.get('status_message'):
+            status_parts.append(cls._pb_str(2, str(span['status_message'])))
+        status_parts.append(cls._pb_tag(3, 0) + cls._pb_varint(status_code))
+        parts.append(cls._pb_bytes(15, b''.join(status_parts)))
+        return b''.join(parts)
 
     def to_otlp_protobuf(self) -> bytes:
-        """Serialize recorded spans as wire-format OTLP Protobuf ExportTraceServiceRequest."""
+        """Encode recorded spans into OTLP Protobuf ExportTraceServiceRequest bytes."""
         with self._lock:
             spans = list(self.spans)
-        res = (self._pb_ld(1, self._pb_kv('service.name', self.service_name))
-               + self._pb_ld(1, self._pb_kv('openinference.project.name', self.project_name)))
-        scope = (self._pb_ld(1, _SCOPE_NAME.encode('utf-8'))
-                 + self._pb_ld(2, _SCOPE_VERSION.encode('utf-8')))
-        scope_spans = self._pb_ld(1, scope) + b''.join(
-            self._pb_ld(2, self._span_to_otlp_pb(s)) for s in spans
+        resource_bytes = (
+            self._pb_bytes(1, self._pb_kv('service.name', self.service_name))
+            + self._pb_bytes(1, self._pb_kv('openinference.project.name', self.project_name))
         )
-        res_spans = self._pb_ld(1, res) + self._pb_ld(2, scope_spans)
-        return self._pb_ld(1, res_spans)
-
-    def _post_otlp(self, target: str, body: bytes, content_type: str, timeout: float) -> int:
-        headers = {'Content-Type': content_type}
-        if self.arize_api_key:
-            headers['api_key'] = self.arize_api_key
-            headers['x-arize-api-key'] = self.arize_api_key
-        if self.arize_space_id:
-            headers['space_id'] = self.arize_space_id
-            headers['x-arize-space-id'] = self.arize_space_id
-        request = urllib.request.Request(target, data=body, headers=headers, method='POST')
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return int(getattr(response, 'status', 200))
+        scope_bytes = self._pb_str(1, _SCOPE_NAME) + self._pb_str(2, _SCOPE_VERSION)
+        scope_spans_parts = [self._pb_bytes(1, scope_bytes)]
+        for span in spans:
+            scope_spans_parts.append(self._pb_bytes(2, self._span_to_pb(span)))
+        resource_spans_bytes = (
+            self._pb_bytes(1, resource_bytes)
+            + self._pb_bytes(2, b''.join(scope_spans_parts))
+        )
+        return self._pb_bytes(1, resource_spans_bytes)
 
     def flush_otlp(self, *, endpoint: str | None = None, timeout: float = 1.5) -> bool:
-        """POST the current spans as OTLP/HTTP (JSON with Protobuf fallback on 415); True on 2xx."""
+        """POST spans as OTLP/HTTP Protobuf (falling back to JSON if rejected); True on 2xx."""
+        if endpoint is None and _is_otel_disabled():
+            return False
         target = endpoint or self.otlp_endpoint
         if not target:
             return False
+        base_headers = {}
+        if self.arize_api_key:
+            base_headers['api_key'] = self.arize_api_key
+            base_headers['x-arize-api-key'] = self.arize_api_key
+        if self.arize_space_id:
+            base_headers['space_id'] = self.arize_space_id
+            base_headers['x-arize-space-id'] = self.arize_space_id
+
+        def _post(body: bytes, content_type: str) -> bool:
+            headers = {**base_headers, 'Content-Type': content_type}
+            request = urllib.request.Request(target, data=body, headers=headers, method='POST')
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return 200 <= getattr(response, 'status', 200) < 300
+
         try:
-            status = self._post_otlp(
-                target,
-                json.dumps(self.to_otlp_payload()).encode('utf-8'),
-                'application/json',
-                timeout,
-            )
-            return 200 <= status < 300
+            return _post(self.to_otlp_protobuf(), 'application/x-protobuf')
         except urllib.error.HTTPError as exc:
-            if exc.code == 415:
-                try:
-                    status = self._post_otlp(
-                        target,
-                        self.to_otlp_protobuf(),
-                        'application/x-protobuf',
-                        timeout,
-                    )
-                    return 200 <= status < 300
-                except (urllib.error.URLError, OSError, ValueError):
-                    return False
-            return False
+            code = exc.code
+            exc.close()
+            if code not in (400, 415, 422, 500, 501):
+                return False
+        except http.client.HTTPException:
+            pass
         except (urllib.error.URLError, OSError, ValueError):
+            return False
+
+        try:
+            return _post(json.dumps(self.to_otlp_payload()).encode('utf-8'), 'application/json')
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            return False
+        except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
             return False
 
 
@@ -291,9 +345,15 @@ def format_trace_tree(spans: list[dict]) -> str:
         extras = ', '.join(f"{key}={attributes[key]}"
                            for key in _PREVIEW_ATTR_KEYS if key in attributes)
         suffix = f'  {extras}' if extras else ''
-        lines.append(f"{prefix}{connector}[{kind}] {span.get('name', '?')}"
-                     f"  latency_ms={latency_ms:.1f}"
-                     f"  status={span.get('status', 'OK')}{suffix}")
+        if kind == 'TOOL':
+            tool_name = attributes.get('tool.name') or span.get('name', '?')
+            status = span.get('status', 'OK')
+            lines.append(f"{prefix}{connector}[TOOL] {tool_name} ({status})"
+                         f"  latency_ms={latency_ms:.1f}{suffix}")
+        else:
+            lines.append(f"{prefix}{connector}[{kind}] {span.get('name', '?')}"
+                         f"  latency_ms={latency_ms:.1f}"
+                         f"  status={span.get('status', 'OK')}{suffix}")
         kids = children.get(span.get('span_id'), [])
         for index, child in enumerate(kids):
             last = index == len(kids) - 1
@@ -441,49 +501,428 @@ def _load_run_requests(run_path: Path) -> list:
     return []
 
 
+_OK_STATUSES = {
+    'validation_passed_review_required',
+    'patch_ready_review_required',
+    'configuration_verified_no_model_call',
+    'succeeded',
+    'ok',
+}
+
+
+def _load_task_json(run_path: Path) -> dict:
+    try:
+        payload = json.loads((run_path / 'task.json').read_text(encoding='utf-8'))
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _load_run_events_times(run_path: Path) -> tuple[int | None, int | None]:
+    events_path = run_path / 'events.jsonl'
+    if not events_path.is_file():
+        return None, None
+    first_ns = last_ns = started_ns = finished_ns = None
+    try:
+        with events_path.open('r', encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                ts_ns = _timestamp_to_ns(ev.get('time'))
+                if ts_ns is None:
+                    continue
+                if first_ns is None:
+                    first_ns = ts_ns
+                last_ns = ts_ns
+                ev_name = ev.get('event')
+                if ev_name == 'run_started' and started_ns is None:
+                    started_ns = ts_ns
+                elif ev_name == 'run_finished':
+                    finished_ns = ts_ns
+    except OSError:
+        return None, None
+    return (started_ns if started_ns is not None else first_ns,
+            finished_ns if finished_ns is not None else last_ns)
+
+
+def _needs_resynthesis(spans: list[dict], run_path: Path) -> bool:
+    if not (run_path / 'result.json').is_file():
+        return False
+    if any((s.get('end_time_ns') or 0) < (s.get('start_time_ns') or 0) for s in spans):
+        return True
+    if not any(
+        (s.get('attributes') or {}).get('openinference.span.kind') == 'TOOL' for s in spans
+    ) and _extract_tool_events(_load_run_messages(run_path)):
+        # Cached traces.jsonl predates TOOL span synthesis from worker.log.
+        return True
+    root = next((s for s in spans if s.get('name') == 'harness.task'), None)
+    if root is not None:
+        attrs = root.get('attributes') or {}
+        if 'input.value' not in attrs:
+            return True
+        if root.get('start_time_ns') == root.get('end_time_ns'):
+            # Re-synthesize if duration_seconds or events indicate non-zero duration.
+            return (run_path / 'events.jsonl').is_file() or (run_path / 'requests.json').is_file()
+        return False
+    return (run_path / 'requests.json').is_file() or (run_path / 'events.jsonl').is_file()
+
+
+def _load_run_messages(run_path: Path) -> list:
+    """Load ``messages`` from ``requests.json``, falling back to ``worker.log`` JSONL.
+
+    Real OpenCode runs write ``worker.log`` as JSONL where each line is a dict
+    like ``{"type": "tool_use", "timestamp": ..., "part": {"type": "tool",
+    "tool": "read", "state": {...}}}``. Such lines are converted into tool
+    part dicts that ``_extract_tool_events`` understands.
+    """
+    try:
+        payload = json.loads((run_path / 'requests.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+        return payload['messages']
+
+    worker_log = run_path / 'worker.log'
+    if not worker_log.is_file():
+        return []
+    try:
+        text = worker_log.read_text(encoding='utf-8')
+    except OSError:
+        return []
+    messages: list = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get('type') == 'tool_use' or (
+            isinstance(obj.get('part'), dict) and obj['part'].get('type') == 'tool'
+        ):
+            if not isinstance(obj.get('part'), dict):
+                continue
+            part = dict(obj['part'])
+            if 'time' not in part or part.get('state'):
+                part.setdefault('time', {'start': obj.get('timestamp'), 'end': obj.get('timestamp')})
+            messages.append(part)
+    return messages
+
+
+def _extract_tool_events(messages: list) -> list[dict]:
+    """Extract normalized tool call dicts from OpenCode/OpenAI message snapshots."""
+    events: list[dict] = []
+
+    def _serialize_params(raw) -> str:
+        if raw is None:
+            return ''
+        text = raw if isinstance(raw, str) else json.dumps(raw, sort_keys=True, default=str)
+        return text[:2000]
+
+    def _add_part(part: dict) -> None:
+        state = part.get('state') if isinstance(part.get('state'), dict) else {}
+        tool_name = str(part.get('tool') or part.get('name') or 'unknown')
+        raw_input = state.get('input', part.get('input', part.get('arguments')))
+        raw_output = state.get('output', part.get('output', part.get('result')))
+        err = state.get('error') or part.get('error')
+        raw_status = str(state.get('status') or part.get('status') or '').lower()
+        status = 'ERROR' if (err or raw_status in ('error', 'failed')) else 'OK'
+        if raw_output is None and err:
+            raw_output = err
+        time_obj = state.get('time') if isinstance(state.get('time'), dict) else (
+            part.get('time') if isinstance(part.get('time'), dict) else {}
+        )
+        t_start = _timestamp_to_ns(time_obj.get('start') or time_obj.get('created'))
+        t_end = _timestamp_to_ns(time_obj.get('end') or time_obj.get('completed'))
+        events.append({
+            'tool_name': tool_name,
+            'parameters': _serialize_params(raw_input),
+            'output': str(raw_output)[:2000] if raw_output is not None else '',
+            'status': status,
+            'start_ns': t_start,
+            'end_ns': t_end,
+        })
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get('type') == 'tool' or ('tool' in msg and 'parts' not in msg and 'tool_calls' not in msg):
+            _add_part(msg)
+            continue
+        parts = msg.get('parts')
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict) and (part.get('type') == 'tool' or 'tool' in part):
+                    _add_part(part)
+        tool_calls = msg.get('tool_calls')
+        if isinstance(tool_calls, list):
+            for tc in tool_calls:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get('function') if isinstance(tc.get('function'), dict) else {}
+                tool_name = str(fn.get('name') or tc.get('name') or tc.get('tool') or 'unknown')
+                raw_args = fn.get('arguments', tc.get('arguments', tc.get('input')))
+                raw_out = tc.get('output', tc.get('result'))
+                err = tc.get('error')
+                status = 'ERROR' if (err or str(tc.get('status') or '').lower() in ('error', 'failed')) else 'OK'
+                events.append({
+                    'tool_name': tool_name,
+                    'parameters': _serialize_params(raw_args),
+                    'output': str(raw_out if raw_out is not None else (err or ''))[:2000],
+                    'status': status,
+                    'start_ns': None,
+                    'end_ns': None,
+                })
+    return events
+
+
 def synthesize_spans_from_run_dir(run_dir: str | Path) -> list[dict]:
     """Return spans for a guard run directory, synthesizing them if needed.
 
-    If ``traces.jsonl`` already exists and holds parseable spans, those are
-    returned unchanged. Otherwise ``result.json`` (plus the sibling
-    ``requests.json`` when present) is converted into a root AGENT span
-    (``harness.task``) and per-request LLM spans (``gen_ai.chat``), and the
-    spans are written to ``traces.jsonl`` so historical runs gain a trace
-    file automatically. Span/trace ids are derived deterministically from the
-    run id, keeping re-synthesis idempotent.
+    If ``traces.jsonl`` already exists and holds complete spans, those are
+    returned unchanged. Otherwise ``result.json`` (plus ``task.json``,
+    ``events.jsonl``, and ``requests.json`` when present) is converted into a
+    root AGENT span (``harness.task``) and per-request LLM spans
+    (``gen_ai.chat``), preserving any existing guardrail spans, and written to
+    ``traces.jsonl``.
     """
     run_path = Path(run_dir)
     traces_path = run_path / 'traces.jsonl'
+    existing_spans: list[dict] = []
     if traces_path.is_file():
         try:
-            spans = _parse_jsonl_spans(traces_path.read_text(encoding='utf-8'))
+            existing_spans = _parse_jsonl_spans(traces_path.read_text(encoding='utf-8'))
         except OSError:
-            spans = []
-        if spans:
-            return spans
+            existing_spans = []
+        if existing_spans and not _needs_resynthesis(existing_spans, run_path):
+            return existing_spans
 
+    result_path = run_path / 'result.json'
     try:
-        payload = json.loads((run_path / 'result.json').read_text(encoding='utf-8'))
+        payload = json.loads(result_path.read_text(encoding='utf-8'))
     except (OSError, ValueError):
-        return []
+        return existing_spans
     if not isinstance(payload, dict):
-        return []
+        return existing_spans
 
     run_id = run_path.name
     trace_id = _deterministic_hex(f'{run_id}:trace', 32)
     root_span_id = _deterministic_hex(f'{run_id}:root', 16)
+    requests = _load_run_requests(run_path)
+    task_json = _load_task_json(run_path)
+
     started_at = _first(payload, _STARTED_AT_KEYS)
     finished_at = _first(payload, _FINISHED_AT_KEYS)
     start_ns = _timestamp_to_ns(started_at)
     end_ns = _timestamp_to_ns(finished_at)
-    if start_ns is None:
-        start_ns = end_ns if end_ns is not None else time.time_ns()
+
+    if start_ns is None or end_ns is None:
+        ev_start_ns, ev_end_ns = _load_run_events_times(run_path)
+        if start_ns is None:
+            start_ns = ev_start_ns
+        if end_ns is None:
+            end_ns = ev_end_ns
+
+    if (start_ns is None or end_ns is None) and requests:
+        req_starts, req_ends = [], []
+        for record in requests:
+            if not isinstance(record, dict):
+                continue
+            time_obj = record.get('time') if isinstance(record.get('time'), dict) else {}
+            rs = (_timestamp_to_ns(time_obj.get('created'))
+                  or _timestamp_to_ns(_first(record, _STARTED_AT_KEYS)))
+            re = (_timestamp_to_ns(time_obj.get('completed'))
+                  or _timestamp_to_ns(time_obj.get('streamed'))
+                  or _timestamp_to_ns(_first(record, _FINISHED_AT_KEYS)))
+            if rs is not None:
+                req_starts.append(rs)
+            if re is not None:
+                req_ends.append(re)
+        if start_ns is None and req_starts:
+            start_ns = min(req_starts)
+        if end_ns is None and req_ends:
+            end_ns = max(req_ends)
+
     if end_ns is None:
-        end_ns = start_ns
+        try:
+            end_ns = int(result_path.stat().st_mtime * 1e9)
+        except OSError:
+            end_ns = time.time_ns()
+    if start_ns is None:
+        dur = _to_float(payload.get('duration_seconds'))
+        start_ns = (end_ns - int(dur * 1e9)) if dur > 0 else end_ns
     if end_ns < start_ns:
         end_ns = start_ns
 
-    task_model = str(_first(payload, _MODEL_KEYS) or 'unknown')
+    project_name = _synthesis_project_name()
+    task_id = str(_first(payload, _TASK_ID_KEYS) or run_id)
+    task_model = str(_first(payload, _MODEL_KEYS) or task_json.get('model') or 'unknown')
+    raw_status = str(_first(payload, _STATUS_KEYS) or 'unknown')
+    otel_status = 'OK' if raw_status in _OK_STATUSES else 'ERROR'
+    reason = str(payload.get('reason') or '')
+    steps = _to_int(_first(payload, _STEPS_KEYS))
+    total_cost = _to_float(_first(payload, _COST_KEYS))
+    if total_cost == 0.0 and payload.get('observed_cost') is not None:
+        total_cost = _to_float(payload.get('observed_cost'))
+
+    child_spans: list[dict] = []
+    sum_prompt_tokens = 0
+    sum_completion_tokens = 0
+    sum_total_tokens = 0
+    sum_req_cost = 0.0
+
+    if requests:
+        window = max((end_ns - start_ns) // (len(requests) + 1), 1)
+        for index, record in enumerate(requests):
+            child_start = start_ns + index * window
+            child_end = child_start + window
+            record_dict = record if isinstance(record, dict) else {}
+            time_obj = record_dict.get('time') if isinstance(record_dict.get('time'), dict) else {}
+            record_start = (_timestamp_to_ns(time_obj.get('created'))
+                            or _timestamp_to_ns(_first(record_dict, _STARTED_AT_KEYS)))
+            record_end = (_timestamp_to_ns(time_obj.get('completed'))
+                          or _timestamp_to_ns(time_obj.get('streamed'))
+                          or _timestamp_to_ns(_first(record_dict, _FINISHED_AT_KEYS)))
+            if record_start is not None:
+                child_start = record_start
+            if record_end is not None:
+                child_end = max(record_end, child_start)
+            if child_end < child_start:
+                child_end = child_start
+
+            record_model = str(_first(record_dict, _MODEL_KEYS) or task_model)
+            rec_cost = _to_float(_first(record_dict, _COST_KEYS))
+            sum_req_cost += rec_cost
+
+            tokens = record_dict.get('tokens') if isinstance(record_dict.get('tokens'), dict) else {}
+            cache = tokens.get('cache') if isinstance(tokens.get('cache'), dict) else {}
+            rec_prompt = _to_int(tokens.get('input')) + _to_int(cache.get('read'))
+            rec_completion = _to_int(tokens.get('output')) + _to_int(tokens.get('reasoning'))
+            rec_total = rec_prompt + rec_completion
+            sum_prompt_tokens += rec_prompt
+            sum_completion_tokens += rec_completion
+            sum_total_tokens += rec_total
+
+            rec_error = bool(record_dict.get('error') or record_dict.get('state') == 'error')
+            rec_status = 'ERROR' if rec_error else 'OK'
+            rec_input = json.dumps({
+                'ordinal': record_dict.get('ordinal', index + 1),
+                'model': record_model,
+            }, ensure_ascii=False)
+            rec_output = json.dumps({
+                'finish': record_dict.get('finish'),
+                'state': record_dict.get('state'),
+                'provider_request_ids': record_dict.get('provider_request_ids'),
+                'tokens': tokens,
+                'cost': rec_cost,
+            }, ensure_ascii=False)
+
+            child_spans.append({
+                'name': 'gen_ai.chat',
+                'span_id': _deterministic_hex(f'{run_id}:request:{index}', 16),
+                'trace_id': trace_id,
+                'parent_span_id': root_span_id,
+                'start_time_ns': child_start,
+                'end_time_ns': child_end,
+                'status': rec_status,
+                'attributes': {
+                    'openinference.span.kind': 'LLM',
+                    'openinference.project.name': project_name,
+                    'gen_ai.operation.name': 'chat',
+                    'gen_ai.request.model': record_model,
+                    'llm.model_name': record_model,
+                    'gen_ai.usage.cost_usd': rec_cost,
+                    'llm.cost.total': rec_cost,
+                    'llm.token_count.prompt': rec_prompt,
+                    'llm.token_count.completion': rec_completion,
+                    'llm.token_count.total': rec_total,
+                    'input.value': rec_input,
+                    'input.mime_type': 'application/json',
+                    'output.value': rec_output,
+                    'output.mime_type': 'application/json',
+                },
+            })
+
+    tool_events = _extract_tool_events(_load_run_messages(run_path))
+    if tool_events:
+        tool_window = max((end_ns - start_ns) // (len(tool_events) + 1), 1)
+        for idx, tev in enumerate(tool_events):
+            t_start = tev['start_ns'] if tev['start_ns'] is not None else (start_ns + idx * tool_window)
+            t_end = tev['end_ns'] if tev['end_ns'] is not None else (t_start + tool_window)
+            if t_end < t_start:
+                t_end = t_start
+            tool_attrs = {
+                'openinference.span.kind': 'TOOL',
+                'openinference.project.name': project_name,
+                'tool.name': tev['tool_name'],
+            }
+            if tev['parameters']:
+                tool_attrs['tool.parameters'] = tev['parameters']
+            if tev['output']:
+                tool_attrs['output.value'] = tev['output']
+            child_spans.append({
+                'name': tev['tool_name'],
+                'span_id': _deterministic_hex(f'{run_id}:tool:{idx}', 16),
+                'trace_id': trace_id,
+                'parent_span_id': root_span_id,
+                'start_time_ns': t_start,
+                'end_time_ns': t_end,
+                'status': tev['status'],
+                'attributes': tool_attrs,
+            })
+
+    if total_cost == 0.0 and sum_req_cost > 0.0:
+        total_cost = sum_req_cost
+
+    prompt_text = str(task_json.get('prompt') or '')
+    if len(prompt_text) > 4000:
+        prompt_text = prompt_text[:4000] + '...[truncated]'
+    input_value = json.dumps({
+        'task_id': task_id,
+        'model': task_model,
+        'files': task_json.get('files', []),
+        'prompt': prompt_text,
+    }, ensure_ascii=False)
+    output_value = json.dumps({
+        'status': raw_status,
+        'reason': reason,
+        'steps': steps,
+        'cost': total_cost,
+        'test_return_code': payload.get('test_return_code'),
+    }, ensure_ascii=False)
+
+    root_attrs = {
+        'openinference.span.kind': 'AGENT',
+        'openinference.project.name': project_name,
+        'harness.task_id': task_id,
+        'gen_ai.request.model': task_model,
+        'llm.model_name': task_model,
+        'harness.status': raw_status,
+        'harness.steps': steps,
+        'gen_ai.usage.cost_usd': total_cost,
+        'llm.cost.total': total_cost,
+        'llm.token_count.prompt': sum_prompt_tokens,
+        'llm.token_count.completion': sum_completion_tokens,
+        'llm.token_count.total': sum_total_tokens,
+        'otel.status_code': otel_status,
+        'otel.status_description': reason,
+        'input.value': input_value,
+        'input.mime_type': 'application/json',
+        'output.value': output_value,
+        'output.mime_type': 'application/json',
+        'harness.started_at': str(started_at) if started_at is not None else '',
+        'harness.finished_at': str(finished_at) if finished_at is not None else '',
+    }
     root_span = {
         'name': 'harness.task',
         'span_id': root_span_id,
@@ -491,52 +930,21 @@ def synthesize_spans_from_run_dir(run_dir: str | Path) -> list[dict]:
         'parent_span_id': None,
         'start_time_ns': start_ns,
         'end_time_ns': end_ns,
-        'status': 'OK',
-        'attributes': {
-            'openinference.span.kind': 'AGENT',
-            'openinference.project.name': _synthesis_project_name(),
-            'harness.task_id': str(_first(payload, _TASK_ID_KEYS) or run_id),
-            'gen_ai.request.model': task_model,
-            'harness.status': str(_first(payload, _STATUS_KEYS) or 'unknown'),
-            'harness.steps': _to_int(_first(payload, _STEPS_KEYS)),
-            'gen_ai.usage.cost_usd': _to_float(_first(payload, _COST_KEYS)),
-            'harness.started_at': str(started_at) if started_at is not None else '',
-            'harness.finished_at': str(finished_at) if finished_at is not None else '',
-        },
+        'status': otel_status,
+        'status_message': reason if otel_status == 'ERROR' else '',
+        'attributes': root_attrs,
     }
-    spans = [root_span]
+    spans = [root_span, *child_spans]
 
-    requests = _load_run_requests(run_path)
-    if requests:
-        window = max((end_ns - start_ns) // (len(requests) + 1), 1)
-        for index, record in enumerate(requests):
-            child_start = start_ns + index * window
-            child_end = child_start + window
-            if isinstance(record, dict):
-                record_start = _timestamp_to_ns(_first(record, _STARTED_AT_KEYS))
-                record_end = _timestamp_to_ns(_first(record, _FINISHED_AT_KEYS))
-                if record_start is not None:
-                    child_start = record_start
-                if record_end is not None:
-                    child_end = max(record_end, child_start)
-            record_model = _first(record, _MODEL_KEYS) if isinstance(record, dict) else None
-            spans.append({
-                'name': 'gen_ai.chat',
-                'span_id': _deterministic_hex(f'{run_id}:request:{index}', 16),
-                'trace_id': trace_id,
-                'parent_span_id': root_span_id,
-                'start_time_ns': child_start,
-                'end_time_ns': child_end,
-                'status': 'OK',
-                'attributes': {
-                    'openinference.span.kind': 'LLM',
-                    'openinference.project.name': _synthesis_project_name(),
-                    'gen_ai.operation.name': 'chat',
-                    'gen_ai.request.model': str(record_model or task_model),
-                    'gen_ai.usage.cost_usd': (_to_float(_first(record, _COST_KEYS))
-                                              if isinstance(record, dict) else 0.0),
-                },
-            })
+    # Preserve any guardrail spans recorded live by the proxy.
+    for span in existing_spans:
+        attrs = span.get('attributes') or {}
+        if attrs.get('openinference.span.kind') == 'GUARDRAIL' or str(span.get('name', '')).startswith('guard.'):
+            preserved = dict(span)
+            preserved['trace_id'] = trace_id
+            if not preserved.get('parent_span_id'):
+                preserved['parent_span_id'] = root_span_id
+            spans.append(preserved)
 
     try:
         traces_path.parent.mkdir(parents=True, exist_ok=True)
@@ -578,7 +986,7 @@ def _candidate_run_dirs(state_dir: Path) -> list[Path]:
 
 
 def sync_state_traces_to_phoenix(state_dir: str | Path, *, endpoint: str | None = None,
-                                 timeout: float = 1.5, max_runs: int = 200) -> dict:
+                                 timeout: float = 1.5, max_runs: int | None = None) -> dict:
     """Sync historical run traces to the Phoenix collector, skipping synced runs.
 
     Scans run directories under ``state_dir`` (or treats ``state_dir`` itself
@@ -591,7 +999,12 @@ def sync_state_traces_to_phoenix(state_dir: str | Path, *, endpoint: str | None 
     """
     state = Path(state_dir)
     target = _resolve_otlp_endpoint(endpoint)
-    ledger_base = state.parent if state.is_file() else state
+    if state.is_file():
+        ledger_base = state.parent
+    elif state.parent.name == 'runs':
+        ledger_base = state.parent.parent
+    else:
+        ledger_base = state
     ledger_path = ledger_base / 'phoenix-sync-state.json'
     synced: dict[str, str] = {}
     try:
@@ -601,7 +1014,9 @@ def sync_state_traces_to_phoenix(state_dir: str | Path, *, endpoint: str | None 
     except (OSError, ValueError):
         pass
 
-    candidates = _candidate_run_dirs(state)[:max_runs]
+    candidates = _candidate_run_dirs(state)
+    if max_runs is not None:
+        candidates = candidates[:max_runs]
     total = newly_synced = already_synced = pending = failed_sync = 0
     for run_path in candidates:
         spans = synthesize_spans_from_run_dir(run_path)
@@ -615,6 +1030,10 @@ def sync_state_traces_to_phoenix(state_dir: str | Path, *, endpoint: str | None 
         total += 1
         if synced.get(run_id) == digest:
             already_synced += 1
+            continue
+        if endpoint is None and _is_otel_disabled():
+            failed_sync += 1
+            pending += 1
             continue
         if failed_sync:
             pending += 1

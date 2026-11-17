@@ -9,6 +9,7 @@ and tracks per-turn cost / generation ids / provider health.
 import ast
 import http.server
 import json
+import os
 import re
 import sys
 import threading
@@ -24,8 +25,11 @@ from .guards import (
     check_egress_payload,
     check_readonly_sql_tool_calls,
     collect_python_top_symbols,
+    compact_context_window,
     compact_stale_reads,
     detect_duplicate_tool_calls,
+    inject_edit_failure_hints,
+    inject_read_guard_hints,
 )
 from .routing import ProviderHealthStore, apply_provider_routing
 from .telemetry import HarnessTracer
@@ -33,6 +37,8 @@ from .telemetry import HarnessTracer
 OPENROUTER_UPSTREAM = 'https://openrouter.ai/api/v1'
 GEN_ID_RE = re.compile(rb'"id"\s*:\s*"(gen-[A-Za-z0-9_-]+)"')
 STREAM_COST_RE = re.compile(rb'"usage"\s*:\s*\{[^{}]*"cost"\s*:\s*([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)')
+PROMPT_TOKENS_RE = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
+COMPLETION_TOKENS_RE = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
 PROVIDER_LATENCY_THRESHOLD_SECONDS = 25.0
 
 
@@ -57,7 +63,9 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
                  reasoning_max_tokens=None, allowed_files=None, health_store=None, tracer=None,
                  allowed_models: Iterable[str] | None = None, enforce_egress_guard: bool = False,
                  enforce_readonly_sql: bool = False, host: str = '127.0.0.1', port: int = 0,
-                 upstream_mode: str = 'openrouter', fallback_teacher_model: str | None = None):
+                 upstream_mode: str = 'openrouter', fallback_teacher_model: str | None = None,
+                 max_context_tokens: int | None = None,
+                 sml_results_dir: str | Path | None = None):
         self.gate = gate
         self.upstream_url = upstream_url.rstrip('/')
         self.request_timeout = request_timeout
@@ -69,6 +77,8 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
         self.enforce_readonly_sql = bool(enforce_readonly_sql)
         self.upstream_mode = upstream_mode
         self.fallback_teacher_model = fallback_teacher_model
+        self.max_context_tokens = max_context_tokens
+        self.sml_results_dir = sml_results_dir
         self.baseline_symbols = collect_python_top_symbols(self.allowed_files)
         self.health_store = health_store
         self.tracer = tracer if tracer is not None else HarnessTracer()
@@ -80,6 +90,7 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
         self._blocked_reason = None
         self._auth_bearer = None
         self._compacted_reads = 0
+        self._edit_hints_injected = 0
         self.degraded_providers = (set(health_store.active_degraded())
                                    if health_store is not None else set())
         self.sticky_provider = (health_store.get_sticky(default_model)
@@ -108,7 +119,99 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
                     'dispatched': [dict(d) for d in self._dispatched],
                     'blocked': [dict(b) for b in self._blocked],
                     'spans': list(self.tracer.spans),
-                    'compacted_reads': self._compacted_reads}
+                    'compacted_reads': self._compacted_reads,
+                    'edit_hints_injected': self._edit_hints_injected}
+
+    def task_summaries(self) -> dict[str, dict]:
+        with self._lock:
+            dispatched = [dict(d) for d in self._dispatched]
+            blocked = [dict(b) for b in self._blocked]
+
+        grouped: dict[str, dict] = {}
+
+        def _bucket(task_id: str) -> dict:
+            if task_id not in grouped:
+                grouped[task_id] = {
+                    'request_count': 0,
+                    'blocked_count': 0,
+                    'api_cost_usd': 0.0,
+                    'prompt_tokens': 0,
+                    'completion_tokens': 0,
+                    'started_at': None,
+                    'finished_at': None,
+                    'wall_clock_seconds': 0.0,
+                }
+            return grouped[task_id]
+
+        def _update_window(bucket: dict, start_ts: float | None, end_ts: float | None) -> None:
+            for ts in (start_ts, end_ts):
+                if ts is None:
+                    continue
+                if bucket['started_at'] is None or ts < bucket['started_at']:
+                    bucket['started_at'] = ts
+                if bucket['finished_at'] is None or ts > bucket['finished_at']:
+                    bucket['finished_at'] = ts
+
+        for item in dispatched:
+            task_id = item.get('task_id')
+            if not task_id:
+                continue
+            bucket = _bucket(task_id)
+            bucket['request_count'] += 1
+            bucket['api_cost_usd'] += float(item.get('stream_cost') or 0.0)
+            bucket['prompt_tokens'] += int(item.get('prompt_tokens') or 0)
+            bucket['completion_tokens'] += int(item.get('completion_tokens') or 0)
+            _update_window(bucket, item.get('started_at'), item.get('finished_at') or item.get('started_at'))
+
+        for item in blocked:
+            task_id = item.get('task_id')
+            if not task_id:
+                continue
+            bucket = _bucket(task_id)
+            bucket['blocked_count'] += 1
+            _update_window(bucket, item.get('time'), item.get('time'))
+
+        for bucket in grouped.values():
+            bucket['api_cost_usd'] = round(bucket['api_cost_usd'], 8)
+            if bucket['started_at'] is not None and bucket['finished_at'] is not None:
+                bucket['wall_clock_seconds'] = round(max(0.0, bucket['finished_at'] - bucket['started_at']), 6)
+
+        return grouped
+
+    def flush_sml_manifests(
+        self,
+        results_dir: str | Path,
+        *,
+        gpu_hours: float = 0.0,
+        gpu_hourly_rate_usd: float = 0.0,
+    ) -> dict[str, str]:
+        base = Path(results_dir)
+        written: dict[str, str] = {}
+        compute_cost_usd = round(float(gpu_hours) * float(gpu_hourly_rate_usd), 8)
+        for task_id, stats in self.task_summaries().items():
+            api_cost_usd = round(float(stats['api_cost_usd']), 8)
+            total_cost_usd = round(compute_cost_usd + api_cost_usd, 8)
+            manifest = {
+                'wall_clock_seconds': stats['wall_clock_seconds'],
+                'gpu_hours': float(gpu_hours),
+                'hourly_rate_usd': float(gpu_hourly_rate_usd),
+                'HourlyRateUSD': float(gpu_hourly_rate_usd),
+                'compute_cost_usd': compute_cost_usd,
+                'api_cost_usd': api_cost_usd,
+                'total_cost_usd': total_cost_usd,
+                'prompt_tokens': int(stats['prompt_tokens']),
+                'completion_tokens': int(stats['completion_tokens']),
+                'request_count': int(stats['request_count']),
+                'cost_accounting_status': 'estimated',
+            }
+            out_dir = base / task_id
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / 'cost.json'
+            tmp_path = out_dir / f'.cost.{os.getpid()}.{threading.get_ident()}.tmp'
+            tmp_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+            os.replace(tmp_path, out_path)
+            written[task_id] = str(out_path)
+        return written
 
 
 class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
@@ -149,6 +252,8 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
 
     def _forward(self, method):
         self._capture_auth()
+        raw_task_id = self.headers.get('X-Harness-Task-Id')
+        task_id = raw_task_id.strip() if isinstance(raw_task_id, str) and raw_task_id.strip() else None
         body = self._read_body() if method == 'POST' else None
         entry = None
         if method == 'POST':
@@ -158,7 +263,10 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                 reason = str(exc)
             if reason:
                 with self.server._lock:
-                    self.server._blocked.append({'time': time.time(), 'reason': reason, 'path': self.path})
+                    blocked_item = {'time': time.time(), 'reason': reason, 'path': self.path}
+                    if task_id is not None:
+                        blocked_item['task_id'] = task_id
+                    self.server._blocked.append(blocked_item)
                     if self.server._blocked_reason is None:
                         self.server._blocked_reason = reason
                 self.server.stop_event.set()
@@ -183,8 +291,11 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                 egress_violations = check_egress_payload(payload, allowed_models=self.server.allowed_models)
                 if egress_violations:
                     with self.server._lock:
-                        self.server._blocked.append({'time': time.time(), 'reason': 'egress_guard_blocked',
-                                                     'path': self.path, 'violations': egress_violations})
+                        blocked_item = {'time': time.time(), 'reason': 'egress_guard_blocked',
+                                        'path': self.path, 'violations': egress_violations}
+                        if task_id is not None:
+                            blocked_item['task_id'] = task_id
+                        self.server._blocked.append(blocked_item)
                         if self.server._blocked_reason is None:
                             self.server._blocked_reason = 'egress_guard_blocked'
                     self.server.tracer.record_span('guard.egress_guard', kind='GUARDRAIL', status='ERROR',
@@ -207,8 +318,12 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                     return
             with self.server._lock:
                 entry = {'seq': len(self.server._dispatched) + 1, 'started_at': time.time(),
+                         'finished_at': None,
                          'http_status': None, 'generation_id': None, 'stream_cost': None,
+                         'prompt_tokens': 0, 'completion_tokens': 0,
                          'completed': False, 'error': None}
+                if task_id is not None:
+                    entry['task_id'] = task_id
                 self.server._dispatched.append(entry)
             if self.path.rstrip('/').endswith(('/chat/completions', '/responses')):
                 with self.server._lock:
@@ -257,6 +372,40 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                     else:
                         last['content'] = (content if isinstance(content, str) else '') + notice
                     body = json.dumps(payload).encode('utf-8')
+            # H-17: inject recovery hints on trailing edit-target mismatch results.
+            if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+                new_msgs, hints_injected = inject_edit_failure_hints(payload['messages'])
+                if hints_injected > 0:
+                    payload['messages'] = new_msgs
+                    with self.server._lock:
+                        self.server._edit_hints_injected += hints_injected
+                    body = json.dumps(payload).encode('utf-8')
+                    self.server.tracer.record_span(
+                        'guard.edit_failure_hint',
+                        kind='GUARDRAIL',
+                        attributes={
+                            'guardrail.name': 'edit_failure_hint',
+                            'guardrail.triggered': True,
+                            'harness.edit_hints_injected': hints_injected,
+                            'harness.turn_index': turn_index,
+                        },
+                    )
+            # H-21: inject read-guard hints (permission denied / read budget).
+            if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+                new_msgs, read_hints = inject_read_guard_hints(payload['messages'])
+                if read_hints > 0:
+                    payload['messages'] = new_msgs
+                    body = json.dumps(payload).encode('utf-8')
+                    self.server.tracer.record_span(
+                        'guard.read_guard_hint',
+                        kind='GUARDRAIL',
+                        attributes={
+                            'guardrail.name': 'read_guard_hint',
+                            'guardrail.triggered': True,
+                            'harness.read_hints_injected': read_hints,
+                            'harness.turn_index': turn_index,
+                        },
+                    )
             # H-8: on later turns, compact stale read outputs the guard cannot
             # rewrite in place (notice injection already re-encoded the body).
             if turn_index >= 5 and isinstance(payload, dict) and isinstance(payload.get('messages'), list):
@@ -271,6 +420,31 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                                                                'guardrail.triggered': True,
                                                                'harness.compacted_count': compacted,
                                                                'harness.turn_index': turn_index})
+            if (
+                self.server.max_context_tokens is not None
+                and isinstance(payload, dict)
+                and isinstance(payload.get('messages'), list)
+            ):
+                new_msgs, stats = compact_context_window(
+                    payload['messages'], max_context_tokens=self.server.max_context_tokens
+                )
+                if stats['truncated_messages'] > 0:
+                    payload['messages'] = new_msgs
+                    with self.server._lock:
+                        self.server._compacted_reads += stats['truncated_messages']
+                    body = json.dumps(payload).encode('utf-8')
+                    self.server.tracer.record_span(
+                        'guard.context_budget',
+                        kind='GUARDRAIL',
+                        attributes={
+                            'guardrail.name': 'context_budget',
+                            'guardrail.triggered': True,
+                            'harness.truncated_messages': stats['truncated_messages'],
+                            'harness.tokens_before': stats['tokens_before'],
+                            'harness.tokens_after': stats['tokens_after'],
+                            'harness.max_context_tokens': self.server.max_context_tokens,
+                        },
+                    )
             # Provider routing runs last so notices injected above land inside the
             # payload that apply_provider_routing scans for error signals, letting
             # the same turn immediately use the error-recovery reasoning budget.
@@ -339,6 +513,7 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                         return val['name']
             return None
 
+        req_start_ns = time.time_ns()
         try:
             with urllib.request.urlopen(req, timeout=self.server.request_timeout) as resp:
                 status = getattr(resp, 'status', 200)
@@ -366,29 +541,83 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 tail = b''
+                non_sse_chunks = [] if (entry is not None and not is_sse) else None
+                non_sse_bytes = 0
+
+                def _apply_usage_obj(obj):
+                    if not isinstance(obj, dict):
+                        return
+                    gen_id = obj.get('id')
+                    prov = obj.get('provider') or obj.get('provider_name')
+                    if isinstance(prov, str) and prov and not hdr_provider:
+                        degraded_provider[0] = prov
+                    usage = obj.get('usage')
+                    with self.server._lock:
+                        if isinstance(gen_id, str) and gen_id and entry['generation_id'] is None:
+                            entry['generation_id'] = gen_id
+                        if isinstance(usage, dict):
+                            pt = usage.get('prompt_tokens')
+                            ct = usage.get('completion_tokens')
+                            cost = usage.get('cost')
+                            if isinstance(pt, (int, float)):
+                                entry['prompt_tokens'] = int(pt)
+                            if isinstance(ct, (int, float)):
+                                entry['completion_tokens'] = int(ct)
+                            if isinstance(cost, (int, float)):
+                                entry['stream_cost'] = float(cost)
+
                 while True:
                     # Never touch resp.fp.read1 directly: HTTPResponse.readline / read
                     # decode upstream HTTP/1.1 Transfer-Encoding: chunked frames safely.
                     chunk = resp.readline() if is_sse else resp.read(4096)
                     if not chunk:
+                        if non_sse_chunks:
+                            try:
+                                _apply_usage_obj(json.loads(b''.join(non_sse_chunks)))
+                            except (UnicodeDecodeError, ValueError):
+                                pass
                         if entry is not None:
                             with self.server._lock:
                                 entry['completed'] = True
                         break
                     if entry is not None:
+                        if non_sse_chunks is not None and non_sse_bytes < 2_000_000:
+                            non_sse_chunks.append(chunk)
+                            non_sse_bytes += len(chunk)
+                        if is_sse:
+                            stripped = chunk.strip()
+                            if stripped.startswith(b'data:'):
+                                raw_json = stripped[5:].strip()
+                                if raw_json and raw_json != b'[DONE]':
+                                    try:
+                                        _apply_usage_obj(json.loads(raw_json))
+                                    except (UnicodeDecodeError, ValueError):
+                                        pass
                         window = tail + chunk
                         m_id = GEN_ID_RE.search(window)
                         m_cost = STREAM_COST_RE.search(window)
+                        m_pt = PROMPT_TOKENS_RE.search(window)
+                        m_ct = COMPLETION_TOKENS_RE.search(window)
                         m_prov = re.search(rb'"provider(?:_name)?"\s*:\s*"([^"]+)"', window)
                         if m_prov and not hdr_provider:
                             degraded_provider[0] = m_prov.group(1).decode('utf-8', 'replace')
-                        if m_id or m_cost:
+                        if m_id or m_cost or m_pt or m_ct:
                             with self.server._lock:
                                 if m_id and entry['generation_id'] is None:
                                     entry['generation_id'] = m_id.group(1).decode('ascii')
                                 if m_cost:
                                     try:
                                         entry['stream_cost'] = float(m_cost.group(1))
+                                    except ValueError:
+                                        pass
+                                if m_pt and not entry['prompt_tokens']:
+                                    try:
+                                        entry['prompt_tokens'] = int(m_pt.group(1))
+                                    except ValueError:
+                                        pass
+                                if m_ct and not entry['completion_tokens']:
+                                    try:
+                                        entry['completion_tokens'] = int(m_ct.group(1))
                                     except ValueError:
                                         pass
                         tail = window[-160:]
@@ -451,17 +680,26 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                 pass
         finally:
             if entry is not None:
+                with self.server._lock:
+                    entry['finished_at'] = time.time()
+                span_attrs = {
+                    'gen_ai.system': 'openrouter',
+                    'gen_ai.request.model': routed_model,
+                    'llm.model_name': routed_model,
+                    'llm.provider': degraded_provider[0] or front_provider or '',
+                    'gen_ai.response.id': entry.get('generation_id') or '',
+                    'gen_ai.usage.cost_usd': entry.get('stream_cost') or 0.0,
+                    'harness.turn_index': turn_index,
+                    'harness.reasoning_max_tokens': applied_reasoning_max_tokens,
+                    'http.status_code': entry.get('http_status') or 0,
+                }
+                if task_id is not None:
+                    span_attrs['harness.task_id'] = task_id
                 self.server.tracer.record_span('gen_ai.chat', kind='LLM',
+                                               start_time_ns=req_start_ns,
+                                               end_time_ns=time.time_ns(),
                                                status='ERROR' if entry.get('error') else 'OK',
-                                               attributes={'gen_ai.system': 'openrouter',
-                                                           'gen_ai.request.model': routed_model,
-                                                           'llm.model_name': routed_model,
-                                                           'llm.provider': degraded_provider[0] or front_provider or '',
-                                                           'gen_ai.response.id': entry.get('generation_id') or '',
-                                                           'gen_ai.usage.cost_usd': entry.get('stream_cost') or 0.0,
-                                                           'harness.turn_index': turn_index,
-                                                           'harness.reasoning_max_tokens': applied_reasoning_max_tokens,
-                                                           'http.status_code': entry.get('http_status') or 0})
+                                               attributes=span_attrs)
 
     def do_POST(self):
         self._forward('POST')
@@ -476,13 +714,17 @@ def openrouter_proxy(gate, *, upstream_url=OPENROUTER_UPSTREAM, request_timeout=
                      health_store: ProviderHealthStore | None = None, tracer: HarnessTracer | None = None,
                      allowed_models: Iterable[str] | None = None, enforce_egress_guard: bool = False,
                      enforce_readonly_sql: bool = False, host: str = '127.0.0.1', port: int = 0,
-                     upstream_mode: str = 'openrouter', fallback_teacher_model: str | None = None):
+                     upstream_mode: str = 'openrouter', fallback_teacher_model: str | None = None,
+                     max_context_tokens: int | None = None,
+                     sml_results_dir: str | Path | None = None):
     srv = OpenRouterGuardProxy(gate, upstream_url=upstream_url, request_timeout=request_timeout,
                                default_model=default_model, reasoning_max_tokens=reasoning_max_tokens,
                                allowed_files=allowed_files, health_store=health_store, tracer=tracer,
                                allowed_models=allowed_models, enforce_egress_guard=enforce_egress_guard,
                                enforce_readonly_sql=enforce_readonly_sql, host=host, port=int(port),
-                               upstream_mode=upstream_mode, fallback_teacher_model=fallback_teacher_model)
+                               upstream_mode=upstream_mode, fallback_teacher_model=fallback_teacher_model,
+                               max_context_tokens=max_context_tokens,
+                               sml_results_dir=sml_results_dir)
     thread = threading.Thread(target=srv.serve_forever, kwargs={'poll_interval': 0.05}, daemon=True)
     thread.start()
     try:
@@ -491,3 +733,5 @@ def openrouter_proxy(gate, *, upstream_url=OPENROUTER_UPSTREAM, request_timeout=
         srv.shutdown()
         srv.server_close()
         thread.join(timeout=2)
+        if sml_results_dir is not None:
+            srv.flush_sml_manifests(sml_results_dir)

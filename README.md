@@ -60,9 +60,9 @@ budget. Upstream 429/5xx responses arm the circuit breaker
 | `harness.sandbox` | H-10 sandbox: task-JSON schema + path-boundary validation, exclusive path locks (`file_locked:`), SHA-256 file digests, transactional git worktrees, bounded micro-repair prompts |
 | `harness.finops` | H-10 finops: pre-dispatch budget gate (step cap / cost cap / unpriced models), SQLite generation telemetry, local OpenRouter generation settlement, per-task prior-cost aggregation, `export_sml_cost_manifest` |
 | `harness.proxy` | `OpenRouterGuardProxy` / `openrouter_proxy` context manager: gate, notices, stale-read compaction, egress & read-only SQL guards, `vLLM` upstream mode, cost & generation-id capture, circuit breaker, span recording |
-| `harness.report` | Run-record normalization, benchmark aggregation, Markdown comparison, live state-directory stats |
-| `harness.telemetry` | Stdlib-only OpenTelemetry/GenAI tracer, OTLP payload export, Arize AX / Phoenix flush, trace-tree rendering |
-| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `trace`, `serve`, `run` subcommands |
+| `harness.report` | Run-record normalization, benchmark aggregation, Markdown comparison, live state-directory stats, offline A/B replay (`simulate_replay`, `format_replay_markdown`) |
+| `harness.telemetry` | Stdlib-only OpenTelemetry/GenAI tracer, OTLP JSON & Protobuf export (`to_otlp_protobuf`), Arize AX / Phoenix flush, trace-tree rendering |
+| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `replay`, `trace`, `serve`, `run` subcommands |
 
 H-10 adds the supervisor-side half of the picture. `harness.sandbox`
 validates each task manifest against its schema (`task_id`, `directory`,
@@ -79,23 +79,28 @@ record into SQLite telemetry (`<state-dir>/telemetry.sqlite`), and feeds the
 cumulative per-task prior cost back into the gate: an unknown final cost
 blocks paid retries instead of silently overshooting.
 
-### Live benchmark — 2,068 production runs
+### Live benchmark — production runs
 
 The guarded path is benchmarked against live production state, not a
-synthetic corpus: every supervised run writes a run record, and
-`harness stats --state-dir …` / `format_state_stats_markdown` render the
-rolling benchmark table over **2,068 production runs** (state on
-2026-11-15), one row per routed model plus the `ALL` aggregate:
+synthetic corpus: every supervised run writes a run record under
+`<state-dir>/runs/<run>/result.json`, and `harness stats --state-dir …`
+(`format_state_stats_markdown`) renders the rolling per-model table plus the
+`ALL` aggregate directly from disk.
 
-| Model | Runs | Pass % |
-| --- | --- | --- |
-| ALL | 2,068 | rendered live from the state directory |
-| `openrouter/z-ai/glm-5.3-flash` | … | … |
-| `openrouter/deepseek/deepseek-v4.1-flash-1017` | … | … |
+Snapshot from `harness stats` on 2026-11-16 (**2,081 runs**):
 
-The per-model rows show the rendered shape; the authoritative numbers always
-come from re-running the command against the live state directory — the
-benchmark table is derived data, never a static catalog.
+| Model | Runs | Pass@1 (%) | Median Steps | Median Cost (USD) | Total Cost (USD) | Blocked Requests | Auto-Repairs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `openrouter/deepseek/deepseek-v4.1-flash-1017` | 423 | 55.6 | 6.0 | 0.0091 | 6.5911 | 0 | 0 |
+| `openrouter/moonshotai/kimi-k2.5` | 91 | 20.9 | 4.0 | 0.0000 | 1.2378 | 0 | 0 |
+| `openrouter/qwen/qwen3-coder` | 727 | 41.8 | 6.0 | 0.0069 | 8.4045 | 0 | 0 |
+| `openrouter/z-ai/glm-5.1` | 22 | 13.6 | 3.0 | 0.0058 | 0.9519 | 0 | 0 |
+| `openrouter/z-ai/glm-5.3-flash` | 771 | 53.8 | 4.0 | 0.0036 | 4.0721 | 0 | 0 |
+| `unknown` | 47 | 72.3 | 0.0 | 0.0000 | 0.0000 | 0 | 0 |
+| **ALL** | **2081** | **48.5** | **5.0** | **0.0052** | **21.2573** | **0** | **0** |
+
+Re-run `harness stats --state-dir …` to refresh these numbers from the live
+state directory.
 
 ## H-1 — Syntax pre-flight & provider circuit breaker
 
@@ -325,6 +330,47 @@ guardrails for `Small Model Lab` distillation and eval rollouts:
     low-confidence small-model rollouts to a designated teacher model under the
     same FinOps budget and trace context.
 
+## H-11 — Context-window compaction (`compact_context_window`)
+
+`harness.guards.compact_context_window(messages, *, max_context_tokens=6000)`
+bounds prompt growth on long multi-turn runs by compacting older observations
+and trimming excess context once the estimated token count exceeds
+`max_context_tokens`. In `harness serve`, `--max-context-tokens` configures the
+live proxy budget so long tool-use trajectories stay within model context and
+KV-cache limits.
+
+## H-12 — Per-task SML accounting (`X-Harness-Task-Id`)
+
+Requests carrying the `X-Harness-Task-Id` header are correlated in
+`harness.finops` and `harness.proxy` so per-generation token usage and USD cost
+roll up accurately by task ID. Passing `--sml-results-dir` exports and reconciles
+per-task Small Model Lab (SML) cost manifests alongside local SQLite telemetry.
+
+## H-13 — Offline A/B replay simulator (`harness replay`)
+
+`harness.report.simulate_replay(records_or_state_dir, *, max_context_tokens=6000,
+fallback_teacher_model=None, upstream_mode="openrouter")` replays recorded
+episodes (from a JSON/JSONL file or a live `state_dir`) through
+`detect_duplicate_tool_calls`, `check_readonly_sql_tool_calls`,
+`compact_context_window`, and `apply_provider_routing` without making upstream
+network calls. `format_replay_markdown(summary)` renders the aggregated metrics
+(`total_episodes`, `loop_warnings_triggered`, `sql_violations_caught`,
+`escalated_to_teacher_count`, `tokens_before`, `tokens_after`, `tokens_saved`,
+`token_reduction_pct`):
+
+```console
+$ harness replay --input episodes.jsonl --max-context-tokens 6000
+$ harness replay --state-dir state/ --fallback-teacher-model openrouter/deepseek/deepseek-v4.1-flash-1017 --json
+```
+
+## H-14 — Zero-dependency OTLP Protobuf exporter (`to_otlp_protobuf`)
+
+`HarnessTracer.to_otlp_protobuf()` encodes recorded OpenInference/GenAI spans
+into standard binary OTLP/HTTP `ExportTraceServiceRequest` protobuf wire bytes
+using only the Python standard library (no `opentelemetry-*` or `protobuf`
+packages required), enabling native binary ingestion into Arize Phoenix and
+other OTLP protobuf collectors.
+
 ## OpenTelemetry GenAI + Arize AX / Phoenix OpenInference tracing
 
 `harness.telemetry.HarnessTracer` is a stdlib-only tracer speaking both
@@ -374,6 +420,7 @@ $ harness preflight src/a.py src/conf.json          # exit 1 on any finding
 $ harness skeleton big.py --threshold 100           # print the L<start>-L<end> map
 $ harness bench-report --baseline runs.json --guarded guarded.json
 $ harness stats --state-dir state/                  # live state-directory stats
+$ harness replay --state-dir state/                 # offline A/B replay simulation
 $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
