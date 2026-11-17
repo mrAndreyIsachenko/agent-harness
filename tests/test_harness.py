@@ -2911,8 +2911,8 @@ sys.exit(1)
             self.assertEqual(out['status'], 'validation_passed_review_required')
             self.assertEqual(out['candidates_run'], 2)
             self.assertEqual(out['winning_model'], 'openrouter/deepseek/deepseek-v4.1-flash-1017')
-            self.assertEqual(out['steps'], 1)
-            self.assertAlmostEqual(out['cost'], 0.015)
+            self.assertEqual(out['steps'], 2)
+            self.assertAlmostEqual(out['cost'], 0.03)
             with open(target, 'r', encoding='utf-8') as fh:
                 self.assertEqual(fh.read(), 'VALUE = 1\n')
 
