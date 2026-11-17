@@ -56,7 +56,8 @@ ERROR_RECOVERY_MAX_TOKENS_CAP = 12288
 ERROR_SIGNAL_SUBSTRINGS = ('[AST PREFLIGHT ERROR', '[GUARD LOOP WARNING',
                            'Traceback (most recent call last)', 'SyntaxError',
                            'FAILED ', 'AssertionError',
-                           'could not be parsed as JSON', '[HARNESS_EDIT_HINT')
+                           'could not be parsed as JSON', '[HARNESS_EDIT_HINT',
+                           '[HARNESS PLATEAU GUARD')
 GLM_51_REASONING_MAX_TOKENS = DEFAULT_REASONING_MAX_TOKENS
 DEFAULT_MAX_TOKENS_CAP = 8192
 GLM_51_MAX_TOKENS_CAP = DEFAULT_MAX_TOKENS_CAP

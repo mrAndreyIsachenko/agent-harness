@@ -419,11 +419,26 @@ guarded_runs)` renders a baseline-vs-guarded comparison table.
 $ harness preflight src/a.py src/conf.json          # exit 1 on any finding
 $ harness skeleton big.py --threshold 100           # print the L<start>-L<end> map
 $ harness bench-report --baseline runs.json --guarded guarded.json
-$ harness stats --state-dir state/                  # live state-directory stats
+$ harness stats --state-dir state/ --insights       # live stats + failure insights (H-28)
 $ harness replay --state-dir state/                 # offline A/B replay simulation
 $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
+$ harness trace --sync-state state/                 # backfill runs to Phoenix OTLP (H-20)
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
+
+## Capabilities H-15 .. H-33
+
+| ID | Capability | Module |
+| --- | --- | --- |
+| **H-15..H-18** | Salvage validation on `step_limit`/`worker_timeout`, adaptive micro-repair pass, edit-mismatch recovery hints, OpenInference `TOOL` spans | `sandbox.py`, `guards.py`, `telemetry.py` |
+| **H-19..H-22** | Telemetry test isolation, Phoenix state trace backfill (`--sync-state`), `read_only_files` integrity guard, unindexed-read guard hints | `telemetry.py`, `sandbox.py`, `guards.py` |
+| **H-23..H-25** | Symlink path canonicalization & prompt alias rewriting, adaptive micro-repair steps (`compute_repair_max_steps`), JSON parse error recovery | `sandbox.py`, `routing.py`, `guards.py` |
+| **H-26..H-28** | Preloaded file excerpts (`build_preloaded_file_excerpts`), prior attempt feedback (`build_prior_attempt_feedback`), state failure insights (`compute_state_insights`) | `guards.py`, `sandbox.py`, `report.py` |
+| **H-29** | Full proxy wiring in `run_task` (`ProviderHealthStore`, `max_context_tokens`, `fallback_teacher_model`, egress/SQL guards, `upstream_mode`) + `TEACHER_MODELS` allowlist | `sandbox.py`, `routing.py` |
+| **H-30** | Moonshot/Kimi-style KV-cache prefix stability: epoch-gated `compact_stale_reads` with `keep_recent_turns` and `min_total_saved_chars` threshold | `guards.py`, `proxy.py` |
+| **H-31** | MiniMax/DeepSeek `SWE-Pruner` Lite: in-proxy `prune_noisy_tool_outputs` compacting bloated pytest/traceback tool results before context-window compaction | `guards.py`, `proxy.py` |
+| **H-32** | Z.ai-style edit-oscillation & plateau guard (`detect_edit_oscillation`: `revert_cycle` A→B→A and `untested_edit_streak`) wired into `ERROR_SIGNAL_SUBSTRINGS` | `guards.py`, `proxy.py`, `routing.py` |
+| **H-33** | `TrajSpec` retry distillation: Python AST symbol-level `before`/`after` diff and guardrail event summary prioritized in `build_prior_attempt_feedback` | `sandbox.py` |
 
 ## Quickstart
 
@@ -449,5 +464,5 @@ return `429 guard_stop` — that is the supervisor's budget/deadline hook.
 No third-party dependencies: Python ≥ 3.10 standard library only.
 
 ```console
-$ pytest -q tests/test_harness.py    # H-1..H-9, H-10 sandbox/finops, OTel telemetry, report & CLI
+$ pytest -q tests/test_harness.py    # H-1..H-33 contract suite (110 unittest/pytest cases)
 ```

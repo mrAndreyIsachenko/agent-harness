@@ -17,6 +17,7 @@ import io
 import hashlib
 import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import threading
@@ -40,9 +41,11 @@ from harness.guards import (FORBIDDEN_EGRESS_KEYS, _EDIT_FAILURE_HINT,
                             check_readonly_sql_tool_calls, check_sql_syntax,
                             collect_python_top_symbols, compact_context_window,
                             compact_stale_reads, detect_duplicate_tool_calls,
+                            detect_edit_oscillation,
                             estimate_messages_tokens, extract_compact_test_failure,
                             inject_edit_failure_hints,
-                            inject_read_guard_hints)
+                            inject_read_guard_hints,
+                            prune_noisy_tool_outputs)
 from harness.report import (aggregate_benchmark_runs, format_benchmark_markdown,
                             format_replay_markdown, format_state_stats_markdown,
                             scan_state_runs, simulate_replay, summarize_run)
@@ -52,8 +55,9 @@ from harness.routing import (DEFAULT_PROVIDER_HEALTH_TTL_SECONDS, DEFAULT_REASON
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
                              ProviderHealthStore, apply_provider_routing,
                              select_escalated_model)
-from harness.sandbox import (GuardError, capture_files, compute_repair_max_steps,
-                             config_for, execute,
+from harness.sandbox import (GuardError, _snapshot_files_for_feedback,
+                             build_prior_attempt_feedback, capture_files,
+                             compute_repair_max_steps, config_for, execute,
                              file_hashes, isolated_worktree, locks,
                              main as sandbox_main, model_run, owned_process,
                              preflight, run_task, stop_group, validate_task,
@@ -362,7 +366,7 @@ class TestH7AndH8(HarnessTestCase):
         self.assertIn("%s:1: cannot import name 'missing_name' from 'helper'" % importer, errors)
 
     def test_compact_stale_reads(self):
-        long_a, long_b = 'x' * 500, 'y' * 500
+        long_a, long_b = 'x' * 700, 'y' * 700
         msgs = [{'role': 'user', 'content': 'go'},
                 {'role': 'assistant', 'tool_calls': [
                     {'id': 'r1', 'function': {'name': 'read_file',
@@ -391,22 +395,55 @@ class TestH7AndH8(HarnessTestCase):
         # Reads after the edit, edit results and short reads stay intact.
         self.assertTrue(new[7] is msgs[7] and new[7]['content'] == 'z' * 500)
         self.assertTrue(new[5] is msgs[5] and new[5]['content'] == 'ok')
-        self.assertEqual(compact_stale_reads(msgs, turn_index=4), (msgs, 0))
-        self.assertEqual(compact_stale_reads(msgs, turn_index=5, min_turn=6), (msgs, 0))
+        self.assertEqual(compact_stale_reads(msgs, turn_index=0), (msgs, 0))
         self.assertEqual(compact_stale_reads('nope', turn_index=5), ('nope', 0))
+        # H-30: the trailing keep_recent_turns window is never rewritten.
+        self.assertEqual(compact_stale_reads(msgs, turn_index=5, keep_recent_turns=9),
+                         (msgs, 0))
+        # H-30: below min_total_saved_chars nothing is mutated (prefix kept).
+        new, count = compact_stale_reads(msgs, turn_index=5, min_total_saved_chars=2400)
+        self.assertEqual(count, 0)
+        self.assertIs(new, msgs)
+        big = [{'role': 'user', 'content': 'go'},
+               {'role': 'assistant', 'tool_calls': [
+                   {'id': 'r1', 'function': {'name': 'read_file',
+                                             'arguments': json.dumps({'path': 'a.py'})}},
+                   {'id': 'r2', 'function': {'name': 'view',
+                                             'arguments': json.dumps({'file_path': 'b.py'})}}]},
+               {'role': 'tool', 'tool_call_id': 'r1', 'content': 'x' * 3000},
+               {'role': 'tool', 'tool_call_id': 'r2', 'content': 'y' * 3000},
+               {'role': 'assistant', 'tool_calls': [
+                   {'id': 'e1', 'function': {'name': 'edit',
+                                             'arguments': json.dumps({'path': 'a.py'})}},
+                   {'id': 'e2', 'function': {'name': 'edit',
+                                             'arguments': json.dumps({'path': 'b.py'})}}]},
+               {'role': 'tool', 'tool_call_id': 'e1', 'content': 'ok'},
+               {'role': 'tool', 'tool_call_id': 'e2', 'content': 'ok'},
+               {'role': 'user', 'content': 'go on'},
+               {'role': 'assistant', 'content': 'ok'},
+               {'role': 'user', 'content': 'done'},
+               {'role': 'assistant', 'content': 'finished'}]
+        new, count = compact_stale_reads(big, turn_index=6, min_total_saved_chars=2400)
+        self.assertEqual(count, 2)
+        self.assertIn('[STALE READ COMPACTED: a.py', new[2]['content'])
+        self.assertIn('[STALE READ COMPACTED: b.py', new[3]['content'])
         # Anthropic-style tool_result content blocks are compacted per block.
         blocks = [{'role': 'user', 'content': 'go'},
                   {'role': 'assistant', 'content': [
                       {'type': 'tool_use', 'id': 'u1', 'name': 'read_file',
                        'input': {'path': 'c.py'}}]},
                   {'role': 'user', 'content': [
-                      {'type': 'tool_result', 'tool_use_id': 'u1', 'content': 'w' * 500},
+                      {'type': 'tool_result', 'tool_use_id': 'u1', 'content': 'w' * 700},
                       {'type': 'text', 'text': 'summary'}]},
                   {'role': 'assistant', 'content': [
                       {'type': 'tool_use', 'id': 'u2', 'name': 'edit',
                        'input': {'path': 'c.py'}}]},
                   {'role': 'user', 'content': [
-                      {'type': 'tool_result', 'tool_use_id': 'u2', 'content': 'done'}]}]
+                      {'type': 'tool_result', 'tool_use_id': 'u2', 'content': 'done'}]},
+                  {'role': 'assistant', 'content': 'continue'},
+                  {'role': 'user', 'content': 'more'},
+                  {'role': 'assistant', 'content': 'ok'},
+                  {'role': 'user', 'content': 'done'}]
         new_blocks, count = compact_stale_reads(blocks, turn_index=6)
         self.assertEqual(count, 1)
         self.assertIn('[STALE READ COMPACTED: c.py', new_blocks[2]['content'][0]['content'])
@@ -438,6 +475,81 @@ class TestH5LoopGuard(HarnessTestCase):
                   {'role': 'assistant', 'tool_calls': [
                       {'function': {'name': 'edit', 'arguments': '{"path": "a.py"}'}}]}]
         self.assertEqual(detect_duplicate_tool_calls(spaced), [])
+
+    def test_detect_edit_oscillation_revert_cycle(self):
+        def edit(path, old, new):
+            return {'role': 'assistant', 'tool_calls': [
+                {'function': {'name': 'edit',
+                              'arguments': json.dumps({'filePath': path,
+                                                       'oldString': old,
+                                                       'newString': new})}}]}
+
+        msgs = [{'role': 'user', 'content': 'fix it'},
+                edit('a.py', 'x = 1', 'x = 2'),
+                {'role': 'tool', 'content': 'ok'},
+                edit('a.py', 'x = 2', 'x = 1')]
+        self.assertEqual(detect_edit_oscillation(msgs),
+                         {'oscillating': True, 'file': 'a.py', 'reason': 'revert_cycle'})
+        # A non-reversing second edit is not oscillation.
+        msgs[-1] = edit('a.py', 'x = 2', 'x = 3')
+        self.assertIsNone(detect_edit_oscillation(msgs))
+        # Reversal on a different file is not oscillation either.
+        msgs[-1] = edit('b.py', 'x = 2', 'x = 1')
+        self.assertIsNone(detect_edit_oscillation(msgs))
+
+    def test_detect_edit_oscillation_untested_edit_streak(self):
+        def edit(path, old, new):
+            return {'role': 'assistant', 'tool_calls': [
+                {'function': {'name': 'edit',
+                              'arguments': json.dumps({'filePath': path,
+                                                       'oldString': old,
+                                                       'newString': new})}}]}
+
+        msgs = [{'role': 'user', 'content': 'fix it'},
+                edit('a.py', 'a', 'b'),
+                edit('a.py', 'b', 'c'),
+                edit('a.py', 'c', 'd')]
+        self.assertIsNone(detect_edit_oscillation(msgs))
+        msgs.append(edit('a.py', 'd', 'e'))
+        self.assertEqual(detect_edit_oscillation(msgs),
+                         {'oscillating': True, 'file': 'a.py', 'reason': 'untested_edit_streak'})
+        # A test run resets the streak.
+        tested = msgs[:4] + [{'role': 'assistant', 'tool_calls': [
+            {'function': {'name': 'bash', 'arguments': json.dumps({'command': 'pytest -q'})}}]},
+            edit('a.py', 'e', 'f')]
+        self.assertIsNone(detect_edit_oscillation(tested))
+
+    def test_proxy_injects_plateau_guard_notice_and_span(self):
+        upstream, captured = _scripted_upstream([{'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [{'role': 'user', 'content': 'fix it'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'function': {'name': 'edit',
+                                  'arguments': json.dumps({'path': 'a.py', 'old': 'x = 1',
+                                                           'new': 'x = 2'})}}]},
+                {'role': 'tool', 'content': 'ok'},
+                {'role': 'assistant', 'tool_calls': [
+                    {'function': {'name': 'edit',
+                                  'arguments': json.dumps({'path': 'a.py', 'old': 'x = 2',
+                                                           'new': 'x = 1'})}}]}]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 1)
+        forwarded = captured[0]['messages'][-1]['content']
+        self.assertIn('[HARNESS PLATEAU GUARD: you are oscillating on a.py (revert_cycle)', forwarded)
+        spans = [s for s in proxy.summary()['spans']
+                 if s.get('name') == 'guard.edit_oscillation']
+        self.assertEqual(len(spans), 1)
+        span = spans[0]
+        attrs = span.get('attributes', {})
+        self.assertTrue(attrs.get('guardrail.triggered'))
+        self.assertEqual(attrs.get('guardrail.file'), 'a.py')
+        self.assertEqual(attrs.get('guardrail.reason'), 'revert_cycle')
 
     def test_proxy_injects_guard_loop_warning(self):
         upstream, captured = _scripted_upstream([{'status': 200}] * 2)
@@ -626,11 +738,11 @@ class TestH6ProviderHealthStore(HarnessTestCase):
 
 
 class TestH8ProxyStaleReadCompaction(HarnessTestCase):
-    def test_proxy_compacts_stale_reads_from_turn_5(self):
-        upstream, captured = _scripted_upstream([{'status': 200}] * 5)
+    def test_proxy_compacts_stale_reads_on_epoch_turns(self):
+        upstream, captured = _scripted_upstream([{'status': 200}] * 7)
         proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:%d' % upstream.server_port)
         threading.Thread(target=proxy.serve_forever, daemon=True).start()
-        long_read = 'x' * 600
+        long_read = 'x' * 3000
         msgs = [{'role': 'user', 'content': 'update the file'},
                 {'role': 'assistant', 'tool_calls': [
                     {'id': 'r1', 'function': {'name': 'read_file',
@@ -639,23 +751,33 @@ class TestH8ProxyStaleReadCompaction(HarnessTestCase):
                 {'role': 'assistant', 'tool_calls': [
                     {'id': 'e1', 'function': {'name': 'edit',
                                               'arguments': json.dumps({'path': 'a.py'})}}]},
-                {'role': 'tool', 'tool_call_id': 'e1', 'content': 'ok'}]
+                {'role': 'tool', 'tool_call_id': 'e1', 'content': 'ok'},
+                {'role': 'user', 'content': 'keep going'},
+                {'role': 'assistant', 'content': 'working'},
+                {'role': 'user', 'content': 'status?'},
+                {'role': 'assistant', 'content': 'done'}]
         body = json.dumps({'model': GLM, 'messages': msgs}).encode()
         try:
-            for _ in range(5):
+            for _ in range(7):
                 _post_chat(proxy.base_url, body)
         finally:
             proxy.shutdown(); proxy.server_close()
             upstream.shutdown(); upstream.server_close()
-        self.assertEqual(len(captured), 5)
-        self.assertEqual(proxy.summary()['compacted_reads'], 1)  # only the turn >= 5 pass
-        self.assertNotIn('STALE READ COMPACTED', json.dumps(captured[3]))  # turn 4 untouched
-        self.assertNotIn('[STALE READ COMPACTED', json.dumps(captured[0]))
-        forwarded = captured[4]['messages'][2]['content']
+        self.assertEqual(len(captured), 7)
+        # H-30: only the epoch turn (turn_index >= 6 and turn_index % 3 == 0)
+        # busts the KV-cache prefix; turns 1-5 (captured[0..4]) and non-epoch
+        # turn 7 (captured[6]) forward the original body untouched.
+        self.assertEqual(proxy.summary()['compacted_reads'], 1)
+        self.assertNotIn('STALE READ COMPACTED', json.dumps(captured[2]))  # turn 3 (< 6) untouched
+        self.assertNotIn('[STALE READ COMPACTED', json.dumps(captured[0]))  # turn 1 untouched
+        self.assertNotIn('[STALE READ COMPACTED', json.dumps(captured[4]))  # turn 5 untouched
+        forwarded = captured[5]['messages'][2]['content']  # turn 6 (epoch) compacted
         self.assertIn('[STALE READ COMPACTED: a.py was modified in a later turn', forwarded)
-        self.assertNotIn(long_read, json.dumps(captured[4]))
-        # Later messages (edit result) pass through untouched.
-        self.assertEqual(captured[4]['messages'][4]['content'], 'ok')
+        self.assertNotIn(long_read, json.dumps(captured[5]))
+        self.assertNotIn('[STALE READ COMPACTED', json.dumps(captured[6]))  # turn 7 untouched
+        # Later messages (edit result, recent turns) pass through untouched.
+        self.assertEqual(captured[5]['messages'][4]['content'], 'ok')
+        self.assertEqual(captured[5]['messages'][8]['content'], 'done')
 
 
 class TestTelemetry(HarnessTestCase):
@@ -4521,6 +4643,204 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertTrue(cli_out)
             self.assertIn('tests_failed', cli_out)
             self.assertIn('Average reads before first edit', cli_out)
+
+
+class TestH31SwePruner(unittest.TestCase):
+    def _pytest_output(self, chars=6000):
+        filler = 'assertions/details line\n'
+        lines = ['=== FAILURES ===', '_ test_broken _', 'Traceback (most recent call last):',
+                 '  File "test_x.py", line 10, in test_broken', 'E   AssertionError: boom']
+        body = '\n'.join(lines)
+        while len(body) < chars:
+            body += filler
+        body += '\n=== short test summary info ===\nFAILED test_x.py::test_broken'
+        return body
+
+    def test_prune_compacts_bloated_pytest_output(self):
+        original = {'role': 'tool', 'tool_call_id': 'c1', 'content': self._pytest_output()}
+        messages = [{'role': 'user', 'content': 'run tests'}, original,
+                    {'role': 'assistant', 'content': 'ok'}]
+        new_messages, pruned = prune_noisy_tool_outputs(messages)
+        self.assertEqual(pruned, 1)
+        self.assertIsNot(new_messages[1], original)
+        # input is never mutated
+        self.assertGreater(len(original['content']), 4000)
+        pruned_content = new_messages[1]['content']
+        self.assertIn('[HARNESS SWE-PRUNER: noisy test output compacted]', pruned_content)
+        self.assertLess(len(pruned_content), len(original['content']))
+        self.assertLessEqual(len(pruned_content), 4000)
+        self.assertIn('FAILED test_x.py::test_broken', pruned_content)
+        self.assertIn('AssertionError: boom', pruned_content)
+        # non-tool messages pass through untouched
+        self.assertIs(new_messages[0], messages[0])
+        self.assertIs(new_messages[2], messages[2])
+
+    def test_prune_leaves_non_test_output_and_already_pruned_intact(self):
+        big_dump = 'x' * 6000  # large but not test output
+        already_pruned = 'FAILED test\n[HARNESS SWE-PRUNER: noisy test output compacted]'
+        messages = [
+            {'role': 'tool', 'tool_call_id': 'a', 'content': big_dump},
+            {'role': 'tool', 'tool_call_id': 'b', 'content': already_pruned + 'y' * 6000},
+            {'role': 'assistant', 'content': 'x' * 6000},
+        ]
+        snapshot = [m['content'] for m in messages]
+        new_messages, pruned = prune_noisy_tool_outputs(messages)
+        self.assertEqual(pruned, 0)
+        self.assertEqual([m['content'] for m in new_messages], snapshot)
+        self.assertIsNot(new_messages, messages)
+
+    def test_prune_respects_custom_max_tool_chars_and_threshold(self):
+        small = '=== FAILURES ===\nFAILED t\n' + 'z' * 100  # under threshold
+        messages = [{'role': 'tool', 'tool_call_id': 'c', 'content': small},
+                    {'role': 'tool', 'tool_call_id': 'd', 'content': self._pytest_output(800)}]
+        new_messages, pruned = prune_noisy_tool_outputs(messages, max_tool_chars=400)
+        self.assertEqual(pruned, 1)
+        self.assertEqual(new_messages[0]['content'], small)
+        self.assertIn('[HARNESS SWE-PRUNER:', new_messages[1]['content'])
+        self.assertLessEqual(len(new_messages[1]['content']), 400)
+
+
+class TestH29ValidateAndProxyWiring(HarnessTestCase):
+    """H-29: TEACHER_MODELS accepted by validate_task and new proxy wiring in run_task."""
+
+    def _task(self, root, **over):
+        wd = os.path.join(root, 'wd')
+        os.makedirs(wd, exist_ok=True)
+        target = os.path.join(wd, 'a.py')
+        with open(target, 'w', encoding='utf-8') as fh:
+            fh.write('VALUE = 0\n')
+        task = {
+            'task_id': 'h29-validate',
+            'directory': wd,
+            'files': [target],
+            'prompt': 'Set VALUE = 1 in ' + target,
+            'test_argv': [sys.executable, '-c', 'raise SystemExit(0)'],
+        }
+        task.update(over)
+        return task
+
+    def test_validate_task_teacher_models_and_new_fields(self):
+        from harness.routing import MODELS, TEACHER_MODELS
+        teacher = sorted(TEACHER_MODELS)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._task(tmp)
+            for model in sorted(MODELS | TEACHER_MODELS):
+                validated = validate_task({**base, 'model': model})
+                self.assertEqual(validated['model'], model)
+            validated = validate_task(dict(base))
+            self.assertEqual(validated['max_context_tokens'], 32000)
+            self.assertIsNone(validated['fallback_teacher_model'])
+            self.assertTrue(validated['enforce_egress_guard'])
+            self.assertFalse(validated['enforce_readonly_sql'])
+            self.assertEqual(validated['upstream_mode'], 'openrouter')
+            validated = validate_task(dict(
+                base, max_context_tokens=0, fallback_teacher_model=teacher,
+                enforce_egress_guard=False, enforce_readonly_sql=True,
+                upstream_mode='vllm'))
+            self.assertIsNone(validated['max_context_tokens'])
+            self.assertEqual(validated['fallback_teacher_model'], teacher)
+            self.assertFalse(validated['enforce_egress_guard'])
+            self.assertTrue(validated['enforce_readonly_sql'])
+            self.assertEqual(validated['upstream_mode'], 'vllm')
+            for bad in ({'model': 'openrouter/not-a-model'},
+                        {'max_context_tokens': -1},
+                        {'max_context_tokens': 'big'},
+                        {'fallback_teacher_model': 'nope'},
+                        {'enforce_egress_guard': 'yes'},
+                        {'enforce_readonly_sql': 1},
+                        {'upstream_mode': 'nope'}):
+                with self.assertRaises(GuardError):
+                    validate_task(dict(base, **bad))
+
+    def test_run_task_wires_health_store_and_proxy_options(self):
+        from unittest import mock
+        import harness.sandbox as sandbox_mod
+        from harness.routing import ProviderHealthStore
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._task(tmp, enforce_egress_guard=False, enforce_readonly_sql=True,
+                              upstream_mode='vllm')
+            task_path = os.path.join(tmp, 'task.json')
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump(base, fh)
+            cli_path = os.path.join(tmp, 'cli.py')
+            with open(cli_path, 'w', encoding='utf-8') as fh:
+                fh.write('print("ok")\n')
+            state_dir = os.path.join(tmp, 'state')
+            captured = {}
+
+            def fake_proxy(*args, **kwargs):
+                captured.update(kwargs)
+                stub = mock.MagicMock()
+                stub.base_url = None
+                stub.__enter__.return_value = stub
+                return stub
+
+            with mock.patch.object(sandbox_mod, 'openrouter_proxy', fake_proxy), \
+                    mock.patch.object(sandbox_mod, 'model_run'), \
+                    mock.patch.object(sandbox_mod, 'verify_db'), \
+                    mock.patch.object(sandbox_mod, 'snapshot', return_value=None):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf), contextlib.suppress(Exception):
+                    run_task(task_path, cli=cli_path, db=os.path.join(tmp, 'opencode.db'),
+                             state=state_dir, check=False, upstream_url='http://127.0.0.1:9')
+            self.assertIn('health_store', captured)
+            self.assertIsInstance(captured['health_store'], ProviderHealthStore)
+            self.assertEqual(captured['max_context_tokens'], 32000)
+            self.assertIsNone(captured['fallback_teacher_model'])
+            self.assertFalse(captured['enforce_egress_guard'])
+            self.assertTrue(captured['enforce_readonly_sql'])
+            self.assertEqual(captured['upstream_mode'], 'vllm')
+
+
+class TestH33RetryFeedbackDistillation(HarnessTestCase):
+    def test_feedback_lists_symbol_diff_and_respects_max_chars(self):
+        tmp = tempfile.mkdtemp()
+        state = os.path.join(tmp, 'state')
+        run_dir = Path(state) / 'runs' / 'abc123'
+        (run_dir / 'before').mkdir(parents=True)
+        (run_dir / 'after').mkdir(parents=True)
+        before_src = 'def foo():\n    return 1\n\nclass Bar:\n    pass\n\ndef gone():\n    return 3\n'
+        after_src = 'def foo():\n    return 2\n\nclass Bar:\n    pass\n\ndef fresh():\n    return 4\n'
+        (run_dir / 'before' / 'mod.py').write_text(before_src)
+        (run_dir / 'after' / 'mod.py').write_text(after_src)
+        (run_dir / 'events.jsonl').write_text(
+            json.dumps({'event': 'salvage_validation_started'}) + '\n'
+            + json.dumps({'event': 'run_finished'}) + '\n'
+            + 'not-json\n')
+        (run_dir / 'result.json').write_text(json.dumps(
+            {'task_id': 't33', 'status': 'blocked', 'reason': 'validation_failed',
+             'model': 'm', 'started_at': 1.0}))
+        feedback = build_prior_attempt_feedback(state, 't33')
+        self.assertIn('Modified symbols: foo()', feedback)
+        self.assertIn('Added symbols: fresh()', feedback)
+        self.assertIn('Dropped symbols: gone', feedback)
+        self.assertNotIn('Bar', feedback)
+        self.assertIn('salvage_validation_started', feedback)
+        self.assertNotIn('run_finished', feedback)
+        self.assertIn('validation_failed', feedback)
+        long_dir = Path(state) / 'runs' / 'def456'
+        (long_dir / 'before').mkdir(parents=True)
+        (long_dir / 'after').mkdir(parents=True)
+        big = 'def foo():\n    return 1\n\n' + '\n'.join(
+            f'def f{i}():\n    return {i}\n' for i in range(200))
+        (long_dir / 'before' / 'mod.py').write_text(big)
+        (long_dir / 'after' / 'mod.py').write_text(big.replace('return 1', 'return 2'))
+        (long_dir / 'result.json').write_text(json.dumps(
+            {'task_id': 't33b', 'status': 'blocked', 'reason': 'validation_failed',
+             'model': 'm', 'started_at': 1.0}))
+        capped = build_prior_attempt_feedback(state, 't33b', max_chars=1200)
+        self.assertLessEqual(len(capped), 1200)
+
+    def test_snapshot_files_for_feedback_writes_python_snapshots(self):
+        tmp = tempfile.mkdtemp()
+        src = Path(tmp) / 'a.py'
+        src.write_text('def foo():\n    return 1\n')
+        txt = Path(tmp) / 'b.txt'
+        txt.write_text('ignored')
+        _snapshot_files_for_feedback(Path(tmp) / 'run', [str(src), str(txt)], 'after')
+        self.assertEqual((Path(tmp) / 'run' / 'after' / str(src).replace('/', '__')).read_text(),
+                         'def foo():\n    return 1\n')
+        self.assertFalse((Path(tmp) / 'run' / 'after' / str(txt).replace('/', '__')).exists())
 
 
 if __name__ == '__main__':

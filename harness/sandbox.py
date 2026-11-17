@@ -61,7 +61,7 @@ from .finops import (
 from .guards import (build_file_skeletons, build_preloaded_file_excerpts,
                      extract_compact_test_failure)
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
-from .routing import DEFAULT_MODEL, MODELS
+from .routing import DEFAULT_MODEL, MODELS, TEACHER_MODELS, ProviderHealthStore
 
 MAX_STEPS = LIMITS['max_steps'][1]
 
@@ -157,8 +157,27 @@ def validate_task(raw):
     t['file_aliases'] = sorted(set(file_aliases))
     t['read_only_file_aliases'] = sorted(set(read_only_file_aliases))
     t.setdefault('model', DEFAULT_MODEL)
-    if t['model'] not in MODELS:
+    if t['model'] not in MODELS | TEACHER_MODELS:
         raise GuardError('unsupported_model')
+    t.setdefault('max_context_tokens', 32000)
+    if t['max_context_tokens'] is not None:
+        if type(t['max_context_tokens']) is not int or t['max_context_tokens'] < 0:
+            raise GuardError('invalid_max_context_tokens')
+        if t['max_context_tokens'] == 0:
+            t['max_context_tokens'] = None
+    t.setdefault('fallback_teacher_model', None)
+    if t['fallback_teacher_model'] is not None and \
+            t['fallback_teacher_model'] not in TEACHER_MODELS | MODELS:
+        raise GuardError('invalid_fallback_teacher_model')
+    t.setdefault('enforce_egress_guard', True)
+    if not isinstance(t['enforce_egress_guard'], bool):
+        raise GuardError('invalid_enforce_egress_guard')
+    t.setdefault('enforce_readonly_sql', False)
+    if not isinstance(t['enforce_readonly_sql'], bool):
+        raise GuardError('invalid_enforce_readonly_sql')
+    t.setdefault('upstream_mode', 'openrouter')
+    if t['upstream_mode'] not in ('openrouter', 'vllm', 'openai'):
+        raise GuardError('invalid_upstream_mode')
     if t.get('reasoning_max_tokens') is not None:
         val = t['reasoning_max_tokens']
         if type(val) is not int or val <= 0:
@@ -459,7 +478,41 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
 def file_hashes(files):
     return {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() if Path(p).exists() else None for p in files}
 
-def build_prior_attempt_feedback(state, task_id, *, max_patch_chars=1500):
+def _python_top_symbols(source):
+    """Top-level function/class names mapped to body hashes (H-33)."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    symbols = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            try:
+                symbols[node.name] = hashlib.sha256(ast.dump(node).encode()).hexdigest()
+            except (AttributeError, RecursionError, ValueError):
+                continue
+    return symbols
+
+def _snapshot_files_for_feedback(run_dir, files, tag):
+    """Save plain-bytes snapshots of Python files under run_dir/<tag>/ (H-33)."""
+    out = Path(run_dir) / tag
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for name in files:
+            if not str(name).endswith('.py'):
+                continue
+            p = Path(name)
+            safe = str(name).replace('/', '__').replace('\\', '__')
+            target = out / safe
+            if p.exists():
+                target.write_bytes(p.read_bytes())
+            elif target.exists():
+                target.unlink()
+    except OSError:
+        pass
+
+def build_prior_attempt_feedback(state, task_id, *, max_patch_chars=1500, max_chars=1200):
     """Compact feedback from earlier completed runs of the same task_id."""
     runs_dir = Path(state) / 'runs'
     matches = []
@@ -501,9 +554,52 @@ def build_prior_attempt_feedback(state, task_id, *, max_patch_chars=1500):
                 errors='replace')[:max_patch_chars]
     except OSError:
         pass
-    return (f'\n\n[PRIOR_ATTEMPT_FEEDBACK — previous run on this task_id failed with '
-            f'reason={reason} on model={model}; avoid repeating the same mistake]:'
-            + sections)
+    # H-33: symbol-level diff between before/after Python snapshots of the
+    # failed attempt, plus a one-line guardrail/salvage event summary.
+    extra = ''
+    try:
+        before_dir, after_dir = last_dir / 'before', last_dir / 'after'
+        if before_dir.is_dir() and after_dir.is_dir():
+            names = sorted({p.name for p in before_dir.iterdir()} | {p.name for p in after_dir.iterdir()})
+            added, modified, dropped = [], [], []
+            for name in names:
+                b_path, a_path = before_dir / name, after_dir / name
+                b = _python_top_symbols(b_path.read_text(errors='replace')) if b_path.is_file() else {}
+                a = _python_top_symbols(a_path.read_text(errors='replace')) if a_path.is_file() else {}
+                added += [f'{sym}()' for sym in sorted(set(a) - set(b))]
+                modified += [f'{sym}()' for sym in sorted(set(a) & set(b)) if a[sym] != b[sym]]
+                dropped += sorted(set(b) - set(a))
+            diff_lines = []
+            if modified:
+                diff_lines.append('Modified symbols: ' + ', '.join(modified))
+            if added:
+                diff_lines.append('Added symbols: ' + ', '.join(added))
+            if dropped:
+                diff_lines.append('Dropped symbols: ' + ', '.join(dropped))
+            if diff_lines:
+                extra += '\n[SYMBOL DIFF vs last attempt]:\n' + '\n'.join(diff_lines)
+    except OSError:
+        pass
+    try:
+        events_path = last_dir / 'events.jsonl'
+        if events_path.is_file():
+            notable = []
+            for line in events_path.read_text(errors='replace').splitlines():
+                try:
+                    name = str(json.loads(line).get('event') or '')
+                except ValueError:
+                    continue
+                if name and any(k in name for k in ('guard', 'salvage', 'repair', 'hint', 'reconcile')) \
+                        and name not in notable:
+                    notable.append(name)
+            if notable:
+                extra += '\n[Previous attempt guardrail events]: ' + ', '.join(notable[:8])
+    except OSError:
+        pass
+    feedback = (f'\n\n[PRIOR_ATTEMPT_FEEDBACK — previous run on this task_id failed with '
+                f'reason={reason} on model={model}; avoid repeating the same mistake]:'
+                + extra + sections)
+    return feedback[:max_chars] if len(feedback) > max_chars else feedback
 
 @contextmanager
 def isolated_worktree(task, run_dir):
@@ -606,6 +702,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             private_write(run_dir / 'result.json', result)
             private_write(run_dir / 'task.json', task)
             capture_files(run_dir, tracked)
+            _snapshot_files_for_feedback(run_dir, task['files'], 'before')
             event(run_dir, 'run_started', task_id=task['task_id'], mode=task['mode'])
             validation_attempted = False
             proxy = None
@@ -637,12 +734,19 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             if m_cur['steps'] >= active_max_steps[0] and not m_cur['unfinished']:
                                 return 'step_limit'
                             return None
+                        health_store = ProviderHealthStore(state / 'provider_health.json')
                         proxy = stack.enter_context(openrouter_proxy(
                             _gate, upstream_url=upstream_url or OPENROUTER_UPSTREAM,
                             request_timeout=max(15, min(int(task['timeout_seconds']), 60)),
                             default_model=task['model'],
                             reasoning_max_tokens=task.get('reasoning_max_tokens'),
-                            allowed_files=task.get('files')))
+                            allowed_files=task.get('files'),
+                            health_store=health_store,
+                            max_context_tokens=task.get('max_context_tokens'),
+                            fallback_teacher_model=task.get('fallback_teacher_model'),
+                            enforce_egress_guard=task.get('enforce_egress_guard', True),
+                            enforce_readonly_sql=task.get('enforce_readonly_sql', False),
+                            upstream_mode=task.get('upstream_mode', 'openrouter')))
                     base_url = (proxy.base_url if proxy is not None
                                 else ('http://127.0.0.1:9/api/v1' if (check and is_real_cli) else None))
                     preflight(cli, task, run_dir, base_url=base_url)
@@ -671,6 +775,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     and str(exc) in ('step_limit', 'worker_timeout')
                                     and _fh(task['files']) != result['hashes_before']):
                                 capture_files(run_dir, tracked)
+                                _snapshot_files_for_feedback(run_dir, task['files'], 'after')
                                 salvage_candidate = str(exc)
                                 event(run_dir, 'salvage_validation_started', reason=salvage_candidate)
                             else:
@@ -764,6 +869,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                 try:
                     result['hashes_after'] = _fh(task['files'])
                     capture_files(run_dir, tracked)
+                    _snapshot_files_for_feedback(run_dir, task['files'], 'after')
                     # A failed worker can leave useful changes. Validate them once,
                     # but never turn that into execution success or settled billing.
                     if (not check and task['mode'] == 'model' and result['session_id']

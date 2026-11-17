@@ -23,8 +23,10 @@ from .guards import (
     compact_context_window,
     compact_stale_reads,
     detect_duplicate_tool_calls,
+    detect_edit_oscillation,
     estimate_messages_tokens,
     extract_compact_test_failure,
+    prune_noisy_tool_outputs,
 )
 from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
                     STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
@@ -45,7 +47,8 @@ from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
                         sync_state_traces_to_phoenix, synthesize_spans_from_run_dir)
 from .sandbox import (
     CLI, DB, LIMITS, STATE,
-    _reconcile_locked, auto_reconcile_from_proxy, build_unexposed_settlement_evidence,
+    _reconcile_locked, auto_reconcile_from_proxy, build_prior_attempt_feedback,
+    build_unexposed_settlement_evidence,
     can_settle_from_proxy_local, capture_files, capture_requests, check_patch, config_for,
     connect, event, execute, executable_argv, fetch_generation, fetch_generation_settled,
     file_hashes, interruptions, isolated_worktree, locks, main, metrics, model_run,
@@ -57,8 +60,9 @@ from .sandbox import (
 __all__ = [
     '__version__',
     'check_allowed_files_syntax', 'check_sql_syntax', 'collect_python_top_symbols',
-    '_message_text', 'detect_duplicate_tool_calls', '_sql_skeleton_lines',
-    'build_file_skeletons', 'build_preloaded_file_excerpts', 'extract_compact_test_failure', 'compact_stale_reads',
+    '_message_text', 'detect_duplicate_tool_calls', 'detect_edit_oscillation', '_sql_skeleton_lines',
+    'build_file_skeletons', 'build_preloaded_file_excerpts', 'extract_compact_test_failure',
+    'prune_noisy_tool_outputs', 'compact_stale_reads', 'build_prior_attempt_feedback',
     'OPENROUTER_UPSTREAM', 'GEN_ID_RE', 'STREAM_COST_RE', 'PROVIDER_LATENCY_THRESHOLD_SECONDS',
     'GuardError', 'OpenRouterGuardProxy', 'openrouter_proxy',
     'DEFAULT_MODEL', 'MODELS', 'FP8_PROVIDER_ROUTING', 'GLM_53_FLASH_PROVIDER_ROUTING',

@@ -28,8 +28,10 @@ from .guards import (
     compact_context_window,
     compact_stale_reads,
     detect_duplicate_tool_calls,
+    detect_edit_oscillation,
     inject_edit_failure_hints,
     inject_read_guard_hints,
+    prune_noisy_tool_outputs,
 )
 from .routing import ProviderHealthStore, apply_provider_routing
 from .telemetry import HarnessTracer
@@ -362,6 +364,20 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                                                                'guardrail.triggered': True,
                                                                'guardrail.warnings': '; '.join(loop_warnings),
                                                                'harness.turn_index': turn_index})
+            # H-32: edit-oscillation / untested-edit plateau guard.
+            if isinstance(messages, list):
+                osc = detect_edit_oscillation(messages)
+                if osc:
+                    notices.append(
+                        f"[HARNESS PLATEAU GUARD: you are oscillating on {osc['file']} "
+                        f"({osc['reason']}) — run the tests or rethink the root cause instead of "
+                        f"repeating edits]")
+                    self.server.tracer.record_span('guard.edit_oscillation', kind='GUARDRAIL', status='ERROR',
+                                                   attributes={'guardrail.name': 'edit_oscillation',
+                                                               'guardrail.triggered': True,
+                                                               'guardrail.file': osc['file'],
+                                                               'guardrail.reason': osc['reason'],
+                                                               'harness.turn_index': turn_index})
             if notices and messages:
                 last = messages[-1]
                 if isinstance(last, dict):
@@ -406,10 +422,19 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                             'harness.turn_index': turn_index,
                         },
                     )
-            # H-8: on later turns, compact stale read outputs the guard cannot
-            # rewrite in place (notice injection already re-encoded the body).
-            if turn_index >= 5 and isinstance(payload, dict) and isinstance(payload.get('messages'), list):
-                new_msgs, compacted = compact_stale_reads(payload['messages'], turn_index=turn_index)
+            # H-30: only on epoch turns (turn_index >= 6, every 3rd turn) and
+            # only when the rewrite saves enough characters to justify busting
+            # the upstream KV-cache prefix; minor re-reads stay untouched so
+            # cached prefixes remain valid on intermediate turns.
+            if (
+                turn_index >= 6
+                and turn_index % 3 == 0
+                and isinstance(payload, dict)
+                and isinstance(payload.get('messages'), list)
+            ):
+                new_msgs, compacted = compact_stale_reads(
+                    payload['messages'], turn_index=turn_index, min_total_saved_chars=2400
+                )
                 if compacted > 0:
                     payload['messages'] = new_msgs
                     with self.server._lock:
@@ -420,6 +445,24 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                                                                'guardrail.triggered': True,
                                                                'harness.compacted_count': compacted,
                                                                'harness.turn_index': turn_index})
+            # H-31: SWE-Pruner Lite — compact bloated test/traceback tool
+            # outputs before the context-budget compaction runs, so oversized
+            # pytest dumps never reach the upstream prompt.
+            if isinstance(payload, dict) and isinstance(payload.get('messages'), list):
+                pruned_msgs, pruned_count = prune_noisy_tool_outputs(payload['messages'])
+                if pruned_count > 0:
+                    payload['messages'] = pruned_msgs
+                    body = json.dumps(payload).encode('utf-8')
+                    self.server.tracer.record_span(
+                        'guard.swe_pruner',
+                        kind='GUARDRAIL',
+                        attributes={
+                            'guardrail.name': 'swe_pruner',
+                            'guardrail.triggered': True,
+                            'harness.pruned_tool_outputs': pruned_count,
+                            'harness.turn_index': turn_index,
+                        },
+                    )
             if (
                 self.server.max_context_tokens is not None
                 and isinstance(payload, dict)

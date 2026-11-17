@@ -40,9 +40,11 @@ __all__ = [
     "compact_context_window",
     "compact_stale_reads",
     "detect_duplicate_tool_calls",
+    "detect_edit_oscillation",
     "estimate_messages_tokens",
     "extract_compact_test_failure",
     "inject_edit_failure_hints",
+    "prune_noisy_tool_outputs",
 ]
 
 #: Forbidden keys that must never leave the local harness in an LLM egress payload.
@@ -834,6 +836,92 @@ def detect_duplicate_tool_calls(messages: Iterable[Mapping[str, Any]] | None) ->
     return []
 
 
+# H-32: edit tools whose arguments carry (file, oldString, newString) tuples.
+_EDIT_OSCILLATION_TOOLS = {'edit', 'replace', 'multi_edit', 'patch'}
+_EDIT_FILE_KEYS = ('file_path', 'filePath', 'path', 'file')
+_EDIT_OLD_KEYS = ('old_string', 'oldString', 'old')
+_EDIT_NEW_KEYS = ('new_string', 'newString', 'new')
+
+
+def _extract_edit_call(tool_name: str, raw_arguments: Any) -> tuple[str, str, str] | None:
+    """Return a normalized (filePath, oldString, newString) tuple for an edit call."""
+    if tool_name not in _EDIT_OSCILLATION_TOOLS:
+        return None
+    if isinstance(raw_arguments, (dict, list)):
+        arguments = raw_arguments
+    else:
+        try:
+            arguments = json.loads(raw_arguments)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(arguments, Mapping):
+        return None
+
+    def _first(keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = arguments.get(key)
+            if isinstance(value, str):
+                return value
+        return ''
+
+    file_path = _first(_EDIT_FILE_KEYS)
+    if not file_path:
+        return None
+    return file_path, _first(_EDIT_OLD_KEYS), _first(_EDIT_NEW_KEYS)
+
+
+def detect_edit_oscillation(messages: Iterable[Mapping[str, Any]] | None) -> dict[str, str] | None:
+    """H-32: detect edit oscillation / untested edit plateaus.
+
+    Scans assistant ``tool_calls`` for edit tools and returns a dict when
+    either:
+    - ``revert_cycle``: the latest edit on a file exactly reverses an earlier
+      edit on the same file (``latest.oldString == prior.newString`` and
+      ``latest.newString == prior.oldString``, with non-empty strings), or
+    - ``untested_edit_streak``: the same file was edited >= 4 times without any
+      intervening ``bash``/``test`` tool call.
+
+    Returns ``None`` when no oscillation is detected.
+    """
+    edit_calls: list[tuple[str, str, str]] = []
+    streaks: dict[str, int] = {}
+    for message in (messages or []):
+        if not isinstance(message, Mapping):
+            continue
+        if message.get('role') != 'assistant':
+            continue
+        tool_calls = message.get('tool_calls')
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, Mapping):
+                continue
+            function = tool_call.get('function') or {}
+            if not isinstance(function, Mapping):
+                function = {}
+            tool_name = str(function.get('name') or tool_call.get('name') or '')
+            if tool_name in ('bash', 'test'):
+                streaks.clear()
+            call = _extract_edit_call(tool_name, function.get('arguments', ''))
+            if call:
+                edit_calls.append(call)
+                file_path = call[0]
+                streaks[file_path] = streaks.get(file_path, 0) + 1
+                if streaks[file_path] >= 4:
+                    return {'oscillating': True, 'file': file_path,
+                            'reason': 'untested_edit_streak'}
+
+    if len(edit_calls) >= 2:
+        latest_file, latest_old, latest_new = edit_calls[-1]
+        for prior_file, prior_old, prior_new in edit_calls[:-1]:
+            if prior_file != latest_file:
+                continue
+            if (latest_old and latest_new and latest_old == prior_new
+                    and latest_new == prior_old):
+                return {'oscillating': True, 'file': latest_file, 'reason': 'revert_cycle'}
+    return None
+
+
 _EDIT_MISMATCH_RE = re.compile(
     r"(?:oldstring not found|old_string not found|could not find oldstring|failed to match"
     r"|no exact match|found \d+ matches for oldstring|oldstring and newstring are identical)",
@@ -1354,7 +1442,9 @@ def build_preloaded_file_excerpts(
     return header + "\n".join(chunks) + "\n\n"
 
 
-def extract_compact_test_failure(stdout: str, stderr: str, max_lines: int = 25) -> str:
+def extract_compact_test_failure(
+    stdout: str, stderr: str = '', max_lines: int = 25, max_chars: int | None = None
+) -> str:
     """Compact, bounded digest of a test failure for a micro-repair prompt.
 
     Scans ``stdout`` + ``stderr`` and keeps ``FAILED`` summary lines, ``E   ``
@@ -1384,9 +1474,65 @@ def extract_compact_test_failure(stdout: str, stderr: str, max_lines: int = 25) 
         picked.append((last_file_index, lines[last_file_index]))
     picked.sort()
     if picked:
-        return "\n".join(line for _, line in picked[:max_lines])
-    non_empty = [line for line in lines if line.strip()]
-    return "\n".join(non_empty[-min(max_lines, 10) :])
+        result = "\n".join(line for _, line in picked[:max_lines])
+    else:
+        non_empty = [line for line in lines if line.strip()]
+        result = "\n".join(non_empty[-min(max_lines, 10) :])
+    if max_chars is not None and len(result) > max_chars:
+        kept: list[str] = []
+        total = 0
+        for line in result.splitlines():
+            if total + len(line) + 1 > max_chars and kept:
+                break
+            kept.append(line)
+            total += len(line) + 1
+        result = "\n".join(kept)
+    return result
+
+
+_SWE_PRUNER_MARKER = '[HARNESS SWE-PRUNER:'
+_NOISY_TEST_MARKERS = (
+    '=== FAILURES ===',
+    '=== ERRORS ===',
+    'Traceback (most recent call last):',
+    'short test summary info',
+)
+
+
+def prune_noisy_tool_outputs(messages: list[dict], max_tool_chars: int = 4000) -> tuple[list[dict], int]:
+    """H-31 SWE-Pruner Lite: compact bloated test/traceback tool outputs.
+
+    Scans ``messages`` for ``role == 'tool'`` messages whose string content
+    exceeds ``max_tool_chars`` and has not already been pruned. Content that
+    looks like pytest/unittest output (failures header, errors header,
+    traceback, or short summary) is replaced by a compact digest from
+    :func:`extract_compact_test_failure` plus a pruner marker line. Non-test
+    outputs (e.g. large file dumps) are left intact.
+
+    Returns ``(new_messages, pruned_count)``. The input list is never mutated;
+    when ``pruned_count == 0`` the original message dicts are reused as-is.
+    """
+    pruned = 0
+    new_messages: list[dict] = []
+    for message in messages:
+        if (
+            isinstance(message, dict)
+            and message.get('role') == 'tool'
+            and isinstance(message.get('content'), str)
+            and len(message['content']) > max_tool_chars
+            and _SWE_PRUNER_MARKER not in message['content']
+            and any(marker in message['content'] for marker in _NOISY_TEST_MARKERS)
+        ):
+            compacted = extract_compact_test_failure(
+                message['content'], max_lines=45, max_chars=max_tool_chars
+            )
+            new_message = dict(message)
+            new_message['content'] = compacted + '\n' + _SWE_PRUNER_MARKER + ' noisy test output compacted]'
+            new_messages.append(new_message)
+            pruned += 1
+        else:
+            new_messages.append(message)
+    return new_messages, pruned
 
 
 def _stale_tool_file_path(arguments: Any) -> str:
@@ -1433,22 +1579,31 @@ def _stale_tool_calls(message: Mapping[str, Any]) -> Iterable[tuple[str, str, st
 
 def compact_stale_reads(
     messages: list[dict],
+    turn_index: int = 0,
+    keep_recent_turns: int = 4,
+    min_chars: int = 600,
+    min_total_saved_chars: int = 0,
     *,
-    turn_index: int = 1,
-    min_turn: int = 5,
-    char_threshold: int = 400,
+    min_turn: int = 1,
+    char_threshold: int | None = None,
 ) -> tuple[list[dict], int]:
-    """H-8: drop long read outputs that a later edit made stale.
+    """H-8/H-30: drop long read outputs that a later edit made stale.
 
     Maps ``tool_call_id`` to ``(tool_name, file_path)`` across assistant
     ``tool_calls`` (arguments inspected for ``path``-style keys), records the
     last message index at which each file was touched by an edit/write/patch
     tool, and replaces every earlier read-tool result on that path whose text
-    exceeds ``char_threshold`` with a compact placeholder. Returns the new
-    (shallow-copied) message list and the number of results compacted; before
-    ``min_turn`` or for non-list input the messages pass through untouched.
+    exceeds ``min_chars`` with a compact placeholder. Moonshot-style
+    KV-cache-prefix preservation (H-30): messages inside the trailing
+    ``keep_recent_turns`` window are never rewritten, and when the total
+    characters saved across all candidates is below ``min_total_saved_chars``
+    the original list is returned untouched so the upstream KV-cache prefix
+    stays valid. Returns the new (shallow-copied) message list and the number
+    of results compacted; for non-list input the messages pass through.
     """
-    if turn_index < min_turn or not isinstance(messages, list):
+    if char_threshold is not None:
+        min_chars = char_threshold
+    if turn_index < max(1, min_turn) or not isinstance(messages, list):
         return (messages, 0)
     call_map: dict[str, tuple[str, str]] = {}
     last_edit_idx: dict[str, int] = {}
@@ -1464,8 +1619,7 @@ def compact_stale_reads(
                 last_edit_idx[file_path] = index
     if not last_edit_idx:
         return (messages, 0)
-    new_messages = list(messages)
-    compacted = 0
+    recent_floor = len(messages) - max(keep_recent_turns, 0)
 
     def is_stale_read(call_id: Any, index: int) -> tuple[str, str] | None:
         mapped = call_map.get(call_id) if isinstance(call_id, str) else None
@@ -1474,40 +1628,57 @@ def compact_stale_reads(
         tool_name, file_path = mapped
         if file_path not in last_edit_idx or index >= last_edit_idx[file_path]:
             return None
+        if index >= recent_floor:
+            return None
         if not any(marker in tool_name for marker in _STALE_READ_MARKERS):
             return None
         return file_path
 
+    # First pass: collect candidates without mutating anything, so the whole
+    # compaction can be vetoed when it would save too little to justify
+    # invalidating the upstream KV-cache prefix (H-30).
+    candidates: list[tuple[int, int | None, str, int]] = []
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
         if message.get("role") == "tool":
             stale = is_stale_read(message.get("tool_call_id"), index)
-            if stale is not None and len(_message_text(message)) > char_threshold:
-                new_messages[index] = {
-                    **message,
-                    "content": _STALE_READ_NOTICE.format(path=stale),
-                }
-                compacted += 1
+            if stale is not None and len(_message_text(message)) > min_chars:
+                candidates.append((index, None, stale, len(_message_text(message))))
         content = message.get("content")
         if not isinstance(content, list):
             continue
-        new_content: list[Any] | None = None
         for block_index, block in enumerate(content):
             if not (isinstance(block, dict) and block.get("type") == "tool_result"):
                 continue
             stale = is_stale_read(block.get("tool_use_id"), index)
-            if stale is None or len(_message_text({"content": block.get("content")})) <= char_threshold:
+            if stale is None:
                 continue
-            if new_content is None:
-                new_content = list(content)
-            new_content[block_index] = {
-                **block,
-                "content": _STALE_READ_NOTICE.format(path=stale),
+            text_len = len(_message_text({"content": block.get("content")}))
+            if text_len > min_chars:
+                candidates.append((index, block_index, stale, text_len))
+    total_saved_chars = sum(
+        text_len - len(_STALE_READ_NOTICE.format(path=stale))
+        for _, _, stale, text_len in candidates
+    )
+    if total_saved_chars < min_total_saved_chars:
+        return (messages, 0)
+    new_messages = list(messages)
+    compacted = 0
+    for index, block_index, stale, _text_len in candidates:
+        notice = _STALE_READ_NOTICE.format(path=stale)
+        if block_index is None:
+            message = new_messages[index]
+            new_messages[index] = {**message, "content": notice}
+        else:
+            message = new_messages[index]
+            content = list(message["content"])
+            content[block_index] = {
+                **content[block_index],
+                "content": notice,
             }
-            compacted += 1
-        if new_content is not None:
-            new_messages[index] = {**message, "content": new_content}
+            new_messages[index] = {**message, "content": content}
+        compacted += 1
     return (new_messages, compacted)
 
 
