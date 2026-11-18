@@ -66,6 +66,16 @@ from .routing import DEFAULT_MODEL, MODELS, TEACHER_MODELS, ProviderHealthStore
 
 MAX_STEPS = LIMITS['max_steps'][1]
 
+ESCALATABLE_BLOCK_REASONS = frozenset({
+    'validation_failed',
+    'worker_timeout',
+    'repeated_file_read_without_write',
+    'repeated_tool_error',
+    'step_limit',
+    'model_error',
+    'no_change',
+})
+
 CLI = os.environ.get("HARNESS_CLI") or os.environ.get("OPENCODE_CLI") or "/Applications/OpenCode.app/Contents/Resources/opencode-cli"
 # The durable journal stays next to the launcher facade when loaded via opencode_guard;
 # otherwise use finops.STATE (which honors HARNESS_STATE_DIR).
@@ -163,13 +173,16 @@ def validate_task(raw):
     t.setdefault('strategy', 'single')
     if t['strategy'] not in ('single', 'best_of_2'):
         raise GuardError('invalid_strategy')
+    t.setdefault('auto_escalate', False)
+    if not isinstance(t['auto_escalate'], bool):
+        raise GuardError('invalid_auto_escalate_flag')
     t.setdefault('candidate_models', None)
     if t['candidate_models'] is not None:
         cm = t['candidate_models']
         if (not isinstance(cm, list) or not 1 <= len(cm) <= 2
                 or any(not isinstance(m, str) or m not in MODELS | TEACHER_MODELS for m in cm)):
             raise GuardError('invalid_candidate_models')
-    if t['strategy'] == 'best_of_2' and t['candidate_models'] is None:
+    if (t['strategy'] == 'best_of_2' or t['auto_escalate']) and t['candidate_models'] is None:
         t['candidate_models'] = [t['model'],
                                  t.get('fallback_teacher_model') or 'openrouter/deepseek/deepseek-v4.1-flash-1017']
     t.setdefault('max_context_tokens', 32000)
@@ -392,12 +405,29 @@ def preflight(cli, task, run_dir, *, base_url=None):
 def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref=None):
     sid = result['session_id']
     skeletons = build_file_skeletons(task['files'])
+    if '[CURRENT_PATCH]' not in task['prompt']:
+        excerpts = build_preloaded_file_excerpts(
+            list(task['files']) + list(task.get('read_only_files', ())), task['prompt'],
+            read_only_files=task.get('read_only_files', []))
+    else:
+        excerpts = ''
     ro_line = ''
     if task.get('read_only_files'):
         ro_line = ('\nRead-only reference files (do NOT edit): '
                    + json.dumps(task['read_only_files']))
+    if 'COMPLETE FILE PRELOADED' in excerpts:
+        read_instruction = (
+            'Files marked COMPLETE FILE PRELOADED above are already provided in full — '
+            'do NOT call read on them; edit directly. Batch any other needed reads into '
+            'your first turn and batch edits together.\n'
+        )
+    else:
+        read_instruction = (
+            'Batch all needed file reads into your first turn and batch edits together; '
+            'do not loop one small read/edit per turn.\n'
+        )
     prompt = ('Read/edit ONLY the listed files; do NOT run find/glob or search for Python interpreters.\n'
-              'Batch all needed file reads into your first turn and batch edits together; do not loop one small read/edit per turn.\n'
+              + read_instruction
               + json.dumps(task['files']) + ro_line + '\n' + task['prompt']
               + '\nNo shell is available. The supervisor runs this exact validation AFTER you exit: '
               + json.dumps(task['test_argv'])
@@ -408,12 +438,6 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
                   + '. Source files are read-only. Do not reconstruct whole files. '
                   'No shell or network. Exit immediately after writing the patch; no extra summary call. '
                   'The supervisor checks the patch without applying it; testing follows reviewed application.')
-    if '[CURRENT_PATCH]' not in task['prompt']:
-        excerpts = build_preloaded_file_excerpts(
-            list(task['files']) + list(task.get('read_only_files', ())), task['prompt'],
-            read_only_files=task.get('read_only_files', []))
-    else:
-        excerpts = ''
     prompt = skeletons + excerpts + prompt
     argv = [str(cli), 'run', '--standalone', '--auto', '--format', 'json', '--agent', 'guarded_worker',
             '--session', sid, '--title', task['task_id'], '--model', task['model'], prompt]
@@ -510,6 +534,93 @@ def _python_top_symbols(source):
             except (AttributeError, RecursionError, ValueError):
                 continue
     return symbols
+
+
+def build_micro_repair_prompt(task, run_dir, originals=None):
+    """Assemble a zero-read micro-repair prompt (H-41).
+
+    Includes the current patch, a Python symbol diff against the pre-attempt
+    snapshot, preloaded on-disk excerpts and the compact test failure so the
+    repair attempt applies a targeted edit without re-reading files.
+    """
+    run_dir = Path(run_dir)
+    try:
+        test_log_text = (run_dir / 'test.log').read_text(errors='replace')
+    except OSError:
+        test_log_text = ''
+    compact_failure = extract_compact_test_failure(test_log_text, '')
+    try:
+        current_patch = (run_dir / 'changes.patch').read_text(errors='replace')[:3000]
+    except OSError:
+        current_patch = ''
+    trajspec_lines: list[str] = []
+    if originals:
+        file_names = sorted(set(originals) | set(task.get('files', ())))
+        modified: list[str] = []
+        added: list[str] = []
+        dropped: list[str] = []
+        for name in file_names:
+            if not str(name).endswith('.py'):
+                continue
+            before_src = originals.get(name)
+            before_symbols = (
+                _python_top_symbols(before_src.decode('utf-8', errors='replace'))
+                if isinstance(before_src, (bytes, bytearray)) else {}
+            )
+            p = Path(name)
+            after_src = p.read_bytes() if p.is_file() else None
+            after_symbols = (
+                _python_top_symbols(after_src.decode('utf-8', errors='replace'))
+                if isinstance(after_src, (bytes, bytearray)) else {}
+            )
+            for symbol in sorted(set(before_symbols) | set(after_symbols)):
+                if symbol in before_symbols and symbol not in after_symbols:
+                    dropped.append(symbol)
+                elif symbol not in before_symbols and symbol in after_symbols:
+                    added.append(symbol)
+                elif before_symbols[symbol] != after_symbols[symbol]:
+                    modified.append(symbol)
+        if modified:
+            trajspec_lines.append('Modified symbols: ' + ', '.join(modified))
+        if added:
+            trajspec_lines.append('Added symbols: ' + ', '.join(added))
+        if dropped:
+            trajspec_lines.append('Dropped symbols: ' + ', '.join(dropped))
+    # Long files (>150 lines) are only preloaded when the query carries an
+    # explicit line range; seed the query with ranges parsed from the raw
+    # test log (tracebacks / "file.py:155:" patterns) so the failing lines
+    # always land in [CURRENT_ON_DISK_EXCERPTS].
+    try:
+        from harness.guards import _parse_prompt_line_ranges
+        range_markers = ['L%d-L%d' % (a, b)
+                         for a, b in _parse_prompt_line_ranges(test_log_text)][:8]
+    except Exception:
+        range_markers = []
+    excerpts_query = task['prompt'] + '\n' + compact_failure
+    if range_markers:
+        excerpts_query += '\n' + ' '.join(range_markers)
+    excerpts = build_preloaded_file_excerpts(
+        list(task['files']) + list(task.get('read_only_files', ())),
+        excerpts_query,
+        read_only_files=task.get('read_only_files', []),
+    )
+    prompt = (
+        task['prompt']
+        + '\n\n[CURRENT_PATCH]\n'
+        + current_patch
+    )
+    if trajspec_lines:
+        prompt += '\n\n[TRAJSPEC_MODIFIED_SYMBOLS]\n' + '\n'.join(trajspec_lines)
+    if excerpts:
+        prompt += '\n\n[CURRENT_ON_DISK_EXCERPTS]\n' + excerpts
+    prompt += (
+        '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
+        'Apply the minimal targeted edit directly to fix the failure above; '
+        'do NOT re-read entire files from scratch.\n'
+        + compact_failure
+    )
+    return prompt
+
 
 def _snapshot_files_for_feedback(run_dir, files, tag):
     """Save plain-bytes snapshots of Python files under run_dir/<tag>/ (H-33)."""
@@ -692,8 +803,11 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             raw_strategy = json.loads(Path(task_path).read_text())
         except (OSError, ValueError):
             raw_strategy = {}
-        if isinstance(raw_strategy, dict) and raw_strategy.get('strategy') == 'best_of_2' \
-                and raw_strategy.get('mode', 'model') == 'model':
+        if (
+            isinstance(raw_strategy, dict)
+            and (raw_strategy.get('strategy') == 'best_of_2' or raw_strategy.get('auto_escalate') is True)
+            and raw_strategy.get('mode', 'model') == 'model'
+        ):
             return run_best_of_2(task_path, cli=cli, db=db, state=state,
                                  upstream_url=upstream_url, fetch=fetch)
     result = {'status': 'rejected', 'reason': '', 'artifact': None}
@@ -790,6 +904,8 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                         if snapshot(db, sid) is not None:
                             raise GuardError('session_id_collision')
                         result['session_id'] = sid
+                        originals = {name: (Path(name).read_bytes() if Path(name).is_file() else None)
+                                     for name in task['files']}
                         if task.get('include_prior_feedback', True):
                             prior_feedback = build_prior_attempt_feedback(state, task['task_id'])
                             if prior_feedback:
@@ -835,22 +951,12 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     and result.get('cost') is not None
                                     and result.get('steps', 0) <= task['max_steps']
                                     and result['cost'] <= min(budget * 0.8, 0.08)):
-                                compact_failure = extract_compact_test_failure(
-                                    (run_dir / 'test.log').read_text(errors='replace'), '')
-                                current_patch = (run_dir / 'changes.patch').read_text(errors='replace')[:4000]
                                 repair_max_steps = compute_repair_max_steps(task)
                                 active_max_steps[0] = repair_max_steps
                                 repair_task = dict(
                                     task,
                                     max_steps=repair_max_steps,
-                                    prompt=(
-                                        task['prompt']
-                                        + '\n\n[CURRENT_PATCH]\n'
-                                        + current_patch
-                                        + '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
-                                        + 'Apply the minimal targeted edit directly to fix the failure above; do NOT re-read entire files from scratch.\n'
-                                        + compact_failure
-                                    ),
+                                    prompt=build_micro_repair_prompt(task, run_dir, originals),
                                 )
                                 primary_steps = result.get('steps', 0)
                                 primary_cost = result.get('cost')
@@ -1012,7 +1118,10 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
     try:
         raw_task = json.loads(Path(task_path).read_text())
         task = validate_task(raw_task)
-        candidates = task['candidate_models']
+        candidates = task['candidate_models'] or [
+            task['model'],
+            task.get('fallback_teacher_model') or 'openrouter/deepseek/deepseek-v4.1-flash-1017',
+        ]
 
         def _snapshot():
             snap = {}
@@ -1057,7 +1166,7 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
         for index, model in enumerate(candidates):
             candidate_path = Path(task_path).with_name(
                 Path(task_path).stem + ('.candidate%d.json' % (index + 1)))
-            candidate_task = dict(raw_task, strategy='single', model=model)
+            candidate_task = dict(raw_task, strategy='single', auto_escalate=False, model=model)
             candidate_task.pop('candidate_models', None)
             if index > 0 and handoff_feedback:
                 candidate_task['prompt'] = (candidate_task.get('prompt') or '') + handoff_feedback
@@ -1073,6 +1182,8 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
                     pass
             results.append((res, model))
             if _passes(res) and not res.get('salvaged_from'):
+                break
+            if index == 0 and res.get('status') == 'blocked' and res.get('reason') not in ESCALATABLE_BLOCK_REASONS:
                 break
             if index == 0 and len(candidates) > 1:
                 first_bytes = _snapshot()

@@ -30,6 +30,7 @@ from pathlib import Path
 
 from harness.proxy import OPENROUTER_UPSTREAM, openrouter_proxy
 from harness.report import (
+    export_sml_dataset,
     format_benchmark_markdown,
     format_replay_markdown,
     format_state_insights_markdown,
@@ -335,9 +336,15 @@ def _run_serve(args: argparse.Namespace) -> int:
 
 
 def _run_run(args: argparse.Namespace) -> int:
-    from harness.sandbox import STATE as DEFAULT_SANDBOX_STATE, run_task
+    from harness.sandbox import STATE as DEFAULT_SANDBOX_STATE, run_best_of_2, run_task
 
     state_dir = args.state_dir or os.environ.get("HARNESS_STATE_DIR") or DEFAULT_SANDBOX_STATE
+    if getattr(args, "best_of_2", False) and not args.check:
+        return int(run_best_of_2(
+            args.task_manifest,
+            state=state_dir,
+            upstream_url=args.upstream_url,
+        ))
     result = run_task(
         args.task_manifest,
         state=state_dir,
@@ -349,6 +356,14 @@ def _run_run(args: argparse.Namespace) -> int:
         status = result.get("status")
         return 0 if status in ("passed", "validated", "configuration_verified_no_model_call") else 1
     return int(result)
+
+
+def _run_export_dataset(args: argparse.Namespace) -> int:
+    records = export_sml_dataset(args.state_dir, output_path=args.output, mode=args.mode)
+    if args.output is None:
+        for record in records:
+            print(json.dumps(record, ensure_ascii=False))
+    return 0
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -490,6 +505,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="run or validate a sandboxed task manifest")
     run.add_argument("task_manifest", help="path to JSON task manifest")
     run.add_argument("--check", action="store_true", help="validate task manifest without executing")
+    run.add_argument("--best-of-2", action="store_true", help="run with best_of_2 auto-escalation strategy")
     run.add_argument("--upstream-url", default=None, help="optional upstream LLM API base URL")
     run.add_argument("--state-dir", default=None, help="optional state directory override")
     run.set_defaults(handler=_run_run)
@@ -530,6 +546,28 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print raw JSON instead of Markdown",
     )
     replay.set_defaults(handler=_run_replay)
+
+    export_dataset = subparsers.add_parser(
+        "export-dataset",
+        help="export SFT/DPO fine-tuning records from a state directory",
+    )
+    export_dataset.add_argument(
+        "--state-dir",
+        required=True,
+        help="state directory containing runs/",
+    )
+    export_dataset.add_argument(
+        "--mode",
+        choices=("sft", "dpo"),
+        default="sft",
+        help="dataset export mode (default: %(default)s)",
+    )
+    export_dataset.add_argument(
+        "--output",
+        default=None,
+        help="optional JSONL output path (default: print records to stdout)",
+    )
+    export_dataset.set_defaults(handler=_run_export_dataset)
 
     return parser
 

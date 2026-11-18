@@ -22,6 +22,7 @@ API and are not re-exported.
 from __future__ import annotations
 
 import ast
+import difflib
 import json
 import re
 from bisect import bisect_right
@@ -1045,6 +1046,73 @@ def _ambiguous_match_hint(call: tuple[str, str, str]) -> str:
     return _EDIT_AMBIGUOUS_HINT
 
 
+def _fuzzy_mismatch_hint(call: tuple[str, str, str]) -> str:
+    """H-40: fuzzy-locate the closest on-disk text for a failed oldString match."""
+    file_path, old_string, new_string = call[0], call[1], call[2]
+    if not file_path or not old_string:
+        return _EDIT_FAILURE_HINT
+    try:
+        text = Path(file_path).read_text(errors='replace')
+    except OSError:
+        return _EDIT_FAILURE_HINT
+    if not text:
+        return _EDIT_FAILURE_HINT
+    if new_string and new_string in text and old_string not in text:
+        line = text.count('\n', 0, text.find(new_string)) + 1
+        return (
+            f"\n[HARNESS_EDIT_HINT: target oldString was not found because "
+            f"newString is ALREADY applied in {file_path} at L{line}. "
+            f"Do NOT repeat this edit; proceed to the next change or finish.]"
+        )
+    all_lines = text.splitlines()
+    old_lines = old_string.splitlines()
+    if not all_lines or not old_lines:
+        return _EDIT_FAILURE_HINT
+    old_norm_lines = [line.strip() for line in old_lines[:25]]
+    old_block_norm = '\n'.join(old_norm_lines)
+    win_len = min(len(old_norm_lines), len(all_lines), 25)
+    if win_len <= 0:
+        return _EDIT_FAILURE_HINT
+    def _best_window(indices: Iterable[int], init_idx: int = 0, init_ratio: float = -1.0) -> tuple[int, float]:
+        idx, top = init_idx, init_ratio
+        for start in indices:
+            window_norm = '\n'.join(
+                line.strip() for line in all_lines[start:start + win_len])
+            ratio = difflib.SequenceMatcher(
+                None, old_block_norm, window_norm).ratio()
+            if ratio > top:
+                top = ratio
+                idx = start
+        return idx, top
+
+    max_start = len(all_lines) - win_len
+    if len(all_lines) > 2500:
+        step = max(1, win_len // 3)
+        coarse_index, best_ratio = _best_window(range(0, max_start + 1, step))
+        refine_start = max(0, coarse_index - 3)
+        refine_end = min(max_start, coarse_index + 3)
+        best_index, best_ratio = _best_window(
+            range(refine_start, refine_end + 1), coarse_index, best_ratio)
+    else:
+        best_index, best_ratio = _best_window(range(0, max_start + 1))
+    if best_ratio < 0.55:
+        return _EDIT_FAILURE_HINT
+    disp_start = max(0, best_index - 3)
+    disp_end = min(len(all_lines), best_index + win_len + 3)
+    if disp_end - disp_start > 25:
+        disp_end = disp_start + 25
+    formatted = [
+        f"{ln}: {all_lines[ln - 1]}"
+        for ln in range(disp_start + 1, disp_end + 1)
+    ]
+    return (
+        f"{_EDIT_FAILURE_HINT}\n"
+        f"Closest on-disk lines in {file_path} "
+        f"(L{disp_start + 1}-L{disp_end}):\n"
+        + '\n'.join(formatted)
+    )
+
+
 def _select_edit_failure_hint(
     text: str,
     messages: list[dict[str, Any]],
@@ -1066,6 +1134,9 @@ def _select_edit_failure_hint(
     if _TOOL_JSON_OR_ARGS_ERROR_RE.search(text):
         return _EDIT_JSON_TRUNCATION_HINT
     if _EDIT_MISMATCH_RE.search(text):
+        call = _find_edit_call_for_result(messages, index, expected_id)
+        if call is not None:
+            return _fuzzy_mismatch_hint(call)
         return _EDIT_FAILURE_HINT
     return None
 
@@ -1175,6 +1246,10 @@ _READ_PRELOADED_PERMISSION_HINT = (
     "\n[HARNESS_READ_GUARD: This path is outside the tool sandbox, but its "
     "contents/skeleton are ALREADY preloaded in your initial prompt above. Do "
     "NOT call read on it again; proceed directly with your edit on allowed_files.]"
+)
+_READ_COMPLETE_PRELOADED_HINT = (
+    "\n[HARNESS_READ_HINT: This complete file was already preloaded in your "
+    "initial prompt. Do NOT call read on it again; proceed directly to edit.]"
 )
 _READ_TOOLS = {"read"}
 _READ_RESET_TOOLS = {"edit", "write", "apply_patch"}
@@ -1289,6 +1364,56 @@ def _append_tool_result_text(block: dict[str, Any], text: str) -> dict[str, Any]
     return {**block, "content": text}
 
 
+def _is_preloaded_complete_read(
+    messages: list[dict[str, Any]],
+    call_id: str,
+) -> bool:
+    """Return True if ``call_id`` is a ``read`` for a COMPLETE FILE PRELOADED path."""
+    if not call_id:
+        return False
+    first_user = _first_user_message_text(messages)
+    if "COMPLETE FILE PRELOADED" not in first_user:
+        return False
+    requested_path = ""
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict) or str(tool_call.get("id") or "") != call_id:
+                    continue
+                function = tool_call.get("function")
+                name = str((function.get("name") if isinstance(function, dict) else None) or tool_call.get("name") or "")
+                if name not in _READ_TOOLS:
+                    return False
+                args = function.get("arguments") if isinstance(function, dict) else None
+                requested_path = _path_from_tool_arguments(args)
+                break
+        if requested_path:
+            break
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                    continue
+                if str(block.get("id") or "") != call_id:
+                    continue
+                if str(block.get("name") or "") not in _READ_TOOLS:
+                    return False
+                requested_path = _path_from_tool_arguments(block.get("input"))
+                break
+        if requested_path:
+            break
+    if not requested_path:
+        return False
+    prefix = f"--- {requested_path} ("
+    return any(
+        line.startswith(prefix) and "COMPLETE FILE PRELOADED" in line
+        for line in first_user.splitlines()
+    )
+
+
 def inject_read_guard_hints(
     messages: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], int]:
@@ -1329,6 +1454,13 @@ def inject_read_guard_hints(
                 touch(index, _append_tool_text(
                     message, _preloaded_hint_for(messages, text, block=message)))
                 injected += 1
+            elif (
+                _READ_HINT_MARKER not in text
+                and _READ_GUARD_MARKER not in text
+                and _is_preloaded_complete_read(messages, str(message.get("tool_call_id") or ""))
+            ):
+                touch(index, _append_tool_text(message, _READ_COMPLETE_PRELOADED_HINT))
+                injected += 1
             continue
         content = message.get("content")
         if (
@@ -1353,6 +1485,20 @@ def inject_read_guard_hints(
                         new_content = list(content)
                     new_content[block_index] = _append_tool_result_text(
                         block, _preloaded_hint_for(messages, block_text, block=block)
+                    )
+                    injected += 1
+                elif (
+                    _READ_HINT_MARKER not in block_text
+                    and _READ_GUARD_MARKER not in block_text
+                    and _is_preloaded_complete_read(
+                        messages,
+                        str(block.get("tool_use_id") or block.get("tool_call_id") or ""),
+                    )
+                ):
+                    if new_content is None:
+                        new_content = list(content)
+                    new_content[block_index] = _append_tool_result_text(
+                        block, _READ_COMPLETE_PRELOADED_HINT
                     )
                     injected += 1
             if new_content is not None:
@@ -1564,9 +1710,20 @@ _LINE_RANGE_PATTERNS = (
     re.compile(r"строк[аиуе]?\s+(\d+)\s*[-–—]+\s*(\d+)", re.IGNORECASE),
 )
 
+_LINE_SINGLE_PATTERNS = (
+    re.compile(r"\bline\s+(\d+)\b", re.IGNORECASE),
+    re.compile(r":(\d+):"),
+    re.compile(r"(?<![-–—])\bL(\d+)\b(?!\s*[-–—])"),
+)
+
 
 def _parse_prompt_line_ranges(prompt: str) -> list[tuple[int, int]]:
-    """Extract normalized ``(lo, hi)`` line ranges (1-based, inclusive) from a prompt."""
+    """Extract normalized ``(lo, hi)`` line ranges (1-based, inclusive) from a prompt.
+
+    Also recognizes single-line references (``line 123``, ``:123:``, ``L123``)
+    from Python/pytest tracebacks and converts each into a one-line ``(n, n)``
+    range so excerpts capture ``+-5`` context lines around the failure line.
+    """
     ranges: list[tuple[int, int]] = []
     for pattern in _LINE_RANGE_PATTERNS:
         for match in pattern.finditer(prompt):
@@ -1575,7 +1732,92 @@ def _parse_prompt_line_ranges(prompt: str) -> list[tuple[int, int]]:
             if lo > hi:
                 lo, hi = hi, lo
             ranges.append((lo, hi))
+    for pattern in _LINE_SINGLE_PATTERNS:
+        for match in pattern.finditer(prompt):
+            n = int(match.group(1))
+            if n >= 1:
+                ranges.append((n, n))
     return ranges
+
+
+def _extract_prompt_symbols(prompt: str) -> list[str]:
+    """Return deduplicated identifier names mentioned in backticks or def/class."""
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for symbol in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", prompt):
+        if symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
+    for kind in ("def", "class"):
+        for symbol in re.findall(rf"\b{kind}\s+([A-Za-z_][A-Za-z0-9_]*)", prompt):
+            if symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
+    return symbols
+
+
+def _symbol_line_windows(
+    text: str,
+    all_lines: list[str],
+    line_count: int,
+    symbols: list[str],
+    *,
+    is_python: bool,
+    context_lines: int,
+    use_ast: bool,
+) -> list[tuple[int, int]]:
+    """Build line windows around ``symbols`` using AST defs/classes and text matches."""
+    windows: list[tuple[int, int]] = []
+    ast_matched: set[str] = set()
+    if use_ast and is_python:
+        symbol_set = set(symbols)
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, OSError):
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, _DEF_NODES) and node.name in symbol_set:
+                    ast_matched.add(node.name)
+                    dec_start = min(
+                        [d.lineno for d in getattr(node, "decorator_list", ())] + [node.lineno]
+                    )
+                    end_ln = getattr(node, "end_lineno", None) or node.lineno
+                    cap_end = min(line_count, end_ln, node.lineno + 79)
+                    windows.append((max(1, dec_start), max(dec_start, cap_end)))
+    remaining = [s for s in symbols if s not in ast_matched]
+    if remaining:
+        seen_linenos: set[int] = set()
+        for lineno, line in enumerate(all_lines, 1):
+            if lineno in seen_linenos:
+                continue
+            for symbol in remaining:
+                if re.search(rf"\b{re.escape(symbol)}\b", line):
+                    seen_linenos.add(lineno)
+                    break
+        for lineno in sorted(seen_linenos):
+            windows.append(
+                (max(1, lineno - context_lines), min(line_count, lineno + context_lines))
+            )
+    return windows
+
+
+def _cap_merged_windows(merged: list[list[int]], cap: int) -> list[list[int]]:
+    """Cap merged ``[start, end]`` windows to at most ``cap`` total lines."""
+    capped: list[list[int]] = []
+    total = 0
+    for start, end in merged:
+        span = end - start + 1
+        if total >= cap:
+            break
+        if total + span > cap:
+            end = start + (cap - total) - 1
+            span = end - start + 1
+            if span <= 0:
+                break
+        capped.append([start, end])
+        total += span
+    return capped
 
 
 def build_preloaded_file_excerpts(
@@ -1588,10 +1830,12 @@ def build_preloaded_file_excerpts(
 ) -> str:
     """Build pre-loaded exact-line excerpts for ``files`` guided by ``prompt``.
 
-    Files at or under ``short_file_max_lines`` are included whole; longer files
-    contribute only the line ranges parsed from ``prompt`` (expanded by ``+-5``
-    context lines, capped at 120 lines per window). Read-only reference files
-    (``read_only_files``) are marked in their section header, and long
+    Files at or under ``short_file_max_lines`` are included whole (and marked
+    ``COMPLETE FILE PRELOADED`` when editable); longer files contribute line
+    ranges parsed from ``prompt`` (expanded by ``+-5`` context lines) and/or
+    ``+-20`` windows (or AST ``def``/``class`` bodies up to 80 lines) around
+    prompt symbols, capped at 120 lines per editable file. Read-only reference
+    files (``read_only_files``) are marked in their section header, and long
     read-only files without explicit ``L<a>-L<b>`` ranges fall back to
     ``+-15`` windows around prompt symbols, capped at 80 lines. The total
     output is capped at ``max_total_chars``. Returns a prompt-ready string
@@ -1599,18 +1843,7 @@ def build_preloaded_file_excerpts(
     """
     read_only_set = {str(p) for p in read_only_files}
     ranges = _parse_prompt_line_ranges(prompt)
-    readonly_symbols: list[str] = []
-    if not ranges:
-        seen_symbols: set[str] = set()
-        for symbol in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", prompt):
-            if symbol not in seen_symbols:
-                seen_symbols.add(symbol)
-                readonly_symbols.append(symbol)
-        for kind in ("def", "class"):
-            for symbol in re.findall(rf"\b{kind}\s+([A-Za-z_][A-Za-z0-9_]*)", prompt):
-                if symbol not in seen_symbols:
-                    seen_symbols.add(symbol)
-                    readonly_symbols.append(symbol)
+    prompt_symbols = _extract_prompt_symbols(prompt)
     seen: set[str] = set()
     chunks: list[str] = []
     total_chars = 0
@@ -1636,19 +1869,17 @@ def build_preloaded_file_excerpts(
             included = [f"{lineno}: {line}" for lineno, line in enumerate(all_lines, 1)]
         else:
             windows: list[tuple[int, int]] = []
-            if path in read_only_set and not ranges and readonly_symbols:
-                seen_linenos: set[int] = set()
-                for lineno, line in enumerate(all_lines, 1):
-                    if lineno in seen_linenos:
-                        continue
-                    for symbol in readonly_symbols:
-                        if re.search(rf"\b{re.escape(symbol)}\b", line):
-                            seen_linenos.add(lineno)
-                            break
-                for lineno in sorted(seen_linenos):
-                    windows.append(
-                        (max(1, lineno - 15), min(line_count, lineno + 15))
-                    )
+            is_ro = path in read_only_set
+            if is_ro and not ranges and prompt_symbols:
+                windows = _symbol_line_windows(
+                    text,
+                    all_lines,
+                    line_count,
+                    prompt_symbols,
+                    is_python=file_path.suffix == ".py",
+                    context_lines=15,
+                    use_ast=False,
+                )
             else:
                 for lo, hi in ranges:
                     start = max(1, lo - 5)
@@ -1659,6 +1890,18 @@ def build_preloaded_file_excerpts(
                         continue
                     end = min(line_count, end)
                     windows.append((start, end))
+                if not is_ro and prompt_symbols:
+                    windows.extend(
+                        _symbol_line_windows(
+                            text,
+                            all_lines,
+                            line_count,
+                            prompt_symbols,
+                            is_python=file_path.suffix == ".py",
+                            context_lines=20,
+                            use_ast=True,
+                        )
+                    )
             if not windows:
                 continue
             windows.sort()
@@ -1668,22 +1911,10 @@ def build_preloaded_file_excerpts(
                     merged[-1][1] = max(merged[-1][1], end)
                 else:
                     merged.append([start, end])
-            if path in read_only_set and readonly_symbols:
-                cap = 80
-                capped: list[list[int]] = []
-                total = 0
-                for start, end in merged:
-                    span = end - start + 1
-                    if total >= cap:
-                        break
-                    if total + span > cap:
-                        end = start + (cap - total) - 1
-                        span = end - start + 1
-                        if span <= 0:
-                            break
-                    capped.append([start, end])
-                    total += span
-                merged = capped
+            if is_ro and not ranges and prompt_symbols:
+                merged = _cap_merged_windows(merged, 80)
+            elif not is_ro:
+                merged = _cap_merged_windows(merged, 120)
             for start, end in merged:
                 included.extend(
                     f"{lineno}: {all_lines[lineno - 1]}"
@@ -1695,6 +1926,11 @@ def build_preloaded_file_excerpts(
             prefix = (
                 f"--- {path} ({line_count} lines, READ-ONLY — preloaded below; "
                 "do NOT call read or edit on this path)\n"
+            )
+        elif line_count <= short_file_max_lines:
+            prefix = (
+                f"--- {path} ({line_count} lines, COMPLETE FILE PRELOADED — "
+                "do NOT call read on this file; edit directly)\n"
             )
         else:
             prefix = f"--- {path} ({line_count} lines)\n"

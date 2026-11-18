@@ -60,9 +60,9 @@ budget. Upstream 429/5xx responses arm the circuit breaker
 | `harness.sandbox` | H-10 sandbox: task-JSON schema + path-boundary validation, exclusive path locks (`file_locked:`), SHA-256 file digests, transactional git worktrees, bounded micro-repair prompts |
 | `harness.finops` | H-10 finops: pre-dispatch budget gate (step cap / cost cap / unpriced models), SQLite generation telemetry, local OpenRouter generation settlement, per-task prior-cost aggregation, `export_sml_cost_manifest` |
 | `harness.proxy` | `OpenRouterGuardProxy` / `openrouter_proxy` context manager: gate, notices, stale-read compaction, egress & read-only SQL guards, `vLLM` upstream mode, cost & generation-id capture, circuit breaker, span recording |
-| `harness.report` | Run-record normalization, benchmark aggregation, Markdown comparison, live state-directory stats, offline A/B replay (`simulate_replay`, `format_replay_markdown`) |
+| `harness.report` | Run-record normalization, benchmark aggregation, Markdown comparison, live state-directory stats, offline A/B replay (`simulate_replay`, `format_replay_markdown`), SML SFT/DPO dataset export (`export_sml_dataset`) |
 | `harness.telemetry` | Stdlib-only OpenTelemetry/GenAI tracer, OTLP JSON & Protobuf export (`to_otlp_protobuf`), Arize AX / Phoenix flush, trace-tree rendering |
-| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `replay`, `trace`, `serve`, `run` subcommands |
+| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `replay`, `trace`, `serve`, `run`, `export-dataset` subcommands |
 
 H-10 adds the supervisor-side half of the picture. `harness.sandbox`
 validates each task manifest against its schema (`task_id`, `directory`,
@@ -423,10 +423,11 @@ $ harness stats --state-dir state/ --insights       # live stats + failure insig
 $ harness replay --state-dir state/                 # offline A/B replay simulation
 $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
 $ harness trace --sync-state state/                 # backfill runs to Phoenix OTLP (H-20)
+$ harness export-dataset --state-dir state/ --mode sft --output sft.jsonl
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-39
+## Capabilities H-15 .. H-44
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -445,6 +446,11 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-37** | Read-only excerpt preloading (`build_preloaded_file_excerpts` symbol windows + `READ-ONLY` header) and preloaded permission-denied stop hint (`inject_read_guard_hints`) | `guards.py`, `sandbox.py` |
 | **H-38** | In-proxy per-attempt timeout & immediate healthy-provider failover on `TimeoutError` / `socket.timeout` (`_OpenRouterProxyHandler`) | `proxy.py` |
 | **H-39** | Default heterogeneous `best_of_2` cascade (`glm-5.3-flash` → `deepseek-v4.1-flash-1017`) and cross-candidate `[CANDIDATE_1_TRAJSPEC_FEEDBACK]` handoff | `sandbox.py` |
+| **H-40** | Fuzzy `oldString` mismatch recovery hint (`_fuzzy_mismatch_hint` via `difflib.SequenceMatcher` closest on-disk `L<a>-L<b>` window & already-applied `newString` detection) | `guards.py` |
+| **H-41** | Zero-read micro-repair context (`build_micro_repair_prompt` with `[TRAJSPEC_MODIFIED_SYMBOLS]`, `[CURRENT_ON_DISK_EXCERPTS]`, and traceback line-number extraction) | `sandbox.py`, `guards.py` |
+| **H-42** | Recoverable-failure auto-escalation (`ESCALATABLE_BLOCK_REASONS`, `auto_escalate`, `harness run --best-of-2`) skipping Candidate 2 on fatal lock/budget/config blocks | `sandbox.py`, `cli.py` |
+| **H-43** | Zero-read fast path: AST/symbol window preloading for long editable files (`_symbol_line_windows`), `COMPLETE FILE PRELOADED` header, and redundant-read guard hint | `guards.py` |
+| **H-44** | Small Model Lab SFT & DPO trajectory dataset exporter (`export_sml_dataset`, `harness export-dataset --mode sft\|dpo`) | `report.py`, `cli.py` |
 
 ## Quickstart
 
@@ -470,5 +476,5 @@ return `429 guard_stop` — that is the supervisor's budget/deadline hook.
 No third-party dependencies: Python ≥ 3.10 standard library only.
 
 ```console
-$ pytest -q tests/test_harness.py    # H-1..H-35 contract suite (119 unittest/pytest cases)
+$ pytest -q tests/test_harness.py    # H-1..H-44 contract suite (153 unittest/pytest cases)
 ```

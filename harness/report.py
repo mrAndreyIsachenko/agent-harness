@@ -9,7 +9,9 @@ record itself does not carry.
 from __future__ import annotations
 
 import json
+import os
 import statistics
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -32,6 +34,7 @@ __all__ = [
     "format_state_insights_markdown",
     "simulate_replay",
     "format_replay_markdown",
+    "export_sml_dataset",
 ]
 
 # Statuses treated as a Pass@1 success (after lowercasing).
@@ -938,3 +941,154 @@ def format_replay_markdown(summary: dict) -> str:
     ]
     lines.extend(f"| {metric} | {value} |" for metric, value in rows)
     return "\n".join(lines)
+
+
+def _load_run_messages(run_dir: Path) -> list:
+    """Extract the ``messages`` list from the last usable record in requests.jsonl."""
+    requests_path = run_dir / "requests.jsonl"
+    if not requests_path.is_file():
+        return []
+    messages: list = []
+    try:
+        with requests_path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                candidate = record
+                if isinstance(candidate, dict):
+                    for key in ("request", "body", "payload"):
+                        nested = candidate.get(key)
+                        if isinstance(nested, dict) and isinstance(nested.get("messages"), list):
+                            candidate = nested
+                            break
+                if isinstance(candidate, dict) and isinstance(candidate.get("messages"), list):
+                    messages = candidate["messages"]
+    except OSError:
+        return []
+    return messages
+
+
+def export_sml_dataset(
+    state_dir: str | Path,
+    output_path: str | Path | None = None,
+    *,
+    mode: str = "sft",
+) -> list[dict]:
+    """Export Small Model Lab fine-tuning (SFT) or preference (DPO) records.
+
+    Scans ``<state_dir>/runs/*/`` oldest-first and produces JSONL-ready dicts:
+    ``mode="sft"`` yields one record per successful run with a patch or
+    transcript; ``mode="dpo"`` pairs each retry-to-success transition
+    (rejected blocked run followed by a chosen passing run) within a task
+    group. When ``output_path`` is given, records are atomically written as
+    JSONL; the records are also returned as a list of dicts.
+    """
+    if mode not in ("sft", "dpo"):
+        raise ValueError(f"Unsupported mode: {mode!r}; expected 'sft' or 'dpo'")
+
+    records: list[dict] = []
+    if mode == "sft":
+        for run_dir, result in _iter_run_records(state_dir):
+            summary = summarize_run(result, _load_proxy_summary(run_dir / "requests.json"))
+            run_id = _first(result, ("run_id", "runId", "id")) or run_dir.name
+            task_id = summary.get("task_id")
+            status = str(summary.get("status") or "").lower()
+            files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
+            prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            prompt = str(prompt_value) if prompt_value is not None else ""
+            patch_path = run_dir / "changes.patch"
+            patch = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
+            messages = _load_run_messages(run_dir)
+            passed = summary.get("passed") is True or status in PASS_STATUSES
+            has_content = bool(patch.strip()) or bool(messages)
+            if not (passed and has_content):
+                continue
+            records.append({
+                "task_id": task_id,
+                "run_id": run_id,
+                "model": summary.get("model"),
+                "steps": summary.get("steps", 0),
+                "cost_usd": summary.get("cost_usd", 0.0),
+                "files": files,
+                "prompt": prompt,
+                "patch": patch,
+                "messages": messages,
+            })
+        dataset = records
+    else:  # mode == "dpo"
+        groups: dict[object, list[dict]] = {}
+        group_order: list[object] = []
+        for run_dir, result in _iter_run_records(state_dir):
+            summary = summarize_run(result, _load_proxy_summary(run_dir / "requests.json"))
+            status = str(summary.get("status") or "").lower()
+            files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
+            prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            prompt = str(prompt_value) if prompt_value is not None else ""
+            patch_path = run_dir / "changes.patch"
+            patch = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
+            task_id = summary.get("task_id")
+            key = task_id if task_id else (tuple(sorted(files)), " ".join(prompt.split()).lower())
+            entry = {
+                "run_id": _first(result, ("run_id", "runId", "id")) or run_dir.name,
+                "task_id": task_id,
+                "prompt": prompt,
+                "patch": patch,
+                "status": status,
+                "passed": summary.get("passed") is True,
+                "model": summary.get("model"),
+                "reason": str(
+                    _first(result, ("reason", "blocked_reason", "error_reason", "failure_reason"))
+                    or ""
+                ).strip().lower(),
+            }
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(entry)
+
+        for key in group_order:
+            pending_rejected: dict | None = None
+            for entry in groups[key]:
+                is_rejected = entry["status"] == "blocked" and (
+                    bool(entry["patch"].strip())
+                    or entry["reason"] in ("validation_failed", "repeated_tool_error")
+                )
+                is_chosen = (
+                    entry["status"] == "validation_passed_review_required"
+                    or entry["passed"]
+                    or entry["status"] in PASS_STATUSES
+                ) and bool(entry["patch"].strip())
+                if is_rejected:
+                    pending_rejected = entry
+                    continue
+                if is_chosen and pending_rejected is not None:
+                    rejected, pending_rejected = pending_rejected, None
+                    records.append({
+                        "task_id": entry.get("task_id") or rejected.get("task_id"),
+                        "prompt": entry["prompt"] or rejected["prompt"],
+                        "chosen_patch": entry["patch"],
+                        "rejected_patch": rejected["patch"],
+                        "chosen_model": entry["model"],
+                        "rejected_model": rejected["model"],
+                        "rejected_reason": rejected["reason"],
+                        "chosen_run_id": entry["run_id"],
+                        "rejected_run_id": rejected["run_id"],
+                    })
+        dataset = records
+
+    if output_path is not None:
+        out_path = Path(output_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(out_path.parent), delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            for record in dataset:
+                tmp.write(json.dumps(record, ensure_ascii=False) + "\n")
+        os.replace(tmp_name, out_path)
+    return dataset

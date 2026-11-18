@@ -31,7 +31,8 @@ from .guards import (
 from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
                     STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
 from .report import (aggregate_benchmark_runs, build_repo_memory_hint,
-                     compute_state_insights, format_benchmark_markdown,
+                     compute_state_insights, export_sml_dataset,
+                     format_benchmark_markdown,
                      format_replay_markdown, format_state_insights_markdown,
                      format_state_stats_markdown, scan_state_runs,
                      simulate_replay, summarize_run)
@@ -47,7 +48,8 @@ from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
                         sync_state_traces_to_phoenix, synthesize_spans_from_run_dir)
 from .sandbox import (
     CLI, DB, LIMITS, STATE,
-    _reconcile_locked, auto_reconcile_from_proxy, build_prior_attempt_feedback,
+    _reconcile_locked, auto_reconcile_from_proxy, build_micro_repair_prompt,
+    build_prior_attempt_feedback,
     build_unexposed_settlement_evidence,
     can_settle_from_proxy_local, capture_files, capture_requests, check_patch, config_for,
     connect, event, execute, executable_argv, fetch_generation, fetch_generation_settled,
@@ -62,6 +64,7 @@ __all__ = [
     'check_allowed_files_syntax', 'check_sql_syntax', 'collect_python_top_symbols',
     '_message_text', 'detect_duplicate_tool_calls', 'detect_edit_oscillation', '_sql_skeleton_lines',
     'build_file_skeletons', 'build_preloaded_file_excerpts', 'extract_compact_test_failure',
+    'build_micro_repair_prompt',
     'prune_noisy_tool_outputs', 'compact_stale_reads', 'build_prior_attempt_feedback',
     'OPENROUTER_UPSTREAM', 'GEN_ID_RE', 'STREAM_COST_RE', 'PROVIDER_LATENCY_THRESHOLD_SECONDS',
     'GuardError', 'OpenRouterGuardProxy', 'openrouter_proxy',
@@ -72,6 +75,7 @@ __all__ = [
     'MODEL_REQUEST_CAPS', 'apply_provider_routing', 'ProviderHealthStore',
     'DEFAULT_PROVIDER_HEALTH_TTL_SECONDS',
     'summarize_run', 'aggregate_benchmark_runs', 'format_benchmark_markdown',
+    'export_sml_dataset',
     'scan_state_runs', 'format_state_stats_markdown',
     'compute_state_insights', 'build_repo_memory_hint', 'format_state_insights_markdown',
     'DEFAULT_PHOENIX_ENDPOINT', 'OPENINFERENCE_SPAN_KINDS', 'HarnessTracer',
