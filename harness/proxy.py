@@ -11,6 +11,7 @@ import http.server
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -33,6 +34,10 @@ from .guards import (
     inject_read_guard_hints,
     prune_noisy_tool_outputs,
 )
+try:
+    from .routing import MODEL_PROVIDER_PREFS
+except ImportError:  # pragma: no cover - routing module without provider prefs table
+    MODEL_PROVIDER_PREFS = ()
 from .routing import ProviderHealthStore, apply_provider_routing
 from .telemetry import HarnessTracer
 
@@ -557,8 +562,56 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
             return None
 
         req_start_ns = time.time_ns()
+        resp = None
         try:
-            with urllib.request.urlopen(req, timeout=self.server.request_timeout) as resp:
+            for attempt in range(2):
+                try:
+                    resp = urllib.request.urlopen(req, timeout=self.server.request_timeout)
+                    break
+                except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+                    if (isinstance(exc, urllib.error.URLError)
+                            and not isinstance(exc.reason, (TimeoutError, socket.timeout))):
+                        raise
+                    if attempt == 0:
+                        failed_provider = degraded_provider[0] or self.server.sticky_provider
+                        if (failed_provider
+                                or (body and (self.server.sticky_provider
+                                              or routed_model in MODEL_PROVIDER_PREFS))):
+                            _mark_degraded(failed_provider)
+                            if body:
+                                with self.server._lock:
+                                    degraded_snapshot = set(self.server.degraded_providers)
+                                    sticky_snapshot = self.server.sticky_provider
+                                retry_body = apply_provider_routing(
+                                    body, self.path,
+                                    default_model=self.server.default_model,
+                                    turn_index=turn_index,
+                                    reasoning_max_tokens=self.server.reasoning_max_tokens,
+                                    degraded_providers=degraded_snapshot,
+                                    sticky_provider=sticky_snapshot,
+                                    upstream_mode=self.server.upstream_mode,
+                                    fallback_teacher_model=self.server.fallback_teacher_model)
+                                next_provider = None
+                                try:
+                                    retry_payload = json.loads(retry_body)
+                                    if isinstance(retry_payload, dict):
+                                        provider = retry_payload.get('provider')
+                                        if (isinstance(provider, dict)
+                                                and isinstance(provider.get('order'), list)
+                                                and provider['order']):
+                                            next_provider = provider['order'][0]
+                                except (UnicodeDecodeError, ValueError):
+                                    pass
+                                if (next_provider
+                                        and next_provider not in degraded_snapshot
+                                        and next_provider != failed_provider):
+                                    body = retry_body
+                                    degraded_provider[0] = next_provider
+                                    req = urllib.request.Request(self._target_url(), data=body,
+                                                                 headers=headers, method=method)
+                                    continue
+                    raise
+            with resp:
                 status = getattr(resp, 'status', 200)
                 if entry is not None:
                     with self.server._lock:

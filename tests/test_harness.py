@@ -4442,6 +4442,10 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             if ('could not be parsed as JSON' in text
                     or 'Invalid arguments for tool' in text):
                 self.assertIn('Keep oldString/newString small', final_text)
+            elif 'Found 2 matches for oldString' in text:
+                self.assertIn('Multiple matches found', final_text)
+            elif 'oldString and newString are identical' in text:
+                self.assertIn('Target change is already present on disk', final_text)
             else:
                 self.assertIn('Exact target text did not match file contents', final_text)
 
@@ -5056,6 +5060,481 @@ class TestH33RetryFeedbackDistillation(HarnessTestCase):
         self.assertEqual((Path(tmp) / 'run' / 'after' / str(src).replace('/', '__')).read_text(),
                          'def foo():\n    return 1\n')
         self.assertFalse((Path(tmp) / 'run' / 'after' / str(txt).replace('/', '__')).exists())
+
+
+class TestH36TargetedEditAndToolHints(HarnessTestCase):
+    def _run(self, messages):
+        from harness.guards import inject_edit_failure_hints
+
+        return inject_edit_failure_hints(messages)
+
+    def test_noop_edit_hint(self):
+        from harness.guards import _EDIT_NOOP_HINT
+
+        messages = [{'role': 'tool', 'content':
+                     'Error: oldString and NewString are identical'}]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn(_EDIT_NOOP_HINT, new_messages[0]['content'])
+        self.assertIn('[HARNESS_EDIT_HINT', new_messages[0]['content'])
+
+    def test_noop_edit_idempotent(self):
+        messages, injected = self._run(
+            [{'role': 'tool', 'content':
+              'oldString and newString are identical'}])
+        self.assertEqual(injected, 1)
+        again, injected2 = self._run(messages)
+        self.assertEqual(injected2, 0)
+        self.assertEqual(again, messages)
+
+    def test_ambiguous_match_with_file_on_disk(self):
+        from harness.guards import _EDIT_HINT_MARKER
+
+        tmp = tempfile.mkdtemp()
+        target = Path(tmp) / 'code.py'
+        target.write_text('def a():\n    return 1\n\nmarker\n\ndef b():\n'
+                          '    return 2\n\nmarker\n')
+        messages = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'call-1', 'type': 'function', 'function': {
+                    'name': 'edit',
+                    'arguments': json.dumps({
+                        'filePath': str(target),
+                        'oldString': 'marker',
+                        'newString': 'replacement',
+                    }),
+                }},
+            ]},
+            {'role': 'tool', 'tool_call_id': 'call-1',
+             'content': 'Error: Found 2 matches for oldString'},
+        ]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        text = new_messages[1]['content']
+        self.assertIn(_EDIT_HINT_MARKER, text)
+        self.assertIn('(at lines L4, L9)', text)
+        self.assertIn('3-5 unique surrounding context lines', text)
+
+    def test_ambiguous_match_caps_at_five_occurrences(self):
+        tmp = tempfile.mkdtemp()
+        target = Path(tmp) / 'code.py'
+        target.write_text('\n'.join(['marker'] * 7) + '\n')
+        messages = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'call-1', 'type': 'function', 'function': {
+                    'name': 'edit',
+                    'arguments': json.dumps({
+                        'filePath': str(target),
+                        'oldString': 'marker',
+                        'newString': 'replacement',
+                    }),
+                }},
+            ]},
+            {'role': 'tool', 'tool_call_id': 'call-1',
+             'content': 'Error: Found 7 matches for oldString'},
+        ]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        text = new_messages[1]['content']
+        self.assertIn('(at lines L1, L2, L3, L4, L5)', text)
+        self.assertNotIn('L6', text)
+
+    def test_ambiguous_match_without_file_on_disk(self):
+        from harness.guards import _EDIT_HINT_MARKER
+
+        messages = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'call-1', 'type': 'function', 'function': {
+                    'name': 'edit',
+                    'arguments': json.dumps({
+                        'filePath': '/nonexistent/missing.py',
+                        'oldString': 'marker',
+                        'newString': 'replacement',
+                    }),
+                }},
+            ]},
+            {'role': 'tool', 'tool_call_id': 'call-1',
+             'content': 'Error: Found 2 matches for oldString'},
+        ]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        text = new_messages[1]['content']
+        self.assertIn(_EDIT_HINT_MARKER, text)
+        self.assertIn('Multiple matches found', text)
+        self.assertNotIn('(at lines', text)
+
+    def test_ambiguous_match_no_line_numbers_when_file_changed(self):
+        tmp = tempfile.mkdtemp()
+        target = Path(tmp) / 'code.py'
+        target.write_text('other content entirely\n')
+        messages = [
+            {'role': 'assistant', 'content': None, 'tool_calls': [
+                {'id': 'call-1', 'type': 'function', 'function': {
+                    'name': 'edit',
+                    'arguments': json.dumps({
+                        'filePath': str(target),
+                        'oldString': 'marker',
+                        'newString': 'replacement',
+                    }),
+                }},
+            ]},
+            {'role': 'tool', 'tool_call_id': 'call-1',
+             'content': 'Error: Found 2 matches for oldString'},
+        ]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        self.assertNotIn('(at lines', new_messages[1]['content'])
+
+    def test_unknown_tool_hint(self):
+        from harness.guards import _EDIT_UNKNOWN_TOOL_HINT
+
+        for tool in ('execute', 'run_command', 'shell', 'cmd'):
+            messages = [{'role': 'tool', 'content':
+                         'Error: No tool named "%s" is currently available' % tool}]
+            new_messages, injected = self._run(messages)
+            self.assertEqual(injected, 1)
+            self.assertIn(_EDIT_UNKNOWN_TOOL_HINT, new_messages[0]['content'])
+
+    def test_tool_result_block_unknown_tool_hint(self):
+        from harness.guards import _EDIT_UNKNOWN_TOOL_HINT
+
+        messages = [{'role': 'assistant', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 'tu-1',
+             'content': 'No tool named "shell" is currently available'},
+        ]}]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn(_EDIT_UNKNOWN_TOOL_HINT,
+                      new_messages[0]['content'][0]['content'])
+
+    def test_mismatch_and_json_truncation_hints_still_work(self):
+        from harness.guards import _EDIT_FAILURE_HINT, _EDIT_JSON_TRUNCATION_HINT
+
+        messages = [{'role': 'tool', 'content': 'Error: oldString not found'}]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn(_EDIT_FAILURE_HINT, new_messages[0]['content'])
+
+        messages = [{'role': 'tool', 'content':
+                     'Arguments could not be parsed as json: {oops'}]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn(_EDIT_JSON_TRUNCATION_HINT, new_messages[0]['content'])
+
+    def test_ambiguous_match_tool_result_block_with_tool_use_id(self):
+        tmp = tempfile.mkdtemp()
+        target = Path(tmp) / 'code.py'
+        target.write_text('x\nmarker\ny\nmarker\n')
+        messages = [
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 'tu-9', 'name': 'edit', 'input': {
+                    'path': str(target),
+                    'oldString': 'marker',
+                    'newString': 'replacement',
+                }},
+            ]},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'tu-9',
+                 'content': 'Error: Found 2 matches for oldString'},
+            ]},
+        ]
+        new_messages, injected = self._run(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn('(at lines L2, L4)',
+                      new_messages[1]['content'][0]['content'])
+
+
+class TestH37ReadOnlyPreloadAndPermissionGuard(unittest.TestCase):
+    """H-37: read-only excerpt preloading and permission-denied guard."""
+
+    def test_readonly_header_marked(self):
+        import re as _re
+        import tempfile, unittest
+        from harness.guards import build_preloaded_file_excerpts
+        tmp = tempfile.mkdtemp()
+        path = Path(tmp) / 'ref.py'
+        path.write_text('x = 1\n' * 5)
+        out = build_preloaded_file_excerpts([str(path)], '', read_only_files=[str(path)])
+        self.assertIn('READ-ONLY — preloaded below; do NOT call read or edit on this path', out)
+        plain = build_preloaded_file_excerpts([str(path)], '')
+        self.assertNotIn('READ-ONLY', plain)
+
+    def test_long_readonly_symbol_windows_capped_at_80(self):
+        import re as _re
+        import tempfile
+        from harness.guards import build_preloaded_file_excerpts
+        tmp = tempfile.mkdtemp()
+        path = Path(tmp) / 'big.py'
+        lines = ['filler line\n'] * 300
+        for lineno in (20, 60, 100, 140):
+            lines[lineno - 1] = 'def helper_x():  # at line %d\n' % lineno
+        for lineno in (200, 250):
+            lines[lineno - 1] = 'x = `alpha`-like\n'
+        path.write_text(''.join(lines))
+        prompt = 'fix `helper_x` and `alpha` in def helper_x'
+        out = build_preloaded_file_excerpts([str(path)], prompt, read_only_files=[str(path)])
+        included_linenos = [int(m.group(1)) for m in _re.finditer(r'^(\d+): ', out, _re.M)]
+        self.assertTrue(included_linenos)
+        self.assertLessEqual(len(included_linenos), 80)
+        self.assertIn(20, included_linenos)
+        self.assertIn(60, included_linenos)
+        # The 80-line cap is consumed by the earliest merged windows, so
+        # matches near the end of the file (line 250) are capped out.
+        self.assertNotIn(250, included_linenos)
+        self.assertNotIn(1, included_linenos)  # not the whole file
+        # Non-read-only long file without ranges still yields nothing.
+        empty = build_preloaded_file_excerpts([str(path)], prompt)
+        self.assertEqual(empty, '')
+
+    def test_inject_preloaded_permission_hint_tool_role(self):
+        import json
+        from harness.guards import inject_read_guard_hints
+        path = '/allowed/ref.py'
+        messages = [
+            {'role': 'user', 'content': '[PRELOADED_FILE_EXCERPTS — exact lines]\n--- '
+                                        + path + ' (5 lines, READ-ONLY)'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'c1', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'path': path})}}]},
+            {'role': 'tool', 'tool_call_id': 'c1',
+             'content': 'Permission denied: read ' + path},
+        ]
+        new_messages, injected = inject_read_guard_hints(messages)
+        self.assertEqual(injected, 1)
+        text = new_messages[2]['content']
+        self.assertIn('[HARNESS_READ_GUARD:', text)
+        self.assertIn('ALREADY preloaded', text)
+        # Idempotent.
+        self.assertEqual(inject_read_guard_hints(new_messages)[1], 0)
+
+    def test_inject_preloaded_permission_hint_tool_result_block(self):
+        import json
+        from harness.guards import inject_read_guard_hints
+        path = '/allowed/ref2.py'
+        messages = [
+            {'role': 'user', 'content': '[FILE_SKELETONS]\n' + path},
+            {'role': 'assistant', 'content': [
+                {'type': 'tool_use', 'id': 'tu1', 'name': 'read',
+                 'input': {'file_path': path}}]},
+            {'role': 'user', 'content': [
+                {'type': 'tool_result', 'tool_use_id': 'tu1',
+                 'content': 'Permission denied: read'}]},
+        ]
+        new_messages, injected = inject_read_guard_hints(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn('[HARNESS_READ_GUARD:',
+                      new_messages[2]['content'][0]['content'])
+        self.assertEqual(inject_read_guard_hints(new_messages)[1], 0)
+
+    def test_inject_fallback_hint_when_not_preloaded(self):
+        import json
+        from harness.guards import inject_read_guard_hints
+        path = '/other/secret.py'
+        messages = [
+            {'role': 'user', 'content': '[PRELOADED_FILE_EXCERPTS]\n/allowed/ref.py'},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'c2', 'function': {'name': 'read',
+                                          'arguments': json.dumps({'filePath': path})}}]},
+            {'role': 'tool', 'tool_call_id': 'c2',
+             'content': 'Permission denied: read'},
+        ]
+        new_messages, injected = inject_read_guard_hints(messages)
+        self.assertEqual(injected, 1)
+        self.assertIn('[HARNESS_READ_HINT:', new_messages[2]['content'])
+        self.assertNotIn('[HARNESS_READ_GUARD:', new_messages[2]['content'])
+
+    def test_model_run_passes_read_only_files(self):
+        import inspect
+        import harness.sandbox as sandbox
+        source = inspect.getsource(sandbox.model_run)
+        self.assertIn("read_only_files=task.get('read_only_files', [])", source)
+
+
+class TestH38ProxyTimeoutFailover(HarnessTestCase):
+    """H-38: a read timeout on the pinned provider marks it degraded, retries
+    the next healthy provider inline, and a double timeout surfaces 502."""
+
+    def _post_status(self, base_url, body):
+        import http.client
+        import urllib.parse
+        parsed = urllib.parse.urlparse(base_url)
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=10)
+        try:
+            conn.request('POST', '/v1/chat/completions', body=body,
+                         headers={'Content-Type': 'application/json'})
+            resp = conn.getresponse()
+            resp.read()
+            return resp.status
+        finally:
+            conn.close()
+
+    def _new_health_store(self, tmp):
+        import importlib
+        for mod_name in ('harness.proxy', 'harness.sandbox', 'harness.health'):
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, 'ProviderHealthStore', None)
+            if cls is not None:
+                try:
+                    return cls()
+                except TypeError:
+                    try:
+                        return cls(state_path=str(tmp / 'health.json'))
+                    except Exception:
+                        return None
+        return None
+
+    def _start_proxy(self, tmp):
+        from harness.proxy import OpenRouterGuardProxy
+        hs = self._new_health_store(tmp)
+        try:
+            proxy = OpenRouterGuardProxy(lambda: None,
+                                         upstream_url='http://127.0.0.1:9',
+                                         health_store=hs)
+        except TypeError:
+            proxy = OpenRouterGuardProxy(lambda: None,
+                                         upstream_url='http://127.0.0.1:9')
+            hs = None
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        return proxy, hs
+
+    def test_timeout_marks_degraded_and_retries_next_provider(self):
+        calls = []
+
+        class _FakeResp:
+            status = 200
+
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+                self.headers = {'Content-Type': 'application/json'}
+
+            def read(self, size=-1):
+                return self._chunks.pop(0) if self._chunks else b''
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def _fake_urlopen(req, timeout=None):
+            calls.append(req)
+            if len(calls) == 1:
+                raise TimeoutError('timed out')
+            return _FakeResp([b'{"id":"gen-1","choices":[]}', b''])
+
+        proxy, hs = self._start_proxy(self.path('h38-health'))
+        try:
+            body = json.dumps({'model': GLM,
+                               'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+            import unittest.mock as _mock
+            with _mock.patch('urllib.request.urlopen', side_effect=_fake_urlopen):
+                status = self._post_status(proxy.base_url, body)
+            self.assertEqual(status, 200)
+            self.assertEqual(len(calls), 2)
+            first = json.loads(calls[0].data.decode())
+            second = json.loads(calls[1].data.decode())
+            first_provider = first['provider']['order'][0]
+            self.assertIn(first_provider, proxy.degraded_providers)
+            if hs is not None:
+                self.assertIn(first_provider, hs.active_degraded())
+            self.assertNotEqual(second['provider']['order'][0], first_provider)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+
+    def test_double_timeout_returns_502(self):
+        proxy, _hs = self._start_proxy(self.path('h38-health-2'))
+        try:
+            body = json.dumps({'model': GLM,
+                               'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+            import unittest.mock as _mock
+            with _mock.patch('urllib.request.urlopen',
+                             side_effect=TimeoutError('timed out')):
+                status = self._post_status(proxy.base_url, body)
+            self.assertEqual(status, 502)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+
+
+class TestH39BestOf2CascadeHandoff(HarnessTestCase):
+    """H-39: best_of_2 fills the default candidate cascade and hands compact
+    TraJSpec feedback (modified symbols + test failure) to candidate 2 after
+    restoring the original file bytes."""
+
+    def test_validate_task_best_of_2_default_cascade(self):
+        import os
+        from harness.sandbox import validate_task
+        d = self.path('h39a')
+        os.makedirs(d, exist_ok=True)
+        f = os.path.join(d, 'a.py')
+        with open(f, 'w', encoding='utf-8') as fh:
+            fh.write('VALUE = 0\n')
+        task = validate_task({
+            'task_id': 'cascade-default',
+            'directory': d,
+            'files': [f],
+            'prompt': 'Fix a.py',
+            'test_argv': [sys.executable, '-c', 'pass'],
+            'strategy': 'best_of_2',
+            'model': GLM,
+        })
+        self.assertEqual(task['candidate_models'], [GLM, DEEPSEEK])
+
+    def test_run_best_of_2_handoffs_trajspec_feedback_to_candidate_2(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import run_best_of_2
+
+        original_src = 'def target_symbol():\n    return 1\n'
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            py_path = tmp_path / 'mod_under_test.py'
+            py_path.write_text(original_src)
+            artifact_dir = tmp_path / 'artifact'
+            task_path = tmp_path / 'task.json'
+            task_path.write_text(json.dumps({
+                'task_id': 'h39-handoff',
+                'directory': str(tmp_path),
+                'files': [str(py_path)],
+                'prompt': 'Fix target_symbol in mod_under_test.py',
+                'test_argv': [sys.executable, '-c', 'pass'],
+                'strategy': 'best_of_2',
+                'model': GLM,
+            }))
+
+            def fake_run_task(path, **kwargs):
+                calls.append(json.loads(Path(path).read_text()))
+                if len(calls) == 1:
+                    py_path.write_text('def target_symbol():\n    return 2\n')
+                    artifact_dir.mkdir()
+                    (artifact_dir / 'test.log').write_text(
+                        'FAILED tests/test_mod.py::test_target_symbol\n'
+                        'E   AssertionError: assert 1 == 2\n')
+                    return {'status': 'blocked', 'reason': 'validation_failed',
+                            'model': GLM, 'artifact': str(artifact_dir),
+                            'steps': 3, 'cost': 0.01}
+                prompt = calls[1]['prompt']
+                self.assertIn('[CANDIDATE_1_TRAJSPEC_FEEDBACK]', prompt)
+                self.assertIn('target_symbol', prompt)
+                self.assertIn('validation_failed', prompt)
+                self.assertIn('E   AssertionError', prompt)
+                self.assertEqual(py_path.read_text(), original_src)
+                return {'status': 'validation_passed_review_required',
+                        'model': DEEPSEEK, 'steps': 2, 'cost': 0.01}
+
+            old_cwd = os.getcwd()
+            os.chdir(tmp_path)
+            try:
+                import unittest.mock as _mock
+                with _mock.patch('harness.sandbox.run_task', side_effect=fake_run_task):
+                    rc = run_best_of_2(str(task_path))
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(calls[0]['model'], GLM)
+            self.assertEqual(calls[1]['model'], DEEPSEEK)
 
 
 if __name__ == '__main__':

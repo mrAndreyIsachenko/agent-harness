@@ -931,6 +931,18 @@ _TOOL_JSON_OR_ARGS_ERROR_RE = re.compile(
     r"(?:could not be parsed as json|invalid arguments for tool)",
     re.IGNORECASE,
 )
+_EDIT_NOOP_RE = re.compile(
+    r"oldstring and newstring are identical",
+    re.IGNORECASE,
+)
+_EDIT_AMBIGUOUS_RE = re.compile(
+    r"found \d+ matches for oldstring",
+    re.IGNORECASE,
+)
+_EDIT_UNKNOWN_TOOL_RE = re.compile(
+    r"no tool named \"(?:execute|run_command|shell|cmd)\" is currently available",
+    re.IGNORECASE,
+)
 _EDIT_HINT_MARKER = "[HARNESS_EDIT_HINT"
 _EDIT_JSON_TRUNCATION_HINT = (
     "\n[HARNESS_EDIT_HINT: Tool call JSON arguments were malformed or truncated. "
@@ -942,6 +954,120 @@ _EDIT_FAILURE_HINT = (
     "Do NOT retry the same edit blindly; call read with offset/limit around "
     "the target lines first, then apply a single accurate edit.]"
 )
+_EDIT_NOOP_HINT = (
+    "\n[HARNESS_EDIT_HINT: Target change is already present on disk "
+    "(oldString == newString). Do NOT repeat this edit; run verification "
+    "or finish your response.]"
+)
+_EDIT_UNKNOWN_TOOL_HINT = (
+    "\n[HARNESS_EDIT_HINT: Unknown tool name. Use \"bash\" for shell/pytest "
+    "commands, \"read\" to inspect files, and \"edit\" to modify files.]"
+)
+_EDIT_AMBIGUOUS_HINT = (
+    "\n[HARNESS_EDIT_HINT: Multiple matches found. Include 3-5 unique "
+    "surrounding context lines in oldString/newString to disambiguate without "
+    "re-reading the whole file.]"
+)
+_EDIT_AMBIGUOUS_LINES_HINT = (
+    "\n[HARNESS_EDIT_HINT: Multiple matches found (at lines {lines}). "
+    "Include 3-5 unique surrounding context lines in oldString/newString to "
+    "disambiguate without re-reading the whole file.]"
+)
+_EDIT_AMBIGUOUS_MAX_OCCURRENCES = 5
+
+
+def _find_edit_call_for_result(
+    messages: list[dict[str, Any]],
+    index: int,
+    expected_id: str | None = None,
+) -> tuple[str, str, str] | None:
+    """Locate the edit tool call that produced the tool result at ``index``.
+
+    Scans assistant messages before ``index`` for OpenAI ``tool_calls`` or
+    Anthropic ``tool_use`` blocks. When ``expected_id`` (a ``tool_call_id`` or
+    ``tool_use_id``) is given, the matching call wins; otherwise the latest
+    edit call found is returned as a fallback.
+    """
+    fallback: tuple[str, str, str] | None = None
+    for message in messages[:index]:
+        if not isinstance(message, dict) or message.get('role') != 'assistant':
+            continue
+        content = message.get('content')
+        if isinstance(content, list):
+            for block in content:
+                if not (isinstance(block, dict) and block.get('type') == 'tool_use'):
+                    continue
+                call = _extract_edit_call(
+                    str(block.get('name') or ''), block.get('input', ''))
+                if call:
+                    if expected_id and block.get('id') == expected_id:
+                        return call
+                    fallback = call
+        tool_calls = message.get('tool_calls')
+        if not isinstance(tool_calls, list):
+            continue
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            function = tool_call.get('function') or {}
+            if not isinstance(function, dict):
+                function = {}
+            name = str(function.get('name') or tool_call.get('name') or '')
+            args = function.get('arguments', tool_call.get('input', ''))
+            call = _extract_edit_call(name, args)
+            if call:
+                if expected_id and tool_call.get('id') == expected_id:
+                    return call
+                fallback = call
+    return fallback
+
+
+def _ambiguous_match_hint(call: tuple[str, str, str]) -> str:
+    """Build the ambiguous-match hint, adding on-disk line numbers when known."""
+    file_path, old_string = call[0], call[1]
+    if file_path and old_string:
+        try:
+            text = Path(file_path).read_text(errors='replace')
+        except OSError:
+            text = ''
+        if text and old_string in text:
+            lines: list[int] = []
+            start = 0
+            for _ in range(_EDIT_AMBIGUOUS_MAX_OCCURRENCES):
+                position = text.find(old_string, start)
+                if position < 0:
+                    break
+                lines.append(text.count('\n', 0, position) + 1)
+                start = position + max(len(old_string), 1)
+            if lines:
+                rendered = ', '.join('L%d' % number for number in lines)
+                return _EDIT_AMBIGUOUS_LINES_HINT.format(lines=rendered)
+    return _EDIT_AMBIGUOUS_HINT
+
+
+def _select_edit_failure_hint(
+    text: str,
+    messages: list[dict[str, Any]],
+    index: int,
+    expected_id: str | None = None,
+) -> str | None:
+    """H-36: pick the specialized hint for a single edit/tool error result."""
+    if _EDIT_HINT_MARKER in text:
+        return None
+    if _EDIT_NOOP_RE.search(text):
+        return _EDIT_NOOP_HINT
+    if _EDIT_AMBIGUOUS_RE.search(text):
+        call = _find_edit_call_for_result(messages, index, expected_id)
+        if call is not None:
+            return _ambiguous_match_hint(call)
+        return _EDIT_AMBIGUOUS_HINT
+    if _EDIT_UNKNOWN_TOOL_RE.search(text):
+        return _EDIT_UNKNOWN_TOOL_HINT
+    if _TOOL_JSON_OR_ARGS_ERROR_RE.search(text):
+        return _EDIT_JSON_TRUNCATION_HINT
+    if _EDIT_MISMATCH_RE.search(text):
+        return _EDIT_FAILURE_HINT
+    return None
 
 
 def inject_edit_failure_hints(
@@ -968,12 +1094,8 @@ def inject_edit_failure_hints(
         role = message.get("role")
         if role == "tool":
             text = _message_text(message)
-            hint = None
-            if _EDIT_HINT_MARKER not in text:
-                if _TOOL_JSON_OR_ARGS_ERROR_RE.search(text):
-                    hint = _EDIT_JSON_TRUNCATION_HINT
-                elif _EDIT_MISMATCH_RE.search(text):
-                    hint = _EDIT_FAILURE_HINT
+            hint = _select_edit_failure_hint(
+                text, messages, index, message.get("tool_call_id"))
             if hint is not None:
                 content = message.get("content")
                 if isinstance(content, list):
@@ -1005,12 +1127,8 @@ def inject_edit_failure_hints(
                 if not (isinstance(block, dict) and block.get("type") == "tool_result"):
                     continue
                 block_text = _message_text({"content": block.get("content")})
-                hint = None
-                if _EDIT_HINT_MARKER not in block_text:
-                    if _TOOL_JSON_OR_ARGS_ERROR_RE.search(block_text):
-                        hint = _EDIT_JSON_TRUNCATION_HINT
-                    elif _EDIT_MISMATCH_RE.search(block_text):
-                        hint = _EDIT_FAILURE_HINT
+                hint = _select_edit_failure_hint(
+                    block_text, messages, index, block.get("tool_use_id"))
                 if hint is not None:
                     block_content = block.get("content")
                     if isinstance(block_content, list):
@@ -1052,8 +1170,103 @@ _READ_BUDGET_WARNING = (
     "without applying an edit. Stop re-reading and apply your edit now, or the run "
     "will be terminated by repeated_file_read_without_write.]"
 )
+_READ_GUARD_MARKER = "[HARNESS_READ_GUARD"
+_READ_PRELOADED_PERMISSION_HINT = (
+    "\n[HARNESS_READ_GUARD: This path is outside the tool sandbox, but its "
+    "contents/skeleton are ALREADY preloaded in your initial prompt above. Do "
+    "NOT call read on it again; proceed directly with your edit on allowed_files.]"
+)
 _READ_TOOLS = {"read"}
 _READ_RESET_TOOLS = {"edit", "write", "apply_patch"}
+
+
+def _requested_read_path(messages: list[dict[str, Any]], result_text: str) -> str:
+    """Resolve the path requested by a permission-denied ``read`` tool call.
+
+    Looks up the matching ``tool_call`` (OpenAI) / ``tool_use`` (Anthropic) by
+    id and extracts ``filePath`` / ``path`` / ``file_path`` from its
+    arguments; falls back to the first path-like token in the error text.
+    """
+    ids: set[str] = set()
+    for match in re.finditer(r'(?:tool_call_id|tool_use_id)["\s:]+([A-Za-z0-9_\-]+)', result_text):
+        ids.add(match.group(1))
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        candidates: list[tuple[str, Any]] = []
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for tool_call in tool_calls:
+                if not isinstance(tool_call, dict):
+                    continue
+                function = tool_call.get("function")
+                if isinstance(function, dict):
+                    candidates.append((str(tool_call.get("id") or ""), function.get("arguments")))
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    candidates.append((str(block.get("id") or ""), block.get("input")))
+        for call_id, arguments in candidates:
+            if call_id and call_id in ids:
+                path = _path_from_tool_arguments(arguments)
+                if path:
+                    return path
+    match = re.search(r"(/[^\s'\"]+|[\w.\-/]+\.\w+)", result_text)
+    return match.group(1) if match else ""
+
+
+def _path_from_tool_arguments(arguments: Any) -> str:
+    raw: Any = arguments
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            return ""
+    if isinstance(raw, Mapping):
+        for key in ("filePath", "path", "file_path"):
+            value = raw.get(key)
+            if isinstance(value, str) and value:
+                return value
+    return ""
+
+
+def _first_user_message_text(messages: list[dict[str, Any]]) -> str:
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "user":
+            return _message_text(message)
+    return ""
+
+
+_PRELOAD_SECTION_MARKERS = (
+    "[PRELOADED_FILE_EXCERPTS",
+    "[FILE_SKELETONS",
+    "[FILE SKELETON MAP",
+)
+
+
+def _preloaded_hint_for(
+    messages: list[dict[str, Any]],
+    result_text: str,
+    block: dict[str, Any] | None = None,
+) -> str:
+    """Choose the permission-denied hint based on whether the path was preloaded."""
+    path = _requested_read_path(messages, result_text)
+    if not path and isinstance(block, dict):
+        # Anthropic ``tool_result`` blocks carry the call id on the block, not
+        # in the error text; re-resolve via the id.
+        call_id = str(block.get("tool_use_id") or block.get("tool_call_id") or "")
+        if call_id:
+            path = _requested_read_path(messages, f"tool_use_id: {call_id}")
+    first_user = _first_user_message_text(messages)
+    if (
+        path
+        and first_user
+        and any(marker in first_user for marker in _PRELOAD_SECTION_MARKERS)
+        and path in first_user
+    ):
+        return _READ_PRELOADED_PERMISSION_HINT
+    return _READ_PERMISSION_HINT
 
 
 def _append_tool_text(message: dict[str, Any], text: str) -> dict[str, Any]:
@@ -1108,8 +1321,13 @@ def inject_read_guard_hints(
             break
         if message.get("role") == "tool":
             text = _message_text(message)
-            if "Permission denied: read" in text and _READ_HINT_MARKER not in text:
-                touch(index, _append_tool_text(message, _READ_PERMISSION_HINT))
+            if (
+                "Permission denied: read" in text
+                and _READ_HINT_MARKER not in text
+                and _READ_GUARD_MARKER not in text
+            ):
+                touch(index, _append_tool_text(
+                    message, _preloaded_hint_for(messages, text, block=message)))
                 injected += 1
             continue
         content = message.get("content")
@@ -1129,11 +1347,12 @@ def inject_read_guard_hints(
                 if (
                     "Permission denied: read" in block_text
                     and _READ_HINT_MARKER not in block_text
+                    and _READ_GUARD_MARKER not in block_text
                 ):
                     if new_content is None:
                         new_content = list(content)
                     new_content[block_index] = _append_tool_result_text(
-                        block, _READ_PERMISSION_HINT
+                        block, _preloaded_hint_for(messages, block_text, block=block)
                     )
                     injected += 1
             if new_content is not None:
@@ -1365,16 +1584,33 @@ def build_preloaded_file_excerpts(
     *,
     short_file_max_lines: int = 150,
     max_total_chars: int = 12000,
+    read_only_files: Iterable[str] = (),
 ) -> str:
     """Build pre-loaded exact-line excerpts for ``files`` guided by ``prompt``.
 
     Files at or under ``short_file_max_lines`` are included whole; longer files
     contribute only the line ranges parsed from ``prompt`` (expanded by ``+-5``
-    context lines, capped at 120 lines per window). The total output is capped
-    at ``max_total_chars``. Returns a prompt-ready string (empty when nothing
-    was collected).
+    context lines, capped at 120 lines per window). Read-only reference files
+    (``read_only_files``) are marked in their section header, and long
+    read-only files without explicit ``L<a>-L<b>`` ranges fall back to
+    ``+-15`` windows around prompt symbols, capped at 80 lines. The total
+    output is capped at ``max_total_chars``. Returns a prompt-ready string
+    (empty when nothing was collected).
     """
+    read_only_set = {str(p) for p in read_only_files}
     ranges = _parse_prompt_line_ranges(prompt)
+    readonly_symbols: list[str] = []
+    if not ranges:
+        seen_symbols: set[str] = set()
+        for symbol in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", prompt):
+            if symbol not in seen_symbols:
+                seen_symbols.add(symbol)
+                readonly_symbols.append(symbol)
+        for kind in ("def", "class"):
+            for symbol in re.findall(rf"\b{kind}\s+([A-Za-z_][A-Za-z0-9_]*)", prompt):
+                if symbol not in seen_symbols:
+                    seen_symbols.add(symbol)
+                    readonly_symbols.append(symbol)
     seen: set[str] = set()
     chunks: list[str] = []
     total_chars = 0
@@ -1400,15 +1636,29 @@ def build_preloaded_file_excerpts(
             included = [f"{lineno}: {line}" for lineno, line in enumerate(all_lines, 1)]
         else:
             windows: list[tuple[int, int]] = []
-            for lo, hi in ranges:
-                start = max(1, lo - 5)
-                end = hi + 5
-                if end - start + 1 > 120:
-                    end = start + 119
-                if not (1 <= start <= line_count):
-                    continue
-                end = min(line_count, end)
-                windows.append((start, end))
+            if path in read_only_set and not ranges and readonly_symbols:
+                seen_linenos: set[int] = set()
+                for lineno, line in enumerate(all_lines, 1):
+                    if lineno in seen_linenos:
+                        continue
+                    for symbol in readonly_symbols:
+                        if re.search(rf"\b{re.escape(symbol)}\b", line):
+                            seen_linenos.add(lineno)
+                            break
+                for lineno in sorted(seen_linenos):
+                    windows.append(
+                        (max(1, lineno - 15), min(line_count, lineno + 15))
+                    )
+            else:
+                for lo, hi in ranges:
+                    start = max(1, lo - 5)
+                    end = hi + 5
+                    if end - start + 1 > 120:
+                        end = start + 119
+                    if not (1 <= start <= line_count):
+                        continue
+                    end = min(line_count, end)
+                    windows.append((start, end))
             if not windows:
                 continue
             windows.sort()
@@ -1418,6 +1668,22 @@ def build_preloaded_file_excerpts(
                     merged[-1][1] = max(merged[-1][1], end)
                 else:
                     merged.append([start, end])
+            if path in read_only_set and readonly_symbols:
+                cap = 80
+                capped: list[list[int]] = []
+                total = 0
+                for start, end in merged:
+                    span = end - start + 1
+                    if total >= cap:
+                        break
+                    if total + span > cap:
+                        end = start + (cap - total) - 1
+                        span = end - start + 1
+                        if span <= 0:
+                            break
+                    capped.append([start, end])
+                    total += span
+                merged = capped
             for start, end in merged:
                 included.extend(
                     f"{lineno}: {all_lines[lineno - 1]}"
@@ -1425,7 +1691,13 @@ def build_preloaded_file_excerpts(
                 )
         if not included:
             continue
-        prefix = f"--- {path} ({line_count} lines)\n"
+        if path in read_only_set:
+            prefix = (
+                f"--- {path} ({line_count} lines, READ-ONLY — preloaded below; "
+                "do NOT call read or edit on this path)\n"
+            )
+        else:
+            prefix = f"--- {path} ({line_count} lines)\n"
         chunk = prefix + "\n".join(included)
         remaining = max_total_chars - total_chars
         if remaining <= 0:

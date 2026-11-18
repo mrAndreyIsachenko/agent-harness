@@ -410,7 +410,8 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
                   'The supervisor checks the patch without applying it; testing follows reviewed application.')
     if '[CURRENT_PATCH]' not in task['prompt']:
         excerpts = build_preloaded_file_excerpts(
-            list(task['files']) + list(task.get('read_only_files', ())), task['prompt'])
+            list(task['files']) + list(task.get('read_only_files', ())), task['prompt'],
+            read_only_files=task.get('read_only_files', []))
     else:
         excerpts = ''
     prompt = skeletons + excerpts + prompt
@@ -953,6 +954,49 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
         print(json.dumps(out))
     return 0 if result['status'] in ('validation_passed_review_required', 'patch_ready_review_required', 'configuration_verified_no_model_call') else 1
 
+def _build_candidate1_trajspec_feedback(res, originals, after_snap):
+    """H-39: compact TraSpec handoff so Candidate 2 avoids repeating
+    Candidate 1's validation mistake."""
+    status = str(res.get('status') or 'blocked')
+    reason = str(res.get('reason') or '')
+    added, modified, dropped = [], [], []
+    for name in sorted(set(originals) | set(after_snap)):
+        if not str(name).endswith('.py'):
+            continue
+        before = originals.get(name)
+        after = after_snap.get(name)
+        before_src = before.decode('utf-8', errors='replace') if before is not None else ''
+        after_src = after.decode('utf-8', errors='replace') if after is not None else ''
+        before_syms = _python_top_symbols(before_src) if before_src else {}
+        after_syms = _python_top_symbols(after_src) if after_src else {}
+        for sym in sorted(set(after_syms) - set(before_syms)):
+            added.append(sym)
+        for sym in sorted(set(before_syms) & set(after_syms)):
+            if before_syms[sym] != after_syms[sym]:
+                modified.append(sym)
+        for sym in sorted(set(before_syms) - set(after_syms)):
+            dropped.append(sym)
+    parts = ['\n\n[CANDIDATE_1_TRAJSPEC_FEEDBACK]',
+             'Candidate 1 status: %s' % status]
+    if reason:
+        parts.append('Candidate 1 reason: %s' % reason)
+    if modified:
+        parts.append('Modified symbols: %s' % ', '.join(modified))
+    if added:
+        parts.append('Added symbols: %s' % ', '.join(added))
+    if dropped:
+        parts.append('Dropped symbols: %s' % ', '.join(dropped))
+    artifact = res.get('artifact')
+    if artifact:
+        test_log = Path(artifact) / 'test.log'
+        try:
+            if test_log.exists() and test_log.stat().st_size > 0:
+                parts.append(extract_compact_test_failure(
+                    test_log.read_text(errors='replace'), '', max_chars=1500))
+        except OSError:
+            pass
+    return '\n'.join(parts)
+
 def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None, fetch=None):
     """Verifier-guided best_of_2 strategy: run candidate 1; only if it does not
     pass validation cleanly, restore the original file bytes and run candidate 2.
@@ -1009,11 +1053,14 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
             return a
 
         results = []
+        handoff_feedback = ''
         for index, model in enumerate(candidates):
             candidate_path = Path(task_path).with_name(
                 Path(task_path).stem + ('.candidate%d.json' % (index + 1)))
             candidate_task = dict(raw_task, strategy='single', model=model)
             candidate_task.pop('candidate_models', None)
+            if index > 0 and handoff_feedback:
+                candidate_task['prompt'] = (candidate_task.get('prompt') or '') + handoff_feedback
             candidate_path.write_text(json.dumps(candidate_task))
             try:
                 res = run_task(candidate_path, cli=cli, db=db, state=state,
@@ -1029,6 +1076,7 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
                 break
             if index == 0 and len(candidates) > 1:
                 first_bytes = _snapshot()
+                handoff_feedback = _build_candidate1_trajspec_feedback(res, originals, first_bytes)
                 _restore(originals)
         winner = results[0]
         for other in results[1:]:

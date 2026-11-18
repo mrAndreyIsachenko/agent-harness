@@ -426,7 +426,7 @@ $ harness trace --sync-state state/                 # backfill runs to Phoenix O
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-33
+## Capabilities H-15 .. H-39
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -441,6 +441,10 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-33** | `TrajSpec` retry distillation: Python AST symbol-level `before`/`after` diff and guardrail event summary prioritized in `build_prior_attempt_feedback` | `sandbox.py` |
 | **H-34** | DeepSeek R1 / SWE-Gym verifier-guided `best_of_2` strategy (`run_best_of_2`, `candidate_models`) with file snapshot/restore and early exit on clean pass | `sandbox.py` |
 | **H-35** | Kimi / ZCode-style learned repo memory hints (`build_repo_memory_hint`, `include_repo_memory`) auto-injected from recurring workspace block reasons and tool errors | `report.py`, `sandbox.py` |
+| **H-36** | Targeted edit & tool-error recovery hints (`inject_edit_failure_hints`: no-op `oldString == newString`, ambiguous multi-match with on-disk `L<n>` lines, unknown tool name) | `guards.py` |
+| **H-37** | Read-only excerpt preloading (`build_preloaded_file_excerpts` symbol windows + `READ-ONLY` header) and preloaded permission-denied stop hint (`inject_read_guard_hints`) | `guards.py`, `sandbox.py` |
+| **H-38** | In-proxy per-attempt timeout & immediate healthy-provider failover on `TimeoutError` / `socket.timeout` (`_OpenRouterProxyHandler`) | `proxy.py` |
+| **H-39** | Default heterogeneous `best_of_2` cascade (`glm-5.3-flash` → `deepseek-v4.1-flash-1017`) and cross-candidate `[CANDIDATE_1_TRAJSPEC_FEEDBACK]` handoff | `sandbox.py` |
 
 ## Quickstart
 
