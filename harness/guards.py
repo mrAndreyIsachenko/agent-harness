@@ -42,6 +42,7 @@ __all__ = [
     "compact_stale_reads",
     "detect_duplicate_tool_calls",
     "detect_edit_oscillation",
+    "extract_failing_test_excerpts",
     "estimate_messages_tokens",
     "extract_compact_test_failure",
     "inject_edit_failure_hints",
@@ -199,8 +200,9 @@ def check_allowed_files_syntax(
             produced by :func:`collect_python_top_symbols`. For any path present
             here, removing one of its top-level function/class symbols is an error.
     """
+    file_list = list(files) if files else []
     errors: list[str] = []
-    for path in files or []:
+    for path in file_list:
         try:
             if not path.endswith(_PARSEABLE_SUFFIXES) or not Path(path).is_file():
                 continue
@@ -234,7 +236,7 @@ def check_allowed_files_syntax(
                                         f"{path}:{key.lineno}: duplicate dict key {key.value!r}"
                                     )
                                 seen.add(identity)
-                    errors.extend(_sibling_import_errors(path, tree))
+                    errors.extend(_sibling_import_errors(path, tree, known_files=file_list))
             elif path.endswith(".json"):
                 try:
                     json.loads(source)
@@ -294,35 +296,114 @@ def _sibling_defined_names(tree: ast.Module) -> set[str]:
     return known
 
 
-def _sibling_import_errors(path: str, tree: ast.Module) -> list[str]:
-    """H-7: flag ``from <sibling> import <missing>`` without executing anything.
+def _resolve_importfrom_target(
+    path: str, node: ast.ImportFrom, known_files: Iterable[str] | None
+) -> Path | None:
+    """Resolve the on-disk ``.py`` file an ``ImportFrom`` node points at.
 
-    For each ``ImportFrom`` naming a simple sibling module (no dots, ``level``
-    0 or 1) whose ``<module>.py`` exists next to ``path`` and parses cleanly,
+    Relative imports (``node.level >= 1``) climb ``node.level - 1`` parent
+    directories from the importing file's directory; absolute imports keep the
+    direct sibling first, then match against ``known_files`` path-part suffixes,
+    then search up to three ancestor directories. Returns ``None`` when nothing
+    exists on disk (unknown module -- not this guard's business).
+    """
+    base = Path(path).parent
+    if node.level >= 1:
+        levels_up = node.level - 1
+        if levels_up > len(base.parents):
+            return None
+        target_dir = base.parents[levels_up - 1] if levels_up else base
+        if not node.module:
+            init = target_dir / "__init__.py"
+            return init if init.is_file() else None
+        parts = node.module.split(".")
+        for candidate in (
+            target_dir.joinpath(*parts).with_suffix(".py"),
+            target_dir.joinpath(*parts, "__init__.py"),
+        ):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    module = node.module or ""
+    if not module:
+        return None
+    parts = module.split(".")
+    for candidate in (
+        base.joinpath(*parts).with_suffix(".py"),
+        base.joinpath(*parts, "__init__.py"),
+    ):
+        if candidate.is_file():
+            return candidate
+    rel_py = Path(*parts).with_suffix(".py")
+    rel_init = Path(*parts) / "__init__.py"
+    for known in known_files or []:
+        known_path = Path(known)
+        if not known_path.is_file():
+            continue
+        for rel in (rel_py, rel_init):
+            if len(rel.parts) <= len(known_path.parts) and (
+                known_path.parts[-len(rel.parts):] == rel.parts
+            ):
+                return known_path
+    for ancestor in list(base.parents)[:3]:
+        for candidate in (ancestor / rel_py, ancestor / rel_init):
+            if candidate.is_file():
+                return candidate
+    return None
+
+
+def _tree_has_dynamic_names(tree: ast.Module) -> bool:
+    """True when ``tree`` uses ``globals()`` or a wildcard import."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "globals":
+            return True
+        if isinstance(node, ast.ImportFrom) and any(alias.name == "*" for alias in node.names):
+            return True
+    return False
+
+
+def _sibling_import_errors(
+    path: str, tree: ast.Module, known_files: Iterable[str] | None = None
+) -> list[str]:
+    """H-7/H-46: flag ``from <module> import <missing>`` without executing anything.
+
+    For each ``ImportFrom`` whose target module file resolves on disk (simple
+    sibling, relative, dotted package, or known-file match) and parses cleanly,
     every non-``*`` imported alias must match a name collected by
-    :func:`_sibling_defined_names`. Unparseable siblings are skipped rather
-    than guessed at.
+    :func:`_sibling_defined_names`. Targets that use ``globals()`` or wildcard
+    imports are skipped to avoid false positives, as are unparseable or missing
+    targets.
     """
     errors: list[str] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.ImportFrom):
             continue
-        module = node.module or ""
-        if not module or "." in module or node.level not in (0, 1):
-            continue
-        sibling = Path(path).parent / f"{module}.py"
-        if not sibling.is_file():
+        target_file = _resolve_importfrom_target(path, node, known_files)
+        if target_file is None:
             continue
         try:
-            sibling_tree = ast.parse(sibling.read_text(encoding="utf-8"), filename=str(sibling))
+            target_tree = ast.parse(
+                target_file.read_text(encoding="utf-8"), filename=str(target_file)
+            )
         except (OSError, UnicodeDecodeError, SyntaxError):
             continue
-        known = _sibling_defined_names(sibling_tree)
+        if _tree_has_dynamic_names(target_tree):
+            continue
+        known = _sibling_defined_names(target_tree)
+        module_label = node.module or ("." * node.level)
         for alias in node.names:
-            if alias.name != "*" and alias.name not in known:
-                errors.append(
-                    f"{path}:{node.lineno}: cannot import name {alias.name!r} from {module!r}"
-                )
+            if alias.name == "*" or alias.name in known:
+                continue
+            if target_file.name == "__init__.py":
+                pkg_dir = target_file.parent
+                if (pkg_dir / f"{alias.name}.py").is_file() or (
+                    pkg_dir / alias.name / "__init__.py"
+                ).is_file():
+                    continue
+            errors.append(
+                f"{path}:{node.lineno}: cannot import name {alias.name!r} from {module_label!r}"
+            )
     return errors
 
 
@@ -1987,6 +2068,167 @@ def extract_compact_test_failure(
         non_empty = [line for line in lines if line.strip()]
         result = "\n".join(non_empty[-min(max_lines, 10) :])
     if max_chars is not None and len(result) > max_chars:
+        kept: list[str] = []
+        total = 0
+        for line in result.splitlines():
+            if total + len(line) + 1 > max_chars and kept:
+                break
+            kept.append(line)
+            total += len(line) + 1
+        result = "\n".join(kept)
+    return result
+
+
+#: Failed pytest nodeids in short summary lines.
+_FAILED_NODEID_RE = re.compile(r"(?:FAILED|ERROR)\s+([^\s]+\.py::[^\s]+)")
+
+#: Python traceback source-location lines.
+_TRACEBACK_LOC_RE = re.compile(r'File "([^"]+\.py)", line (\d+)(?:, in (\w+))?')
+
+#: Short pytest location lines (``path/file.py:123:``).
+_SHORT_LOC_RE = re.compile(r'([^\s"\'()]+\.py):(\d+):?')
+
+#: Maximum number of test files excerpted by :func:`extract_failing_test_excerpts`.
+_MAX_TEST_EXCERPT_FILES = 2
+
+#: Maximum excerpt window length per test file.
+_MAX_EXCERPT_LINES = 45
+
+_HEADER = "[FAILING_TEST_CONTEXT — READ-ONLY test source; do NOT call read or edit on test files]:"
+
+
+def _is_test_path(raw_path: str, from_nodeid: bool = False) -> bool:
+    """Whether ``raw_path`` looks like a test module."""
+    p = Path(raw_path)
+    name = p.name
+    if name.startswith("test_") or name.endswith("_test.py"):
+        return True
+    if "tests" in p.parts:
+        return True
+    return from_nodeid
+
+
+def extract_failing_test_excerpts(
+    test_log: str,
+    base_dir: str | Path | None = None,
+    *,
+    max_chars: int = 3000,
+    exclude_files: Iterable[str | Path] | None = None,
+) -> str:
+    """READ-ONLY source excerpts of the failing pytest tests (H-47).
+
+    Parses ``test_log`` for failed nodeids and traceback/short location lines,
+    keeps up to two existing test files on disk, and embeds bounded excerpts of
+    the failing test function (or a window around the failing line) so a repair
+    attempt never needs to re-read the test file.
+    """
+    if not test_log:
+        return ""
+    base = Path(base_dir) if base_dir is not None else None
+
+    def resolve(raw: str) -> Path:
+        p = Path(raw)
+        return p if p.is_absolute() or base is None else base / p
+
+    excluded: set[Path] = set()
+    for item in exclude_files or ():
+        excluded.add(resolve(str(item)).resolve())
+
+    # 1. Failed nodeids (order-preserving, deduplicated).
+    nodeids: list[str] = []
+    seen_nodeids: set[str] = set()
+    for match in _FAILED_NODEID_RE.finditer(test_log):
+        nodeid = match.group(1)
+        if nodeid not in seen_nodeids:
+            seen_nodeids.add(nodeid)
+            nodeids.append(nodeid)
+
+    # 2. Candidate (path, line) references, in first-seen order per path.
+    line_for_path: dict[str, int] = {}
+    for pattern in (_TRACEBACK_LOC_RE, _SHORT_LOC_RE):
+        for match in pattern.finditer(test_log):
+            raw_path, lineno = match.group(1), int(match.group(2))
+            if _is_test_path(raw_path):
+                line_for_path.setdefault(raw_path, lineno)
+    for nodeid in nodeids:
+        raw_path = nodeid.split("::", 1)[0]
+        if raw_path not in line_for_path:
+            line_for_path[raw_path] = 0  # nodeid-origin: no line hint
+            if not _is_test_path(raw_path, from_nodeid=True):
+                del line_for_path[raw_path]
+
+    # 3. Keep up to 2 unique existing test files on disk.
+    excerpts: list[tuple[str, list[str]]] = []
+    for raw_path, target_line in line_for_path.items():
+        if len(excerpts) >= _MAX_TEST_EXCERPT_FILES:
+            break
+        resolved = resolve(raw_path)
+        if resolved.resolve() in excluded or not resolved.is_file():
+            continue
+        try:
+            lines = resolved.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        window: list[tuple[int, str]] = []
+        func_name = None
+        # Target function name from the first nodeid of this file, if any.
+        for nodeid in nodeids:
+            if nodeid.split("::", 1)[0] == raw_path:
+                parts = nodeid.split("::")
+                if len(parts) >= 2 and parts[1] and parts[1].isidentifier():
+                    func_name = parts[1]
+                break
+        matched_ast = False
+        if target_line or func_name:
+            try:
+                tree = ast.parse("\n".join(lines))
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                for node in ast.walk(tree):
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    starts = node.name.startswith("test_")
+                    contains = (
+                        target_line
+                        and node.lineno <= target_line
+                        and (node.end_lineno or target_line) >= target_line
+                    )
+                    if (starts and contains) or (func_name and node.name == func_name):
+                        start = node.lineno
+                        end = node.end_lineno or node.lineno
+                        if end - start + 1 <= _MAX_EXCERPT_LINES:
+                            window = [(n, lines[n - 1]) for n in range(start, end + 1)]
+                        else:
+                            if target_line:
+                                half = _MAX_EXCERPT_LINES // 2
+                                lo = max(1, target_line - half)
+                                hi = min(len(lines), lo + _MAX_EXCERPT_LINES - 1)
+                                lo = max(1, hi - _MAX_EXCERPT_LINES + 1)
+                            else:
+                                lo, hi = start, min(len(lines), start + _MAX_EXCERPT_LINES - 1)
+                            window = [(n, lines[n - 1]) for n in range(lo, hi + 1)]
+                        matched_ast = True
+                        break
+        if not matched_ast:
+            if target_line:
+                lo = max(1, target_line - 15)
+                hi = min(len(lines), target_line + 15)
+            else:
+                lo, hi = 1, min(30, len(lines))
+            window = [(n, lines[n - 1]) for n in range(lo, hi + 1)]
+        excerpts.append((raw_path, [f"L{n}: {text}" for n, text in window]))
+
+    if not excerpts:
+        return ""
+    parts = [_HEADER]
+    if nodeids:
+        parts.append("Failing nodeids: " + ", ".join(nodeids))
+    for raw_path, content_lines in excerpts:
+        parts.append(f"--- {raw_path} (READ-ONLY test excerpt)")
+        parts.extend(content_lines)
+    result = "\n".join(parts)
+    if len(result) > max_chars:
         kept: list[str] = []
         total = 0
         for line in result.splitlines():

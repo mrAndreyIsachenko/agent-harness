@@ -43,6 +43,7 @@ from harness.guards import (FORBIDDEN_EGRESS_KEYS, _EDIT_FAILURE_HINT,
                             compact_stale_reads, detect_duplicate_tool_calls,
                             detect_edit_oscillation,
                             estimate_messages_tokens, extract_compact_test_failure,
+                            extract_failing_test_excerpts,
                             inject_edit_failure_hints,
                             inject_read_guard_hints,
                             prune_noisy_tool_outputs)
@@ -364,6 +365,51 @@ class TestH7AndH8(HarnessTestCase):
         errors = check_allowed_files_syntax([sql, importer])
         self.assertIn('%s:1: trailing comma before FROM' % sql, errors)
         self.assertIn("%s:1: cannot import name 'missing_name' from 'helper'" % importer, errors)
+
+    def test_cross_file_dotted_and_relative_imports(self):
+        # Dotted package import between files on disk is checked.
+        pkg_dir = Path(self.root) / 'pkg'
+        sub_dir = pkg_dir / 'sub'
+        sub_dir.mkdir(parents=True)
+        (pkg_dir / '__init__.py').write_text('')
+        (sub_dir / '__init__.py').write_text('def real():\n    return 1\n')
+        importer = self.path('importer.py')
+        with open(importer, 'w') as fh:
+            fh.write('from pkg.sub import real, missing_fn\n')
+        self.assertEqual(check_allowed_files_syntax([importer]),
+                         ["%s:1: cannot import name 'missing_fn' from 'pkg.sub'" % importer])
+        # Relative imports: level 1 and level 2.
+        rel_importer = sub_dir / 'rel_importer.py'
+        rel_importer.write_text('from . import missing_rel\n')
+        deep_dir = Path(self.root) / 'proj' / 'src' / 'app'
+        deep_dir.mkdir(parents=True)
+        shared_dir = Path(self.root) / 'proj' / 'src' / 'shared'
+        shared_dir.mkdir(parents=True)
+        (shared_dir / 'mod.py').write_text('def ok_fn():\n    return 2\n')
+        deep_importer = deep_dir / 'deep.py'
+        deep_importer.write_text('from ..shared.mod import ok_fn, missing_deep\n')
+        errors = check_allowed_files_syntax([str(rel_importer), str(deep_importer)])
+        self.assertIn("%s:1: cannot import name 'missing_rel' from '.'" % rel_importer, errors)
+        self.assertIn("%s:1: cannot import name 'missing_deep' from 'shared.mod'" % deep_importer,
+                      errors)
+        # Valid imports pass: existing symbol and existing submodule.
+        pkg_ok = self.path('pkg_ok.py')
+        with open(pkg_ok, 'w') as fh:
+            fh.write('from pkg.sub import real\nfrom pkg import sub\n')
+        self.assertEqual(check_allowed_files_syntax([pkg_ok]), [])
+        # Dynamic targets (globals() / wildcard import) are skipped.
+        dyn, dyn_importer = self.path('dynamic.py'), self.path('dynamic_importer.py')
+        with open(dyn, 'w') as fh:
+            fh.write('globals()\n')
+        with open(dyn_importer, 'w') as fh:
+            fh.write('from dynamic import anything_at_all\n')
+        wildcard, wildcard_importer = self.path('wildcard.py'), self.path('wildcard_importer.py')
+        with open(wildcard, 'w') as fh:
+            fh.write('from other import *\n')
+        with open(wildcard_importer, 'w') as fh:
+            fh.write('from wildcard import whatever\n')
+        self.assertEqual(
+            check_allowed_files_syntax([dyn_importer, wildcard_importer, dyn, wildcard]), [])
 
     def test_compact_stale_reads(self):
         long_a, long_b = 'x' * 700, 'y' * 700
@@ -3944,6 +3990,87 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             with open(target, 'r', encoding='utf-8') as fh:
                 self.assertEqual(fh.read(), 'VALUE = 0\n')
 
+    def test_proxy_reset_session_clears_turn_and_block_preserving_dispatched(self):
+        with tempfile.TemporaryDirectory():
+            proxy = OpenRouterGuardProxy(lambda: None, upstream_url='http://127.0.0.1:9')
+            try:
+                proxy._turn_count = 5
+                proxy._blocked_reason = 'step_limit'
+                proxy._dispatched.append({'task_id': 't1', 'cost': 0.01})
+                proxy._auth_bearer = 'Bearer test-key'
+                proxy.sticky_provider = 'provider-a'
+
+                proxy.reset_session()
+
+                self.assertEqual(proxy._turn_count, 0)
+                self.assertIsNone(proxy.blocked_reason)
+                self.assertEqual(proxy.summary()['dispatched_count'], 1)
+                self.assertEqual(proxy.auth_bearer, 'Bearer test-key')
+                self.assertEqual(proxy.sticky_provider, 'provider-a')
+            finally:
+                proxy.server_close()
+
+    def test_micro_repair_step_limit_salvage_passes_when_validation_passes(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_repair_salvage_ok.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repair-salvage-pass',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                    'max_steps': 6,
+                    'max_cost_usd': 0.10,
+                }, fh)
+
+            calls = {'n': 0}
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                        fh.write('VALUE = 1\n')
+                    result['steps'] = 2
+                    result['cost'] = 0.01
+                    result['observed_cost'] = 0.01
+                    return
+                with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 2\n')
+                result['steps'] = 3
+                result['cost'] = 0.01
+                result['observed_cost'] = 0.01
+                raise GuardError('step_limit')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls['n'], 2)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertEqual(res['status'], 'validation_passed_review_required')
+            self.assertTrue(res['micro_repair_attempted'])
+            self.assertEqual(res['salvaged_from'], 'micro_repair_step_limit')
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 2\n')
+
     def test_validate_task_adaptive_steps_floor(self):
         with tempfile.TemporaryDirectory() as tmp:
             f1 = os.path.join(tmp, 'a.py')
@@ -4414,6 +4541,74 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertIn('[CURRENT_ON_DISK_EXCERPTS]', prompt)
             self.assertIn('155:', prompt)
             self.assertIn('[TEST_ARGV FAILURE — fix only the failing assertion/import]', prompt)
+
+    def test_extract_failing_test_excerpts_nodeids_and_ast_window(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = os.path.join(tmp, 'tests')
+            os.makedirs(tests_dir)
+            sample_path = os.path.join(tests_dir, 'test_sample.py')
+            with open(sample_path, 'w') as fh:
+                fh.write('def helper():\n    return 1\n\n\n'
+                         'def test_alpha():\n    assert helper() == 1\n\n\n'
+                         'def test_beta():\n    assert helper() == 2\n')
+            excluded_path = os.path.join(tests_dir, 'test_excluded.py')
+            with open(excluded_path, 'w') as fh:
+                fh.write('def test_excluded():\n    assert False\n')
+            log = ('FAILED tests/test_sample.py::test_beta - AssertionError\n'
+                   'tests/test_sample.py:10: AssertionError\n')
+            out = extract_failing_test_excerpts(
+                log, tmp, exclude_files=[excluded_path], max_chars=4000)
+            self.assertTrue(out.startswith(
+                '[FAILING_TEST_CONTEXT — READ-ONLY test source; do NOT call read or edit on test files]:'))
+            self.assertIn('Failing nodeids: tests/test_sample.py::test_beta', out)
+            self.assertIn('--- tests/test_sample.py (READ-ONLY test excerpt)', out)
+            self.assertIn('def test_beta', out)
+            self.assertIn('L10:', out)
+            self.assertNotIn('test_excluded', out)
+            # every test file excluded -> nothing left on disk
+            self.assertEqual(extract_failing_test_excerpts(
+                log, tmp,
+                exclude_files=[excluded_path, sample_path], max_chars=4000), '')
+            # no test files on disk at all
+            self.assertEqual(extract_failing_test_excerpts(
+                log, os.path.join(tmp, 'missing'), max_chars=4000), '')
+            # max_chars respected
+            self.assertLessEqual(
+                len(extract_failing_test_excerpts(log, tmp, max_chars=120)), 120)
+
+    def test_build_micro_repair_prompt_includes_external_failing_test(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            app_path = os.path.join(tmp, 'app.py')
+            with open(app_path, 'w') as fh:
+                fh.write('def compute(x):\n    return x * 2\n')
+            tests_dir = os.path.join(tmp, 'tests')
+            os.makedirs(tests_dir)
+            with open(os.path.join(tests_dir, 'test_app.py'), 'w') as fh:
+                fh.write('from app import compute\n\n\n'
+                         'def test_compute():\n    assert compute(2) == 4\n')
+            run_dir = os.path.join(tmp, 'run')
+            os.makedirs(run_dir)
+            with open(os.path.join(run_dir, 'test.log'), 'w') as fh:
+                fh.write('FAILED tests/test_app.py::test_compute - AssertionError\n'
+                         'tests/test_app.py:2: AssertionError\n')
+            task = {
+                'directory': tmp,
+                'prompt': 'Fix app.py.',
+                'files': [app_path],
+                'read_only_files': [],
+                'test_argv': ['/bin/pytest', '-q'],
+            }
+            prompt = build_micro_repair_prompt(task, run_dir)
+            self.assertIn('[FAILING_TEST_CONTEXT — READ-ONLY test source; do NOT call read or edit on test files]:',
+                          prompt)
+            self.assertIn('READ-ONLY test excerpt', prompt)
+            self.assertIn('def test_compute():', prompt)
+            self.assertIn('assert compute(2) == 4', prompt)
+            self.assertLess(
+                prompt.index('[FAILING_TEST_CONTEXT'),
+                prompt.index('[TEST_ARGV FAILURE — fix only the failing assertion/import]'))
 
     def test_compute_repair_max_steps(self):
         self.assertEqual(compute_repair_max_steps({'files': ['a.py']}), 6)
@@ -5842,6 +6037,200 @@ class TestH42AutoEscalation(HarnessTestCase):
                 self.assertEqual(cli_main(['run', '--best-of-2', str(t_single)]), 0)
                 mock_b2.assert_called_once()
 
+    def test_harnesses_env_auto_escalate_and_overrides(self):
+        import tempfile
+        import unittest.mock as _mock
+        from pathlib import Path
+        from harness import should_auto_escalate
+        from harness.proxy import GuardError
+        from harness.sandbox import run_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp).resolve()
+            with _mock.patch.dict(os.environ, {'HARNESS_AUTO_ESCALATE': '1'}):
+                self.assertTrue(should_auto_escalate({}))
+                self.assertFalse(should_auto_escalate({'mode': 'patch'}))
+                self.assertFalse(should_auto_escalate({'auto_escalate': False}))
+                self.assertFalse(should_auto_escalate({'strategy': 'single'}))
+
+                t_env = self._write_task(tmp_path)
+                with _mock.patch('harness.sandbox.run_best_of_2', return_value=0) as mock_b2:
+                    self.assertEqual(run_task(str(t_env)), 0)
+                    mock_b2.assert_called_once()
+
+                t_off = self._write_task(tmp_path, auto_escalate=False)
+                t_single = self._write_task(tmp_path, strategy='single')
+                with _mock.patch('harness.sandbox.run_best_of_2') as mock_b2:
+                    with _mock.patch('harness.sandbox.model_run'):
+                        with _mock.patch('harness.sandbox.execute', return_value=(0, 'ok')):
+                            for task_path in (t_off, t_single):
+                                run_task(str(task_path))
+                    mock_b2.assert_not_called()
+
+    def test_micro_repair_skips_retest_when_files_unchanged(self):
+        import sqlite3
+        import subprocess
+        import tempfile
+        import unittest.mock as _mock
+        from pathlib import Path
+        from harness.sandbox import run_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = os.path.join(tmp, 'stub_opencode_cli.py')
+            script = '''#!{python}
+import json
+import os
+import sqlite3
+import sys
+
+argv = sys.argv[1:]
+if argv[:4] == ['api', '--standalone', 'GET', '/api/agent']:
+    if os.environ.get('STUB_CLI_BAD_CONFIG') == '1':
+        sys.exit(1)
+    if os.environ.get('STUB_CLI_BAD_JSON') == '1':
+        print('not-json')
+        sys.exit(0)
+    if os.environ.get('STUB_CLI_BAD_PERMS') == '1':
+        print(json.dumps({{'data': [{{'id': 'guarded_worker', 'steps': 1, 'permissions': []}}]}}))
+        sys.exit(0)
+    if os.environ.get('STUB_CLI_FALLBACK_AGENTS') == '1':
+        print(json.dumps({{'data': []}}))
+        sys.exit(0)
+    with open(os.path.join(os.getcwd(), 'opencode.jsonc'), 'r', encoding='utf-8') as fh:
+        cfg = json.load(fh)
+    gw = cfg['agents']['guarded_worker']
+    print(json.dumps({{'data': [{{'id': 'guarded_worker', 'steps': gw['steps'], 'permissions': gw['permissions']}}]}}))
+    sys.exit(0)
+
+if argv[:2] == ['debug', 'agents']:
+    with open(os.path.join(os.getcwd(), 'opencode.jsonc'), 'r', encoding='utf-8') as fh:
+        cfg = json.load(fh)
+    gw = cfg['agents']['guarded_worker']
+    print(json.dumps([{{'id': 'guarded_worker', 'steps': gw['steps'], 'permissions': gw['permissions']}}]))
+    sys.exit(0)
+
+if argv and argv[0] == 'run':
+    sid = argv[argv.index('--session') + 1]
+    prompt = argv[-1]
+    files = []
+    for line in prompt.splitlines():
+        if line.startswith('['):
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, list) and parsed and all(isinstance(x, str) for x in parsed):
+                    files = parsed
+                    break
+            except ValueError:
+                pass
+    db_path = os.environ['HARNESS_TEST_DB']
+    cost = float(os.environ.get('STUB_CLI_COST', '0.015'))
+    finish = os.environ.get('STUB_CLI_FINISH', 'stop')
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute('INSERT INTO session_v2 (id, cost, time_busy, idle_outcome) VALUES (?, ?, 1.0, NULL)', (sid, cost))
+        msg = {{
+            'id': 'gen-' + sid,
+            'cost': cost,
+            'tokens': {{'input': 80, 'output': 20}},
+            'content': [],
+        }}
+        if finish:
+            msg['finish'] = finish
+        conn.execute('INSERT INTO session_message (session_id, type, data) VALUES (?, ?, ?)', (sid, 'assistant', json.dumps(msg)))
+        conn.commit()
+    finally:
+        conn.close()
+    if os.environ.get('STUB_CLI_NO_CHANGE') != '1' and files:
+        content = (
+            os.environ.get('STUB_CLI_REPAIR_CONTENT', 'VALUE = 2\\n')
+            if '[TEST_ARGV FAILURE' in prompt
+            else os.environ.get('STUB_CLI_INITIAL_CONTENT', 'VALUE = 1\\n')
+        )
+        with open(files[0], 'w', encoding='utf-8') as fh:
+            fh.write(content)
+    sys.exit(int(os.environ.get('STUB_CLI_EXIT', '0')))
+
+sys.exit(1)
+'''.format(python=sys.executable)
+            with open(cli_path, 'w', encoding='utf-8') as fh:
+                fh.write(script)
+            os.chmod(cli_path, 0o755)
+
+            db_path = os.path.join(tmp, 'opencode.db')
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute('CREATE TABLE session_v2 (id TEXT PRIMARY KEY, cost REAL, time_busy REAL, idle_outcome TEXT)')
+                conn.execute('CREATE TABLE session_message (session_id TEXT, type TEXT, data TEXT)')
+                conn.commit()
+            finally:
+                conn.close()
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            os.makedirs(repo, exist_ok=True)
+            target = os.path.join(repo, 'target.py')
+            with open(target, 'w', encoding='utf-8') as fh:
+                fh.write('VALUE = 0\n')
+            for cmd in (
+                ['/usr/bin/git', 'init'],
+                ['/usr/bin/git', 'config', 'user.email', 'test@example.com'],
+                ['/usr/bin/git', 'config', 'user.name', 'Test User'],
+                ['/usr/bin/git', 'add', 'target.py'],
+                ['/usr/bin/git', 'commit', '-m', 'init'],
+            ):
+                subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+
+            task_path = os.path.join(tmp, 'task_repair_no_change.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repair-no-change',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                    'max_steps': 6,
+                    'max_cost_usd': 0.10,
+                }, fh)
+
+            calls = {'n': 0}
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                        fh.write('VALUE = 1\n')
+                    result['steps'] = 2
+                    result['cost'] = 0.01
+                    result['observed_cost'] = 0.01
+                    return
+                result['steps'] = 1
+                result['cost'] = 0.005
+                result['observed_cost'] = 0.005
+
+            real_execute = run_task.__globals__['execute']
+
+            with _mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with _mock.patch('harness.sandbox.execute', side_effect=real_execute) as mock_exec:
+                    res = run_task(task_path, cli=cli_path, db=db_path, state=state_dir,
+                                   _return_result=True)
+            self.assertEqual(res['status'], 'blocked')
+            self.assertEqual(res['reason'], 'validation_failed')
+            self.assertTrue(res['micro_repair_attempted'])
+            self.assertEqual(calls['n'], 2)
+            test_exec_calls = [
+                c for c in mock_exec.call_args_list
+                if c.args[0] == [sys.executable, '-c', test_code]
+            ]
+            self.assertEqual(len(test_exec_calls), 1)
+            with open(os.path.join(res['artifact'], 'events.jsonl'), 'r', encoding='utf-8') as fh:
+                events_text = fh.read()
+            self.assertIn('micro_repair_no_change', events_text)
+
 
 class ExportSmlDatasetTest(unittest.TestCase):
     def _run_dir(self, state_dir, name, mtime, result, patch=None, request_lines=None):
@@ -5993,6 +6382,133 @@ class ExportSmlDatasetTest(unittest.TestCase):
             self.assertEqual(dpo[0]['task_id'], 'task-a')
             self.assertEqual(dpo[0]['chosen_patch'], 'patch a')
             self.assertEqual(dpo[0]['rejected_patch'], 'bad patch')
+
+    def _clean_only_runs(self, state_dir):
+        passed = 'validation_passed_review_required'
+        self._run_dir(
+            state_dir, 'run-clean', 1000,
+            {'task_id': 't-clean', 'run_id': 'run-clean', 'status': passed,
+             'model': 'flash', 'steps': 5, 'prompt': 'p', 'files': []},
+            patch='clean patch',
+            request_lines=[{'messages': [{'role': 'user', 'content': 'ok'}]}])
+        self._run_dir(
+            state_dir, 'run-repair', 2000,
+            {'task_id': 't-repair', 'run_id': 'run-repair', 'status': passed,
+             'model': 'flash', 'steps': 5, 'micro_repair_attempted': True,
+             'prompt': 'p', 'files': []},
+            patch='repaired patch')
+        self._run_dir(
+            state_dir, 'run-salvaged', 3000,
+            {'task_id': 't-salvaged', 'run_id': 'run-salvaged', 'status': passed,
+             'model': 'flash', 'steps': 5, 'salvaged_from': 'step_limit',
+             'prompt': 'p', 'files': []},
+            patch='salvaged patch')
+        self._run_dir(
+            state_dir, 'run-hint', 4000,
+            {'task_id': 't-hint', 'run_id': 'run-hint', 'status': passed,
+             'model': 'flash', 'steps': 5, 'prompt': 'p', 'files': []},
+            patch='hint patch',
+            request_lines=[{'messages': [{'role': 'user', 'content': '[HARNESS_EDIT_HINT: fix line]'}]}])
+        self._run_dir(
+            state_dir, 'run-guard', 5000,
+            {'task_id': 't-guard', 'run_id': 'run-guard', 'status': passed,
+             'model': 'flash', 'steps': 5, 'prompt': 'p', 'files': []},
+            patch='guard patch',
+            request_lines=[{'messages': [{'role': 'user', 'content': '[GUARD LOOP WARNING: stop]'}]}])
+        self._run_dir(
+            state_dir, 'run-too-long', 6000,
+            {'task_id': 't-long', 'run_id': 'run-too-long', 'status': passed,
+             'model': 'flash', 'steps': 12, 'prompt': 'p', 'files': []},
+            patch='long patch')
+        self._run_dir(
+            state_dir, 'run-zero-steps', 7000,
+            {'task_id': 't-zero', 'run_id': 'run-zero-steps', 'status': passed,
+             'model': 'flash', 'steps': 0, 'prompt': 'p', 'files': []},
+            patch='zero patch')
+
+    def test_export_sft_clean_only_and_max_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            self._clean_only_runs(state_dir)
+
+            all_runs = export_sml_dataset(state_dir, mode='sft')
+            self.assertEqual(len(all_runs), 7)
+            self.assertEqual({r['run_id'] for r in all_runs},
+                             {'run-clean', 'run-repair', 'run-salvaged', 'run-hint',
+                              'run-guard', 'run-too-long', 'run-zero-steps'})
+
+            clean = export_sml_dataset(state_dir, mode='sft', clean_only=True)
+            self.assertEqual({r['run_id'] for r in clean},
+                             {'run-clean', 'run-too-long', 'run-zero-steps'})
+
+            clean_short = export_sml_dataset(state_dir, mode='sft',
+                                             clean_only=True, max_steps=8)
+            self.assertEqual([r['run_id'] for r in clean_short], ['run-clean'])
+
+    def test_export_dpo_clean_only_and_max_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            passed = 'validation_passed_review_required'
+            # dirty chosen run (micro-repair attempted) -> excluded by clean_only
+            self._run_dir(
+                state_dir, 'task-1-rejected', 1000,
+                {'task_id': 'task-1', 'run_id': 'r1-rej', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash', 'prompt': 'p1', 'files': []},
+                patch='bad patch 1')
+            self._run_dir(
+                state_dir, 'task-1-chosen', 2000,
+                {'task_id': 'task-1', 'run_id': 'r1-ok', 'status': passed,
+                 'model': 'pro', 'prompt': 'p1', 'files': [],
+                 'micro_repair_attempted': True},
+                patch='repaired patch')
+            # too many steps chosen run -> excluded by max_steps
+            self._run_dir(
+                state_dir, 'task-2-rejected', 3000,
+                {'task_id': 'task-2', 'run_id': 'r2-rej', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash', 'prompt': 'p2', 'files': []},
+                patch='bad patch 2')
+            self._run_dir(
+                state_dir, 'task-2-chosen', 4000,
+                {'task_id': 'task-2', 'run_id': 'r2-ok', 'status': passed,
+                 'model': 'pro', 'prompt': 'p2', 'files': [], 'steps': 12},
+                patch='long patch')
+            # clean chosen run -> paired even with clean_only/max_steps
+            self._run_dir(
+                state_dir, 'task-3-rejected', 5000,
+                {'task_id': 'task-3', 'run_id': 'r3-rej', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash', 'prompt': 'p3', 'files': []},
+                patch='bad patch 3')
+            self._run_dir(
+                state_dir, 'task-3-chosen', 6000,
+                {'task_id': 'task-3', 'run_id': 'r3-ok', 'status': passed,
+                 'model': 'pro', 'prompt': 'p3', 'files': [], 'steps': 4},
+                patch='good patch 3')
+
+            pairs = export_sml_dataset(state_dir, mode='dpo')
+            self.assertEqual({p['chosen_run_id'] for p in pairs},
+                             {'r1-ok', 'r2-ok', 'r3-ok'})
+
+            filtered = export_sml_dataset(state_dir, mode='dpo',
+                                          clean_only=True, max_steps=8)
+            self.assertEqual([p['chosen_run_id'] for p in filtered], ['r3-ok'])
+            self.assertEqual(filtered[0]['chosen_patch'], 'good patch 3')
+            self.assertEqual(filtered[0]['rejected_patch'], 'bad patch 3')
+
+    def test_cli_export_dataset_clean_only_and_max_steps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            self._clean_only_runs(state_dir)
+
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(cli_main(['export-dataset', '--state-dir', str(state_dir),
+                                           '--mode', 'sft', '--clean-only',
+                                           '--max-steps', '6']), 0)
+            stdout_records = [json.loads(line) for line in buffer.getvalue().splitlines()
+                              if line.strip().startswith('{')]
+            self.assertEqual(len(stdout_records), 1)
+            self.assertEqual(stdout_records[0]['run_id'], 'run-clean')
+            self.assertEqual(stdout_records[0]['patch'], 'clean patch')
 
 
 if __name__ == '__main__':

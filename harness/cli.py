@@ -359,7 +359,13 @@ def _run_run(args: argparse.Namespace) -> int:
 
 
 def _run_export_dataset(args: argparse.Namespace) -> int:
-    records = export_sml_dataset(args.state_dir, output_path=args.output, mode=args.mode)
+    records = export_sml_dataset(
+        args.state_dir,
+        output_path=args.output,
+        mode=args.mode,
+        clean_only=args.clean_only,
+        max_steps=args.max_steps,
+    )
     if args.output is None:
         for record in records:
             print(json.dumps(record, ensure_ascii=False))
@@ -566,6 +572,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--output",
         default=None,
         help="optional JSONL output path (default: print records to stdout)",
+    )
+    export_dataset.add_argument(
+        "--clean-only",
+        action="store_true",
+        help="exclude runs with micro-repair, salvage, or guard-intervention markers",
+    )
+    export_dataset.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="keep only runs with a positive step count at or below this cap",
     )
     export_dataset.set_defaults(handler=_run_export_dataset)
 

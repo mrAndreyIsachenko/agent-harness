@@ -973,11 +973,44 @@ def _load_run_messages(run_dir: Path) -> list:
     return messages
 
 
+_GUARD_INTERVENTION_MARKERS = (
+    "[HARNESS_EDIT_HINT",
+    "[HARNESS_READ_HINT",
+    "[HARNESS_READ_BUDGET_WARNING",
+    "[GUARD LOOP WARNING",
+    "[AST PREFLIGHT ERROR",
+    "[EDIT OSCILLATION WARNING",
+)
+
+
+def _is_clean_sft_run(result: dict, messages: list[dict]) -> bool:
+    """Return False for runs tainted by micro-repair, salvage, or guard hints."""
+    if not isinstance(result, dict):
+        result = {}
+    if result.get("micro_repair_attempted") or result.get("salvaged_from"):
+        return False
+    for msg in messages or []:
+        if isinstance(msg, str):
+            content = msg
+        elif isinstance(msg, dict) and isinstance(msg.get("content"), str):
+            content = msg["content"]
+        else:
+            try:
+                content = json.dumps(msg, ensure_ascii=False)
+            except (TypeError, ValueError):
+                content = str(msg)
+        if any(marker in content for marker in _GUARD_INTERVENTION_MARKERS):
+            return False
+    return True
+
+
 def export_sml_dataset(
     state_dir: str | Path,
     output_path: str | Path | None = None,
     *,
     mode: str = "sft",
+    clean_only: bool = False,
+    max_steps: int | None = None,
 ) -> list[dict]:
     """Export Small Model Lab fine-tuning (SFT) or preference (DPO) records.
 
@@ -987,6 +1020,10 @@ def export_sml_dataset(
     (rejected blocked run followed by a chosen passing run) within a task
     group. When ``output_path`` is given, records are atomically written as
     JSONL; the records are also returned as a list of dicts.
+
+    With ``clean_only=True``, runs carrying micro-repair/salvage flags or any
+    guard-intervention marker are filtered out. With ``max_steps``, only runs
+    with a positive step count at or below the cap are kept.
     """
     if mode not in ("sft", "dpo"):
         raise ValueError(f"Unsupported mode: {mode!r}; expected 'sft' or 'dpo'")
@@ -1007,6 +1044,11 @@ def export_sml_dataset(
             passed = summary.get("passed") is True or status in PASS_STATUSES
             has_content = bool(patch.strip()) or bool(messages)
             if not (passed and has_content):
+                continue
+            steps = summary.get("steps", 0)
+            if max_steps is not None and (steps <= 0 or steps > max_steps):
+                continue
+            if clean_only and not _is_clean_sft_run(result, messages):
                 continue
             records.append({
                 "task_id": task_id,
@@ -1041,6 +1083,9 @@ def export_sml_dataset(
                 "status": status,
                 "passed": summary.get("passed") is True,
                 "model": summary.get("model"),
+                "steps": summary.get("steps", 0),
+                "result": result,
+                "run_dir": run_dir,
                 "reason": str(
                     _first(result, ("reason", "blocked_reason", "error_reason", "failure_reason"))
                     or ""
@@ -1063,6 +1108,14 @@ def export_sml_dataset(
                     or entry["passed"]
                     or entry["status"] in PASS_STATUSES
                 ) and bool(entry["patch"].strip())
+                if is_chosen and max_steps is not None and (
+                    entry["steps"] <= 0 or entry["steps"] > max_steps
+                ):
+                    is_chosen = False
+                if is_chosen and clean_only:
+                    messages = _load_run_messages(Path(entry["run_dir"]))
+                    if not _is_clean_sft_run(entry["result"], messages):
+                        is_chosen = False
                 if is_rejected:
                     pending_rejected = entry
                     continue

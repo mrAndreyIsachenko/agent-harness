@@ -423,11 +423,11 @@ $ harness stats --state-dir state/ --insights       # live stats + failure insig
 $ harness replay --state-dir state/                 # offline A/B replay simulation
 $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
 $ harness trace --sync-state state/                 # backfill runs to Phoenix OTLP (H-20)
-$ harness export-dataset --state-dir state/ --mode sft --output sft.jsonl
+$ harness export-dataset --state-dir state/ --mode sft --clean-only --max-steps 6 --output sft.jsonl
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-44
+## Capabilities H-15 .. H-49
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -451,6 +451,11 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-42** | Recoverable-failure auto-escalation (`ESCALATABLE_BLOCK_REASONS`, `auto_escalate`, `harness run --best-of-2`) skipping Candidate 2 on fatal lock/budget/config blocks | `sandbox.py`, `cli.py` |
 | **H-43** | Zero-read fast path: AST/symbol window preloading for long editable files (`_symbol_line_windows`), `COMPLETE FILE PRELOADED` header, and redundant-read guard hint | `guards.py` |
 | **H-44** | Small Model Lab SFT & DPO trajectory dataset exporter (`export_sml_dataset`, `harness export-dataset --mode sft\|dpo`) | `report.py`, `cli.py` |
+| **H-45** | Micro-repair salvage validation on `step_limit`/`worker_timeout` (`salvaged_from = micro_repair_<reason>`) and `OpenRouterGuardProxy.reset_session()` | `sandbox.py`, `proxy.py` |
+| **H-46** | Cross-file dotted package & relative `ImportFrom` symbol pre-flight (`_resolve_importfrom_target`, `_sibling_import_errors` across `known_files`) | `guards.py` |
+| **H-47** | Failing pytest source excerpt & nodeid injection into `build_micro_repair_prompt` (`extract_failing_test_excerpts`, `[FAILING_TEST_CONTEXT]`) | `guards.py`, `sandbox.py` |
+| **H-48** | Global `HARNESS_AUTO_ESCALATE` env toggle (`should_auto_escalate`) and `micro_repair_no_change` redundant test-run skip | `sandbox.py` |
+| **H-49** | Golden-trajectory SFT/DPO dataset filter (`--clean-only`, `--max-steps`, `_is_clean_sft_run` excluding guard-intervened/repaired runs) | `report.py`, `cli.py` |
 
 ## Quickstart
 
@@ -476,5 +481,5 @@ return `429 guard_stop` — that is the supervisor's budget/deadline hook.
 No third-party dependencies: Python ≥ 3.10 standard library only.
 
 ```console
-$ pytest -q tests/test_harness.py    # H-1..H-44 contract suite (153 unittest/pytest cases)
+$ pytest -q tests/test_harness.py    # H-1..H-49 contract suite (163 unittest/pytest cases)
 ```

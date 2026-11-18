@@ -59,7 +59,7 @@ from .finops import (
     violation,
 )
 from .guards import (build_file_skeletons, build_preloaded_file_excerpts,
-                     extract_compact_test_failure)
+                     extract_compact_test_failure, extract_failing_test_excerpts)
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
 from .report import build_repo_memory_hint
 from .routing import DEFAULT_MODEL, MODELS, TEACHER_MODELS, ProviderHealthStore
@@ -613,6 +613,13 @@ def build_micro_repair_prompt(task, run_dir, originals=None):
         prompt += '\n\n[TRAJSPEC_MODIFIED_SYMBOLS]\n' + '\n'.join(trajspec_lines)
     if excerpts:
         prompt += '\n\n[CURRENT_ON_DISK_EXCERPTS]\n' + excerpts
+    failing_test_excerpts = extract_failing_test_excerpts(
+        test_log_text,
+        task.get('directory'),
+        exclude_files=list(task.get('files', ())) + list(task.get('read_only_files', ())),
+    )
+    if failing_test_excerpts:
+        prompt += '\n\n' + failing_test_excerpts
     prompt += (
         '\n\n[TEST_ARGV FAILURE — fix only the failing assertion/import]:\n'
         'Apply the minimal targeted edit directly to fix the failure above; '
@@ -790,6 +797,19 @@ def compute_repair_max_steps(task: dict) -> int:
     return min(MAX_STEPS, max(6, 4 + 2 * len(task.get('files', ()))))
 
 
+def should_auto_escalate(raw_task: dict) -> bool:
+    """Decide whether a raw task dict should run through the best_of_2 path."""
+    if not isinstance(raw_task, dict) or raw_task.get('mode', 'model') != 'model':
+        return False
+    if raw_task.get('strategy') == 'best_of_2':
+        return True
+    if raw_task.get('strategy') == 'single' and raw_task.get('auto_escalate') is not True:
+        return False
+    if isinstance(raw_task.get('auto_escalate'), bool):
+        return raw_task['auto_escalate']
+    return os.environ.get('HARNESS_AUTO_ESCALATE', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
 def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None,
              _quiet=False, _return_result=False):
     if cli is None:
@@ -803,11 +823,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             raw_strategy = json.loads(Path(task_path).read_text())
         except (OSError, ValueError):
             raw_strategy = {}
-        if (
-            isinstance(raw_strategy, dict)
-            and (raw_strategy.get('strategy') == 'best_of_2' or raw_strategy.get('auto_escalate') is True)
-            and raw_strategy.get('mode', 'model') == 'model'
-        ):
+        if should_auto_escalate(raw_strategy):
             return run_best_of_2(task_path, cli=cli, db=db, state=state,
                                  upstream_url=upstream_url, fetch=fetch)
     result = {'status': 'rejected', 'reason': '', 'artifact': None}
@@ -944,6 +960,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             capture_files(run_dir, tracked)
                             if salvage_candidate is not None:
                                 raise GuardError(salvage_candidate)
+                            repair_salvage_reason = None
                             if (task.get('auto_micro_repair', True)
                                     and task['mode'] == 'model'
                                     and (run_dir / 'changes.patch').exists()
@@ -966,11 +983,25 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 result['session_id'] = sid2
                                 result['micro_repair_session_id'] = sid2
                                 result['micro_repair_attempted'] = True
+                                hashes_before_repair = _fh(task['files'])
+                                if proxy is not None and hasattr(proxy, 'reset_session'):
+                                    proxy.reset_session()
                                 try:
                                     event(run_dir, 'micro_repair_started', session_id=sid2)
-                                    model_run(cli, db, repair_task, run_dir, result,
-                                              max(0.0, budget - primary_cost),
-                                              proxy=proxy, started_ref=started_ref)
+                                    try:
+                                        model_run(cli, db, repair_task, run_dir, result,
+                                                  max(0.0, budget - primary_cost),
+                                                  proxy=proxy, started_ref=started_ref)
+                                    except GuardError as exc:
+                                        if (str(exc) in ('step_limit', 'worker_timeout')
+                                                and _fh(task['files']) != hashes_before_repair):
+                                            capture_files(run_dir, tracked)
+                                            _snapshot_files_for_feedback(run_dir, task['files'], 'after')
+                                            repair_salvage_reason = str(exc)
+                                            event(run_dir, 'micro_repair_salvage_started',
+                                                  reason=repair_salvage_reason)
+                                        else:
+                                            raise
                                 finally:
                                     result['steps'] = primary_steps + (result.get('steps') or 0)
                                     repair_cost = result.get('cost')
@@ -981,11 +1012,16 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                                                or repair_observed is None
                                                                else primary_observed + repair_observed)
                                     result['session_id'] = primary_sid
-                                result['test_return_code'] = execute(task['test_argv'], task['directory'],
-                                                                    task['test_timeout_seconds'],
-                                                                    run_dir / 'test.log')
+                                if _fh(task['files']) == hashes_before_repair:
+                                    event(run_dir, 'micro_repair_no_change')
+                                else:
+                                    result['test_return_code'] = execute(task['test_argv'], task['directory'],
+                                                                        task['test_timeout_seconds'],
+                                                                        run_dir / 'test.log')
                             if result['test_return_code']:
-                                raise GuardError('validation_failed')
+                                raise GuardError(repair_salvage_reason or 'validation_failed')
+                            if repair_salvage_reason is not None:
+                                result['salvaged_from'] = f'micro_repair_{repair_salvage_reason}'
                         if ro_files and _fh(ro_files) != ro_hashes_before:
                             raise GuardError('read_only_file_modified')
                         if task.get('origin_files'):

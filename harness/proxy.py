@@ -118,6 +118,12 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
         with self._lock:
             return self._blocked_reason
 
+    def reset_session(self) -> None:
+        """Reset per-session turn and block state while preserving billing and sticky provider."""
+        with self._lock:
+            self._turn_count = 0
+            self._blocked_reason = None
+
     def summary(self):
         with self._lock:
             return {'dispatched_count': len(self._dispatched),
