@@ -1401,6 +1401,55 @@ _PRELOAD_SECTION_MARKERS = (
 )
 
 
+def _parse_json_str_list(raw: str) -> list[str]:
+    """Parse a JSON array of non-empty strings, returning [] on mismatch."""
+    try:
+        parsed = json.loads(raw.strip())
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, str) and item]
+
+
+def _extract_allowed_read_paths_from_prompt(first_user_text: str) -> list[str]:
+    """Extract allowed file paths from sandboxed prompt headers."""
+    if not first_user_text:
+        return []
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    def _add_all(items: list[str]) -> None:
+        for item in items:
+            if item not in seen:
+                seen.add(item)
+                paths.append(item)
+
+    lines = first_user_text.splitlines()
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("Read/edit ONLY the listed files"):
+            if ":" in stripped:
+                after_colon = stripped.split(":", 1)[1].strip()
+                if after_colon.startswith("["):
+                    _add_all(_parse_json_str_list(after_colon))
+                    continue
+            for offset in range(1, 5):
+                if idx + offset >= len(lines):
+                    break
+                candidate = lines[idx + offset].strip()
+                if candidate.startswith("["):
+                    parsed = _parse_json_str_list(candidate)
+                    if parsed:
+                        _add_all(parsed)
+                        break
+        elif stripped.startswith("Read ONLY these source files:"):
+            _add_all(_parse_json_str_list(stripped.split(":", 1)[1]))
+        elif stripped.startswith("Read-only reference files (do NOT edit):"):
+            _add_all(_parse_json_str_list(stripped.split(":", 1)[1]))
+    return paths
+
+
 def _preloaded_hint_for(
     messages: list[dict[str, Any]],
     result_text: str,
@@ -1422,6 +1471,15 @@ def _preloaded_hint_for(
         and path in first_user
     ):
         return _READ_PRELOADED_PERMISSION_HINT
+    allowed_paths = _extract_allowed_read_paths_from_prompt(first_user)
+    if allowed_paths:
+        target = path or "<unknown>"
+        allowed_str = ", ".join(allowed_paths)
+        return (
+            f"\n[HARNESS_READ_HINT: Permission denied for '{target}'. "
+            f"You ONLY have read permission for: {allowed_str}. "
+            "Do NOT call read on any other path; apply your edit directly to the allowed files.]"
+        )
     return _READ_PERMISSION_HINT
 
 

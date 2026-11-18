@@ -583,12 +583,15 @@ def metrics(snap):
         steps += 1
         model_error |= bool(data.get('error'))
         unfinished |= not bool(data.get('finish'))
+        turn_input_errors = _Counter()
         for part in data.get('content', []):
             if part.get('type') != 'tool':
                 continue
             st = part.get('state', {})
             if st.get('status') == 'error':
-                errors[(part.get('name'), json.dumps(st.get('error'), sort_keys=True))] += 1
+                key = (part.get('name'), json.dumps(st.get('error'), sort_keys=True))
+                inp = json.dumps(st.get('input'), sort_keys=True)
+                turn_input_errors[(key, inp)] += 1
             if part.get('name') == 'read' and st.get('status') == 'completed':
                 reads[(json.dumps(st.get('input'), sort_keys=True),
                        json.dumps(st.get('content'), sort_keys=True))] += 1
@@ -598,6 +601,14 @@ def metrics(snap):
             elif part.get('name') in {'edit', 'write', 'apply_patch'} and st.get('status') == 'completed':
                 file_reads.clear()
                 reads.clear()
+                errors.clear()
+                turn_input_errors.clear()
+        per_key_max = {}
+        for (key, _inp), cnt in turn_input_errors.items():
+            if cnt > per_key_max.get(key, 0):
+                per_key_max[key] = cnt
+        for key, inc in per_key_max.items():
+            errors[key] += inc
     return dict(cost=snap['cost'], steps=steps, compact=compact, model_error=model_error,
                 unfinished=unfinished, errors=max(errors.values(), default=0), reads=max(reads.values(), default=0),
                 file_reads=max(file_reads.values(), default=0))

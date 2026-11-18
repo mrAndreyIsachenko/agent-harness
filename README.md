@@ -427,7 +427,7 @@ $ harness export-dataset --state-dir state/ --mode sft --clean-only --max-steps 
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-54
+## Capabilities H-15 .. H-59
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -461,6 +461,11 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-52** | Enclosing `TestClass` header, `setUp`/`setUpClass`, and fixture context in `extract_failing_test_excerpts` for class-scoped test failures | `guards.py` |
 | **H-53** | `TrajSpec` on-disk line-range annotations (`_python_symbol_spans`, `sym (L<a>-L<b>)`) and automatic excerpt seeding for modified/added symbols in `build_micro_repair_prompt` | `sandbox.py` |
 | **H-54** | Test state isolation in `TestH42AutoEscalation` and ephemeral temporary test-run cleanup (`purge_ephemeral_test_runs`) | `report.py`, `test_harness.py` |
+| **H-55** | Turn-deduplicated distinct-input tool error accounting and completed-edit error counter reset in `finops.metrics` | `finops.py` |
+| **H-56** | Two-stage fast-fail pytest verification by failing nodeids after `micro_repair` (`build_targeted_pytest_argv`, `micro_repair_fast_fail`) | `sandbox.py` |
+| **H-57** | Retroactive post-edit salvage backfill for historical passing runs (`backfill_salvaged_runs`, `harness stats --backfill-salvage`) | `report.py`, `cli.py` |
+| **H-58** | Explicit allowed-files allowlist and denied-path reporting in `Permission denied: read` guard hint (`_extract_allowed_read_paths_from_prompt`) | `guards.py` |
+| **H-59** | Bounded proportional wall-clock timeout for `micro_repair` (`compute_repair_timeout_seconds`, `active_timeout_seconds`) | `sandbox.py` |
 
 ## Quickstart
 
@@ -486,5 +491,5 @@ return `429 guard_stop` — that is the supervisor's budget/deadline hook.
 No third-party dependencies: Python ≥ 3.10 standard library only.
 
 ```console
-$ pytest -q tests/test_harness.py    # H-1..H-54 contract suite (175 unittest/pytest cases)
+$ pytest -q tests/test_harness.py    # H-1..H-59 contract suite (180 unittest/pytest cases)
 ```

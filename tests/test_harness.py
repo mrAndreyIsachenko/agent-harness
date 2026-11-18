@@ -12,6 +12,7 @@ Layout under test:
 """
 
 import contextlib
+import harness
 import http.server
 import io
 import hashlib
@@ -59,7 +60,7 @@ from harness.routing import (DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
 from harness.sandbox import (GuardError, _PYTEST_PROBE_CACHE,
                              _snapshot_files_for_feedback,
                              build_micro_repair_prompt, build_prior_attempt_feedback, capture_files,
-                             compute_repair_max_steps, config_for, execute,
+                             compute_repair_max_steps, compute_repair_timeout_seconds, config_for, execute,
                              file_hashes, isolated_worktree, locks,
                              main as sandbox_main, model_run, owned_process,
                              preflight, resolve_pytest_test_argv, run_best_of_2,
@@ -4355,6 +4356,7 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertEqual(len(seen_repair_tasks), 1)
             repair_task = seen_repair_tasks[0]
             self.assertEqual(repair_task['max_steps'], 8)
+            self.assertEqual(repair_task['timeout_seconds'], 120)
             self.assertIn('Apply the minimal targeted edit directly to fix the failure above', repair_task['prompt'])
             self.assertIn('[CURRENT_PATCH]', repair_task['prompt'])
             self.assertIn('+VALUE = 1', repair_task['prompt'])
@@ -4558,6 +4560,32 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
         updated, _count = inject_read_guard_hints(anthropic_msgs)
         self.assertIn('[HARNESS_READ_BUDGET_WARNING:',
                       updated[-1]['content'][-1]['content'])
+        again, count2 = inject_read_guard_hints(updated)
+        self.assertEqual(count2, 0)
+        self.assertEqual(again, updated)
+
+    def test_h58_inject_read_guard_hints_lists_allowed_and_denied_paths(self):
+        prompt = (
+            'Read/edit ONLY the listed files; do NOT run find/glob or search for Python interpreters.\n'
+            'Batch all needed file reads into your first turn and batch edits together.\n'
+            '["/repo/a.py"]\n'
+            'Read-only reference files (do NOT edit): ["/repo/ref.py"]\n'
+            'Fix the bug.'
+        )
+        msgs = [
+            {'role': 'user', 'content': prompt},
+            {'role': 'assistant', 'tool_calls': [
+                {'id': 'r_denied', 'function': {
+                    'name': 'read', 'arguments': json.dumps({'path': '/repo/b.py'})}}]},
+            {'role': 'tool', 'tool_call_id': 'r_denied', 'content': 'Permission denied: read'},
+        ]
+        updated, count = inject_read_guard_hints(msgs)
+        self.assertEqual(count, 1)
+        hint_text = updated[2]['content']
+        self.assertIn('[HARNESS_READ_HINT:', hint_text)
+        self.assertIn("'/repo/b.py'", hint_text)
+        self.assertIn('/repo/a.py', hint_text)
+        self.assertIn('/repo/ref.py', hint_text)
         again, count2 = inject_read_guard_hints(updated)
         self.assertEqual(count2, 0)
         self.assertEqual(again, updated)
@@ -4914,6 +4942,23 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
         self.assertEqual(compute_repair_max_steps({'files': ['a.py', 'b.py']}), 8)
         self.assertEqual(compute_repair_max_steps({'files': ['a.py', 'b.py', 'c.py']}), 10)
         self.assertEqual(compute_repair_max_steps({'files': []}), 6)
+
+    def test_compute_repair_timeout_seconds(self):
+        self.assertIn('compute_repair_timeout_seconds', harness.__all__)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py'], 'timeout_seconds': 300}), 90)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py']}), 90)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py'], 'timeout_seconds': 60}), 60)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py'], 'timeout_seconds': 30}), 30)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': [], 'timeout_seconds': 300}), 90)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py', 'b.py'], 'timeout_seconds': 300}), 120)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py', 'b.py', 'c.py'], 'timeout_seconds': 300}), 150)
 
     def test_micro_repair_adaptive_steps(self):
         from unittest import mock
@@ -6869,6 +6914,67 @@ class ExportSmlDatasetTest(unittest.TestCase):
                 self.assertFalse((state_dir / 'runs' / name).exists())
             for name in ('real-1', 'keep-h42'):
                 self.assertTrue((state_dir / 'runs' / name).exists())
+
+
+class TestH55H57Fixes(unittest.TestCase):
+    def _snap(self, messages):
+        return {'cost': 0.0, 'messages': messages}
+
+    def test_h55_batched_distinct_input_errors_and_edit_reset(self):
+        from harness.finops import metrics, violation
+        msg = lambda content: ('assistant', {'cost': 0.0, 'finish': 'stop', 'content': content})
+        tool = lambda name, status, inp=None, err=None: {
+            'type': 'tool', 'name': name,
+            'state': {'status': status, 'input': inp, 'error': err}}
+        snap = self._snap([msg([
+            tool('read', 'error', {'path': '/a.py'}, 'boom'),
+            tool('read', 'error', {'path': '/b.py'}, 'boom'),
+        ])])
+        m = metrics(snap)
+        self.assertEqual(m['errors'], 1)
+        snap['messages'].append(msg([tool('read', 'error', {'path': '/a.py'}, 'boom')]))
+        m = metrics(snap)
+        self.assertEqual(m['errors'], 2)
+        v = violation(m, 1e9, 25)
+        reasons = v if isinstance(v, list) else [v]
+        self.assertIn('repeated_tool_error', reasons)
+        snap['messages'].append(msg([tool('edit', 'completed', {'path': '/a.py'})]))
+        self.assertEqual(metrics(snap)['errors'], 0)
+
+    def test_h56_build_targeted_pytest_argv(self):
+        from harness.sandbox import build_targeted_pytest_argv
+        argv = ['/venv/bin/pytest', '-q', '--tb=short', 'tests/test_harness.py']
+        out = ('FAILED tests/test_harness.py::TestX::test_one - AssertionError\n'
+               'FAILED tests/test_harness.py::TestX::test_two - AssertionError\n'
+               '2 failed, 5 passed')
+        new = build_targeted_pytest_argv(argv, out)
+        self.assertEqual(
+            new,
+            ['/venv/bin/pytest', '-q', '--tb=short',
+             'tests/test_harness.py::TestX::test_one',
+             'tests/test_harness.py::TestX::test_two'])
+        self.assertIsNone(build_targeted_pytest_argv(argv, '5 passed'))
+        self.assertIsNone(build_targeted_pytest_argv(
+            argv, 'Interrupted: 1 error during collection'))
+
+    def test_h57_backfill_salvaged_runs(self):
+        from harness.report import backfill_salvaged_runs
+        root = tempfile.mkdtemp(prefix='h55-h57-')
+        run_dir = Path(root) / 'runs' / 'blocked-run'
+        run_dir.mkdir(parents=True)
+        result = {
+            'task_id': 't1', 'run_id': 'blocked-run', 'status': 'blocked',
+            'reason': 'repeated_tool_error', 'test_return_code': 0,
+            'hashes_before': {'a.py': '1'}, 'hashes_after': {'a.py': '2'},
+        }
+        (run_dir / 'result.json').write_text(json.dumps(result))
+        (run_dir / 'changes.patch').write_text('--- a.py\n+++ a.py\n')
+        backfill_salvaged_runs(root, dry_run=True)
+        self.assertEqual(json.loads((run_dir / 'result.json').read_text())['status'], 'blocked')
+        backfill_salvaged_runs(root, dry_run=False)
+        updated = json.loads((run_dir / 'result.json').read_text())
+        self.assertEqual(updated['status'], 'validation_passed_review_required')
+        self.assertEqual(updated['salvaged_from'], 'retroactive_repeated_tool_error')
 
 
 if __name__ == '__main__':

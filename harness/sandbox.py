@@ -137,6 +137,64 @@ def resolve_pytest_test_argv(test_argv, directory):
                 return [str(candidate), *argv[1:]]
     raise GuardError('test_runner_missing_pytest')
 
+_PYTEST_VALUE_FLAGS = frozenset({
+    '-k', '-m', '-c', '-o', '-p', '-W', '-n',
+    '--tb', '--rootdir', '--confcutdir', '--basetemp', '--junitxml', '--junit-prefix',
+    '--maxfail', '--durations', '--durations-min', '--log-level', '--log-format',
+    '--log-date-format', '--ignore', '--ignore-glob', '--deselect', '--import-mode',
+    '--override-ini', '--pythonwarnings', '--dist', '--tx',
+    '--cov', '--cov-report', '--cov-config', '--asyncio-mode',
+    '--timeout', '--timeout-method',
+})
+
+def build_targeted_pytest_argv(test_argv, test_log, *, max_nodeids=5):
+    """H-56: build a targeted pytest invocation from failed nodeids in a test log.
+
+    Returns None when test_argv is not a pytest invocation, when the log has no
+    (or too many) failed nodeids, when collection itself failed, or when the
+    targeted argv would be identical to the original.
+    """
+    argv = list(test_argv)
+    if not argv:
+        return None
+    if Path(argv[0]).name.startswith('pytest'):
+        prefix = [argv[0]]
+        rest = argv[1:]
+    else:
+        idx = next((i for i in range(len(argv) - 1)
+                    if argv[i:i + 2] == ['-m', 'pytest']), None)
+        if idx is None:
+            return None
+        prefix = list(argv[:idx + 2])
+        rest = argv[idx + 2:]
+    nodeids = []
+    for m in re.finditer(r'^FAILED\s+(\S+::\S+)', test_log, re.MULTILINE):
+        if m.group(1) not in nodeids:
+            nodeids.append(m.group(1))
+    if not 1 <= len(nodeids) <= max_nodeids:
+        return None
+    if 'Interrupted:' in test_log or 'ERROR collecting' in test_log:
+        return None
+    flag_args = []
+    skip_next = False
+    for i, arg in enumerate(rest):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == '--':
+            break
+        if not arg.startswith('-'):
+            continue  # positional test path: drop it
+        flag_args.append(arg)
+        name = arg.split('=', 1)[0]
+        if name in _PYTEST_VALUE_FLAGS and '=' not in arg:
+            nxt = rest[i + 1] if i + 1 < len(rest) else None
+            if nxt is not None and not nxt.startswith('-'):
+                flag_args.append(nxt)
+                skip_next = True
+    targeted = prefix + flag_args + nodeids
+    return targeted if targeted != list(test_argv) else None
+
 def validate_task(raw):
     if not isinstance(raw, dict):
         raise GuardError('task_must_be_an_object')
@@ -866,6 +924,12 @@ def compute_repair_max_steps(task: dict) -> int:
     for the worker to re-read only the failing region and apply one edit."""
     return min(MAX_STEPS, max(6, 4 + 2 * len(task.get('files', ()))))
 
+def compute_repair_timeout_seconds(task: dict) -> int:
+    """Bounded proportional wall-clock timeout for micro_repair: 15s per
+    repair step (floor 45s), capped at the task's own timeout."""
+    repair_steps = compute_repair_max_steps(task)
+    return min(int(task.get('timeout_seconds', 180)), max(45, 15 * repair_steps))
+
 
 def should_auto_escalate(raw_task: dict) -> bool:
     """Decide whether a raw task dict should run through the best_of_2 path."""
@@ -941,12 +1005,13 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             use_proxy = (not check and task['mode'] != 'command' and (upstream_url is not None or is_real_cli))
             started_ref = [None]
             active_max_steps = [task['max_steps']]
+            active_timeout_seconds = [task['timeout_seconds']]
             try:
                 if task['mode'] != 'command':
                     verify_db(db)
                     if use_proxy:
                         def _gate():
-                            if started_ref[0] is not None and (time.monotonic() - started_ref[0]) >= task['timeout_seconds']:
+                            if started_ref[0] is not None and (time.monotonic() - started_ref[0]) >= active_timeout_seconds[0]:
                                 return 'worker_timeout'
                             sid_cur = result.get('session_id')
                             if not sid_cur:
@@ -1040,9 +1105,12 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     and result['cost'] <= min(budget * 0.8, 0.08)):
                                 repair_max_steps = compute_repair_max_steps(task)
                                 active_max_steps[0] = repair_max_steps
+                                repair_timeout = compute_repair_timeout_seconds(task)
+                                active_timeout_seconds[0] = repair_timeout
                                 repair_task = dict(
                                     task,
                                     max_steps=repair_max_steps,
+                                    timeout_seconds=repair_timeout,
                                     prompt=build_micro_repair_prompt(task, run_dir, originals),
                                 )
                                 primary_steps = result.get('steps', 0)
@@ -1085,9 +1153,32 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 if _fh(task['files']) == hashes_before_repair:
                                     event(run_dir, 'micro_repair_no_change')
                                 else:
-                                    result['test_return_code'] = execute(task['test_argv'], task['directory'],
-                                                                        task['test_timeout_seconds'],
-                                                                        run_dir / 'test.log')
+                                    # H-56: two-stage fast-fail verification. First
+                                    # re-run only the previously failed nodeids; if
+                                    # any still fail, skip the full suite.
+                                    first_test_log_text = ''
+                                    try:
+                                        first_test_log_text = (run_dir / 'test.log').read_text(errors='replace')
+                                    except OSError:
+                                        first_test_log_text = ''
+                                    targeted_argv = build_targeted_pytest_argv(
+                                        task['test_argv'], first_test_log_text)
+                                    if targeted_argv is not None:
+                                        rc_fast = execute(targeted_argv, task['directory'],
+                                                          min(30, task['test_timeout_seconds']),
+                                                          run_dir / 'test.log')
+                                        if rc_fast != 0:
+                                            result['test_return_code'] = rc_fast
+                                            event(run_dir, 'micro_repair_fast_fail',
+                                                  return_code=rc_fast)
+                                        else:
+                                            result['test_return_code'] = execute(
+                                                task['test_argv'], task['directory'],
+                                                task['test_timeout_seconds'], run_dir / 'test.log')
+                                    else:
+                                        result['test_return_code'] = execute(
+                                            task['test_argv'], task['directory'],
+                                            task['test_timeout_seconds'], run_dir / 'test.log')
                             if result['test_return_code']:
                                 raise GuardError(repair_salvage_reason or 'validation_failed')
                             if repair_salvage_reason is not None:

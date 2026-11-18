@@ -37,7 +37,20 @@ __all__ = [
     "format_replay_markdown",
     "export_sml_dataset",
     "purge_ephemeral_test_runs",
+    "backfill_salvaged_runs",
 ]
+
+# Blocked reasons considered salvageable when the test actually passed and a
+# non-empty patch exists (H-57 retroactive post-edit salvage backfill).
+SALVAGEABLE_BLOCK_REASONS = frozenset(
+    {
+        "step_limit",
+        "worker_timeout",
+        "repeated_tool_error",
+        "repeated_file_read_without_write",
+        "model_error",
+    }
+)
 
 # Statuses treated as a Pass@1 success (after lowercasing).
 PASS_STATUSES = frozenset(
@@ -1210,3 +1223,85 @@ def export_sml_dataset(
                 tmp.write(json.dumps(record, ensure_ascii=False) + "\n")
         os.replace(tmp_name, out_path)
     return dataset
+
+
+def backfill_salvaged_runs(state_dir: str | Path, *, dry_run: bool = False) -> list[dict]:
+    """Retroactively salvage blocked runs whose test actually passed (H-57).
+
+    Scans ``<state_dir>/runs/*/result.json`` and flips eligible runs from
+    ``status="blocked"`` to ``status="validation_passed_review_required"``
+    (adding ``salvaged_from="retroactive_<reason>"``) when all hold:
+
+    1. the block reason is in :data:`SALVAGEABLE_BLOCK_REASONS`;
+    2. ``test_return_code`` is strictly integer ``0``;
+    3. ``hashes_before`` / ``hashes_after`` are non-empty dicts that differ;
+    4. a non-empty ``changes.patch`` exists in the run directory.
+
+    With ``dry_run=True`` nothing is written; matched records are only
+    returned. Each record: ``run_id``, ``task_id``, ``old_reason``,
+    ``salvaged_from``.
+    """
+    state_path = Path(state_dir)
+    runs_dir = state_path / "runs"
+    if not runs_dir.is_dir():
+        return []
+
+    run_dirs = sorted(
+        (d for d in runs_dir.iterdir() if d.is_dir()),
+        key=lambda d: (d.stat().st_mtime, d.name),
+    )
+
+    salvaged: list[dict] = []
+    for run_dir in run_dirs:
+        result_path = run_dir / "result.json"
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(result, dict):
+            continue
+
+        reason = str(result.get("reason") or "")
+        if result.get("status") != "blocked":
+            continue
+        if reason not in SALVAGEABLE_BLOCK_REASONS:
+            continue
+
+        rc = result.get("test_return_code")
+        if not (isinstance(rc, int) and not isinstance(rc, bool) and rc == 0):
+            continue
+
+        hashes_before = result.get("hashes_before")
+        hashes_after = result.get("hashes_after")
+        if not (
+            isinstance(hashes_before, dict) and bool(hashes_before)
+            and isinstance(hashes_after, dict) and bool(hashes_after)
+        ):
+            continue
+        if hashes_after == hashes_before:
+            continue
+
+        patch_path = run_dir / "changes.patch"
+        if not (patch_path.is_file() and patch_path.stat().st_size > 0):
+            continue
+
+        salvaged_from = f"retroactive_{reason}"
+        salvaged.append({
+            "run_id": run_dir.name,
+            "task_id": result.get("task_id"),
+            "old_reason": result.get("reason"),
+            "salvaged_from": salvaged_from,
+        })
+        if dry_run:
+            continue
+
+        result["status"] = "validation_passed_review_required"
+        result["salvaged_from"] = salvaged_from
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(run_dir), delete=False
+        ) as tmp:
+            tmp_name = tmp.name
+            json.dump(result, tmp, ensure_ascii=False, indent=2)
+        os.replace(tmp_name, result_path)
+
+    return salvaged

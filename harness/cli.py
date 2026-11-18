@@ -37,6 +37,7 @@ from harness.report import (
     format_state_stats_markdown,
     simulate_replay,
 )
+from harness.report import backfill_salvaged_runs
 from harness.telemetry import (
     DEFAULT_PHOENIX_ENDPOINT,
     HarnessTracer,
@@ -184,6 +185,8 @@ def _load_trace_spans(path: str) -> list:
 
 
 def _run_stats(args: argparse.Namespace) -> int:
+    if getattr(args, "backfill_salvage", False):
+        backfill_salvaged_runs(args.state_dir)
     print(format_state_stats_markdown(args.state_dir))
     if getattr(args, "insights", False):
         print("\n" + format_state_insights_markdown(args.state_dir))
@@ -412,6 +415,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--insights",
         action="store_true",
         help="also print task-funnel, blocked-reason and tool-error insights",
+    )
+    stats.add_argument(
+        "--backfill-salvage",
+        action="store_true",
+        help="retroactively salvage blocked runs whose test passed (H-57) before reporting",
     )
     stats.set_defaults(handler=_run_stats)
 
