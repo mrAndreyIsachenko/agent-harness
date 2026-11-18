@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import statistics
 import tempfile
 from collections import Counter
@@ -35,6 +36,7 @@ __all__ = [
     "simulate_replay",
     "format_replay_markdown",
     "export_sml_dataset",
+    "purge_ephemeral_test_runs",
 ]
 
 # Statuses treated as a Pass@1 success (after lowercasing).
@@ -106,6 +108,65 @@ def _to_bool(value) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return bool(value)
+
+
+_EPHEMERAL_TEST_TASK_IDS = frozenset({"h42-test", "h42-val"})
+
+_EPHEMERAL_PATH_PREFIXES = (
+    "/var/folders/",
+    "/private/var/folders/",
+    "/tmp/pytest-of-",
+)
+
+
+def _is_ephemeral_test_run(result: dict) -> bool:
+    """Return True for throwaway test runs (h42-test/h42-val touching temp paths)."""
+    task_id = str(result.get("task_id") or "")
+    if task_id not in _EPHEMERAL_TEST_TASK_IDS:
+        return False
+    candidates = list(
+        _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
+    )
+    for key in ("hashes_before", "hashes_after"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            candidates.extend(str(path) for path in value)
+    return any(
+        path.startswith(_EPHEMERAL_PATH_PREFIXES) for path in candidates if path
+    )
+
+
+def purge_ephemeral_test_runs(state_dir: str | Path) -> list[str]:
+    """Delete run directories for ephemeral test runs; return their run ids."""
+    runs_dir = Path(state_dir) / "runs"
+    if not runs_dir.is_dir():
+        return []
+
+    run_dirs: list[tuple[float, Path]] = []
+    for child in runs_dir.iterdir():
+        try:
+            if not child.is_dir() or not (child / "result.json").is_file():
+                continue
+            run_dirs.append((child.stat().st_mtime, child))
+        except OSError:
+            continue
+    run_dirs.sort(key=lambda entry: entry[0])
+
+    purged: list[str] = []
+    for _, run_dir in run_dirs:
+        try:
+            with (run_dir / "result.json").open("r", encoding="utf-8") as handle:
+                result = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(result, dict):
+            continue
+        if not _is_ephemeral_test_run(result):
+            continue
+        run_id = str(_first(result, ("run_id", "runId", "id")) or run_dir.name)
+        shutil.rmtree(run_dir)
+        purged.append(run_id)
+    return purged
 
 
 def _to_str_list(value) -> list:
@@ -342,6 +403,8 @@ def scan_state_runs(state_dir: str | Path) -> list[dict]:
             continue
         if not isinstance(result, dict):
             continue
+        if _is_ephemeral_test_run(result):
+            continue
         runs.append(summarize_run(result, _load_proxy_summary(run_dir / "requests.json")))
     return runs
 
@@ -411,6 +474,8 @@ def _iter_run_records(state_dir: str | Path):
         except (OSError, ValueError):
             continue
         if not isinstance(result, dict):
+            continue
+        if _is_ephemeral_test_run(result):
             continue
         if result.get("status") == "configuration_verified_no_model_call":
             continue

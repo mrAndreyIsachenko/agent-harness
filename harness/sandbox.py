@@ -76,6 +76,14 @@ ESCALATABLE_BLOCK_REASONS = frozenset({
     'no_change',
 })
 
+SALVAGEABLE_BLOCK_REASONS = frozenset({
+    'step_limit',
+    'worker_timeout',
+    'repeated_tool_error',
+    'repeated_file_read_without_write',
+    'model_error',
+})
+
 CLI = os.environ.get("HARNESS_CLI") or os.environ.get("OPENCODE_CLI") or "/Applications/OpenCode.app/Contents/Resources/opencode-cli"
 # The durable journal stays next to the launcher facade when loaded via opencode_guard;
 # otherwise use finops.STATE (which honors HARNESS_STATE_DIR).
@@ -94,6 +102,40 @@ def executable_argv(value):
     if not Path(value[0]).is_absolute() or not Path(value[0]).is_file() or not os.access(value[0], os.X_OK):
         raise GuardError('executable_must_be_an_existing_absolute_path')
     return value
+
+_PYTEST_PROBE_CACHE: dict[str, bool] = {}
+
+def _python_has_pytest(python_bin) -> bool:
+    resolved = os.path.realpath(str(python_bin))
+    cached = _PYTEST_PROBE_CACHE.get(resolved)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run([str(python_bin), '-c', 'import pytest'],
+                              capture_output=True, timeout=5)
+        has = proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        has = False
+    _PYTEST_PROBE_CACHE[resolved] = has
+    return has
+
+def resolve_pytest_test_argv(test_argv, directory):
+    argv = list(test_argv)
+    is_pytest = len(argv) >= 3 and (
+        argv[1:3] == ['-m', 'pytest'] or
+        (Path(argv[0]).name.startswith('python') and
+         any(argv[i:i + 2] == ['-m', 'pytest'] for i in range(1, min(len(argv) - 1, 4)))))
+    if not is_pytest:
+        return argv
+    if _python_has_pytest(argv[0]):
+        return argv
+    base = Path(directory).resolve()
+    for parent in [base, *list(base.parents)[:4]]:
+        for name in ('python', 'python3'):
+            candidate = parent / '.venv' / 'bin' / name
+            if candidate.is_file() and os.access(candidate, os.X_OK) and _python_has_pytest(candidate):
+                return [str(candidate), *argv[1:]]
+    raise GuardError('test_runner_missing_pytest')
 
 def validate_task(raw):
     if not isinstance(raw, dict):
@@ -385,6 +427,8 @@ def execute(argv, directory, timeout, path):
 
 def preflight(cli, task, run_dir, *, base_url=None):
     executable_argv([str(cli)])
+    if task.get('mode', 'model') == 'model':
+        task['test_argv'] = resolve_pytest_test_argv(task['test_argv'], task['directory'])
     private_write(run_dir / 'opencode.jsonc', config_for(task, base_url=base_url))
     path = run_dir / 'config-check.log'
     rc = execute([str(cli), 'api', '--standalone', 'GET', '/api/agent'], run_dir, 30, path)
@@ -536,6 +580,23 @@ def _python_top_symbols(source):
     return symbols
 
 
+def _python_symbol_spans(source):
+    """Top-level function/class names mapped to (start_line, end_line) (H-53)."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    spans = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            dec_lines = [d.lineno for d in getattr(node, 'decorator_list', ()) if hasattr(d, 'lineno')]
+            start = min([node.lineno] + dec_lines)
+            end = getattr(node, 'end_lineno', None) or node.lineno
+            spans[node.name] = (start, end)
+    return spans
+
+
 def build_micro_repair_prompt(task, run_dir, originals=None):
     """Assemble a zero-read micro-repair prompt (H-41).
 
@@ -554,6 +615,7 @@ def build_micro_repair_prompt(task, run_dir, originals=None):
     except OSError:
         current_patch = ''
     trajspec_lines: list[str] = []
+    trajspec_seed_tokens: list[str] = []
     if originals:
         file_names = sorted(set(originals) | set(task.get('files', ())))
         modified: list[str] = []
@@ -569,17 +631,23 @@ def build_micro_repair_prompt(task, run_dir, originals=None):
             )
             p = Path(name)
             after_src = p.read_bytes() if p.is_file() else None
-            after_symbols = (
-                _python_top_symbols(after_src.decode('utf-8', errors='replace'))
-                if isinstance(after_src, (bytes, bytearray)) else {}
-            )
+            after_text = after_src.decode('utf-8', errors='replace') if isinstance(after_src, (bytes, bytearray)) else ''
+            after_symbols = _python_top_symbols(after_text) if after_text else {}
+            after_spans = _python_symbol_spans(after_text) if after_text else {}
             for symbol in sorted(set(before_symbols) | set(after_symbols)):
-                if symbol in before_symbols and symbol not in after_symbols:
+                is_dropped = symbol in before_symbols and symbol not in after_symbols
+                is_added = symbol not in before_symbols and symbol in after_symbols
+                is_modified = (symbol in before_symbols and symbol in after_symbols
+                               and before_symbols[symbol] != after_symbols[symbol])
+                if is_dropped:
                     dropped.append(symbol)
-                elif symbol not in before_symbols and symbol in after_symbols:
-                    added.append(symbol)
-                elif before_symbols[symbol] != after_symbols[symbol]:
-                    modified.append(symbol)
+                elif is_added or is_modified:
+                    span = after_spans.get(symbol)
+                    label = f'{symbol} (L{span[0]}-L{span[1]})' if span else symbol
+                    (added if is_added else modified).append(label)
+                    trajspec_seed_tokens.append(f'`{symbol}`')
+                    if span:
+                        trajspec_seed_tokens.append(f'L{span[0]}-L{span[1]}')
         if modified:
             trajspec_lines.append('Modified symbols: ' + ', '.join(modified))
         if added:
@@ -597,6 +665,8 @@ def build_micro_repair_prompt(task, run_dir, originals=None):
     except Exception:
         range_markers = []
     excerpts_query = task['prompt'] + '\n' + compact_failure
+    if trajspec_seed_tokens:
+        excerpts_query += '\n' + ' '.join(trajspec_seed_tokens)
     if range_markers:
         excerpts_query += '\n' + ' '.join(range_markers)
     excerpts = build_preloaded_file_excerpts(
@@ -936,7 +1006,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
                         except GuardError as exc:
                             if (task['mode'] == 'model'
-                                    and str(exc) in ('step_limit', 'worker_timeout')
+                                    and str(exc) in SALVAGEABLE_BLOCK_REASONS
                                     and _fh(task['files']) != result['hashes_before']):
                                 capture_files(run_dir, tracked)
                                 _snapshot_files_for_feedback(run_dir, task['files'], 'after')
@@ -993,7 +1063,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                                   max(0.0, budget - primary_cost),
                                                   proxy=proxy, started_ref=started_ref)
                                     except GuardError as exc:
-                                        if (str(exc) in ('step_limit', 'worker_timeout')
+                                        if (str(exc) in SALVAGEABLE_BLOCK_REASONS
                                                 and _fh(task['files']) != hashes_before_repair):
                                             capture_files(run_dir, tracked)
                                             _snapshot_files_for_feedback(run_dir, task['files'], 'after')
@@ -1111,11 +1181,14 @@ def _build_candidate1_trajspec_feedback(res, originals, after_snap):
         after_src = after.decode('utf-8', errors='replace') if after is not None else ''
         before_syms = _python_top_symbols(before_src) if before_src else {}
         after_syms = _python_top_symbols(after_src) if after_src else {}
+        after_spans = _python_symbol_spans(after_src) if after_src else {}
         for sym in sorted(set(after_syms) - set(before_syms)):
-            added.append(sym)
+            span = after_spans.get(sym)
+            added.append(f'{sym} (L{span[0]}-L{span[1]})' if span else sym)
         for sym in sorted(set(before_syms) & set(after_syms)):
             if before_syms[sym] != after_syms[sym]:
-                modified.append(sym)
+                span = after_spans.get(sym)
+                modified.append(f'{sym} (L{span[0]}-L{span[1]})' if span else sym)
         for sym in sorted(set(before_syms) - set(after_syms)):
             dropped.append(sym)
     parts = ['\n\n[CANDIDATE_1_TRAJSPEC_FEEDBACK]',

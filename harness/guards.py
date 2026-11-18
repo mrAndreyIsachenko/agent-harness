@@ -2171,12 +2171,21 @@ def extract_failing_test_excerpts(
             continue
         window: list[tuple[int, str]] = []
         func_name = None
-        # Target function name from the first nodeid of this file, if any.
+        class_name = None
+        # Target function/class names from the first nodeid of this file, if any.
         for nodeid in nodeids:
             if nodeid.split("::", 1)[0] == raw_path:
                 parts = nodeid.split("::")
-                if len(parts) >= 2 and parts[1] and parts[1].isidentifier():
-                    func_name = parts[1]
+                if len(parts) >= 3:
+                    if parts[1] and parts[1].isidentifier():
+                        class_name = parts[1]
+                    candidate = parts[-1].split("[", 1)[0]
+                    if candidate and candidate.isidentifier():
+                        func_name = candidate
+                elif len(parts) == 2:
+                    candidate = parts[1].split("[", 1)[0]
+                    if candidate and candidate.isidentifier():
+                        func_name = candidate
                 break
         matched_ast = False
         if target_line or func_name:
@@ -2185,31 +2194,98 @@ def extract_failing_test_excerpts(
             except SyntaxError:
                 tree = None
             if tree is not None:
-                for node in ast.walk(tree):
-                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        continue
-                    starts = node.name.startswith("test_")
-                    contains = (
-                        target_line
-                        and node.lineno <= target_line
-                        and (node.end_lineno or target_line) >= target_line
-                    )
-                    if (starts and contains) or (func_name and node.name == func_name):
-                        start = node.lineno
-                        end = node.end_lineno or node.lineno
-                        if end - start + 1 <= _MAX_EXCERPT_LINES:
-                            window = [(n, lines[n - 1]) for n in range(start, end + 1)]
+                matched_node = None
+                matched_cls: ast.ClassDef | None = None
+
+                def _visit(body: list[ast.stmt], cls_node: ast.ClassDef | None) -> None:
+                    nonlocal matched_node, matched_cls
+                    for stmt in body:
+                        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            starts = stmt.name.startswith("test_")
+                            contains = (
+                                target_line
+                                and stmt.lineno <= target_line
+                                and (stmt.end_lineno or target_line) >= target_line
+                            )
+                            class_ok = not class_name or (
+                                cls_node is not None and cls_node.name == class_name
+                            )
+                            if (starts and contains) or (
+                                func_name and stmt.name == func_name and class_ok
+                            ):
+                                matched_node, matched_cls = stmt, cls_node
+                                return
+                        if isinstance(stmt, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                            _visit(
+                                stmt.body,
+                                stmt if isinstance(stmt, ast.ClassDef) else cls_node,
+                            )
+                            if matched_node is not None:
+                                return
+
+                _visit(tree.body, None)
+                node = matched_node
+                cls_node = matched_cls
+                if node is not None:
+                    start = node.lineno
+                    end = node.end_lineno or node.lineno
+                    if end - start + 1 <= _MAX_EXCERPT_LINES:
+                        window = [(n, lines[n - 1]) for n in range(start, end + 1)]
+                    else:
+                        if target_line:
+                            half = _MAX_EXCERPT_LINES // 2
+                            lo = max(1, target_line - half)
+                            hi = min(len(lines), lo + _MAX_EXCERPT_LINES - 1)
+                            lo = max(1, hi - _MAX_EXCERPT_LINES + 1)
                         else:
-                            if target_line:
-                                half = _MAX_EXCERPT_LINES // 2
-                                lo = max(1, target_line - half)
-                                hi = min(len(lines), lo + _MAX_EXCERPT_LINES - 1)
-                                lo = max(1, hi - _MAX_EXCERPT_LINES + 1)
-                            else:
-                                lo, hi = start, min(len(lines), start + _MAX_EXCERPT_LINES - 1)
-                            window = [(n, lines[n - 1]) for n in range(lo, hi + 1)]
-                        matched_ast = True
-                        break
+                            lo, hi = start, min(len(lines), start + _MAX_EXCERPT_LINES - 1)
+                        window = [(n, lines[n - 1]) for n in range(lo, hi + 1)]
+                    if cls_node is not None:
+                        # H-52: prepend class header + setUp/autouse fixture lines.
+                        first_method = None
+                        for m in cls_node.body:
+                            if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                first_method = m
+                                break
+                        if first_method is not None:
+                            header_end = min(
+                                [first_method.lineno]
+                                + [d.lineno for d in first_method.decorator_list]
+                            ) - 1
+                        else:
+                            header_end = cls_node.end_lineno or cls_node.lineno
+                        prefix: list[int] = list(
+                            range(cls_node.lineno, min(header_end, cls_node.lineno + 19) + 1)
+                        )
+                        prefix = prefix[:20]
+                        setup_lines: list[int] = []
+                        for m in cls_node.body:
+                            if not isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                continue
+                            is_fixture = any(
+                                (isinstance(d, ast.Name) and d.id == "fixture")
+                                or (isinstance(d, ast.Attribute) and d.attr == "fixture")
+                                or (
+                                    isinstance(d, ast.Call)
+                                    and (
+                                        (isinstance(d.func, ast.Name) and d.func.id == "fixture")
+                                        or (
+                                            isinstance(d.func, ast.Attribute)
+                                            and d.func.attr == "fixture"
+                                        )
+                                    )
+                                )
+                                for d in m.decorator_list
+                            )
+                            if m.name in {"setUp", "setUpClass", "__init__"} or is_fixture:
+                                lo_m = min([m.lineno] + [d.lineno for d in m.decorator_list])
+                                hi_m = m.end_lineno or m.lineno
+                                setup_lines.extend(range(lo_m, hi_m + 1))
+                        setup_lines = setup_lines[:18]
+                        class_prefix = (prefix + setup_lines)[:20]
+                        combined = sorted(set(class_prefix + [n for n, _ in window]))
+                        window = [(n, lines[n - 1]) for n in combined if 1 <= n <= len(lines)]
+                    matched_ast = True
         if not matched_ast:
             if target_line:
                 lo = max(1, target_line - 15)

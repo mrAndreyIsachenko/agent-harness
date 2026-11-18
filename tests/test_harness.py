@@ -56,12 +56,14 @@ from harness.routing import (DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
                              ProviderHealthStore, apply_provider_routing,
                              select_escalated_model)
-from harness.sandbox import (GuardError, _snapshot_files_for_feedback,
+from harness.sandbox import (GuardError, _PYTEST_PROBE_CACHE,
+                             _snapshot_files_for_feedback,
                              build_micro_repair_prompt, build_prior_attempt_feedback, capture_files,
                              compute_repair_max_steps, config_for, execute,
                              file_hashes, isolated_worktree, locks,
                              main as sandbox_main, model_run, owned_process,
-                             preflight, run_best_of_2, run_task, stop_group,
+                             preflight, resolve_pytest_test_argv, run_best_of_2,
+                             run_task, stop_group,
                              validate_task, verify_permissions)
 from harness.telemetry import OPENINFERENCE_SPAN_KINDS, HarnessTracer, format_trace_tree
 
@@ -126,6 +128,55 @@ class HarnessTestCase(unittest.TestCase):
     def path(self, name):
         import os
         return str(os.path.join(self.root, name))
+
+
+class TestH51PytestResolution(HarnessTestCase):
+    def _stub_interpreter(self, name, has_pytest):
+        script = self.path(name)
+        with open(script, 'w') as fh:
+            fh.write('#!/bin/sh\nexit %d\n' % (0 if has_pytest else 1))
+        os.chmod(script, 0o755)
+        return script
+
+    def setUp(self):
+        super().setUp()
+        _PYTEST_PROBE_CACHE.clear()
+
+    def tearDown(self):
+        _PYTEST_PROBE_CACHE.clear()
+        super().tearDown()
+
+    def test_interpreter_with_pytest_unchanged(self):
+        interp = self._stub_interpreter('py-with', True)
+        argv = [interp, '-m', 'pytest', '-q', 'test_x.py']
+        self.assertEqual(resolve_pytest_test_argv(argv, self.root), argv)
+
+    def test_non_pytest_argv_unchanged_even_without_pytest(self):
+        interp = self._stub_interpreter('py-no', False)
+        argv = [interp, 'script.py', '--flag']
+        self.assertEqual(resolve_pytest_test_argv(argv, self.root), argv)
+
+    def test_switches_to_venv_python_with_pytest(self):
+        no_py = self._stub_interpreter('py-none', False)
+        os.makedirs(self.path('proj/.venv/bin'))
+        venv_py = self._stub_interpreter('proj/.venv/bin/python', True)
+        argv = [no_py, '-m', 'pytest', '-q', 'test_x.py']
+        resolved = resolve_pytest_test_argv(argv, self.path('proj/sub'))
+        self.assertEqual(os.path.realpath(resolved[0]), os.path.realpath(venv_py))
+        self.assertEqual(resolved[1:], argv[1:])
+
+    def test_preflight_raises_without_any_pytest(self):
+        no_py = self._stub_interpreter('cli', False)
+        cli = self._stub_interpreter('cli-stub', False)
+        os.makedirs(self.path('run'))
+        argv = [no_py, '-m', 'pytest', '-q', 'test_x.py']
+        task = {
+            'task_id': 'h51', 'mode': 'model', 'prompt': 'fix',
+            'directory': self.root, 'files': [no_py], 'test_argv': argv,
+        }
+        with self.assertRaises(GuardError) as ctx:
+            preflight(cli, task, Path(self.path('run')))
+        self.assertEqual(str(ctx.exception), 'test_runner_missing_pytest')
 
 
 class TestH1Preflight(HarnessTestCase):
@@ -4071,6 +4122,153 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             with open(target, 'r', encoding='utf-8') as fh:
                 self.assertEqual(fh.read(), 'VALUE = 2\n')
 
+    def test_salvageable_block_reasons_pass_when_validation_passes(self):
+        from unittest import mock
+        for reason in ('repeated_tool_error', 'repeated_file_read_without_write'):
+            with self.subTest(reason=reason):
+                with tempfile.TemporaryDirectory() as tmp:
+                    cli_path = self._write_stub_cli(tmp)
+                    db_path = os.path.join(tmp, 'opencode.db')
+                    self._init_db(db_path)
+                    state_dir = os.path.join(tmp, 'state')
+
+                    repo = os.path.join(tmp, 'repo')
+                    target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+                    task_path = os.path.join(tmp, 'task_salvage_reason_ok.json')
+                    test_code = (
+                        "import pathlib, sys; "
+                        "sys.exit(0 if 'VALUE = 1' in pathlib.Path('target.py').read_text() else 1)"
+                    )
+                    with open(task_path, 'w', encoding='utf-8') as fh:
+                        json.dump({
+                            'task_id': 'salvage-reason-pass',
+                            'directory': repo,
+                            'files': [target],
+                            'prompt': 'Set VALUE = 1 in ' + target,
+                            'test_argv': [sys.executable, '-c', test_code],
+                            'worktree': True,
+                        }, fh)
+
+                    def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                        with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                            fh.write('VALUE = 1\n')
+                        raise GuardError(reason)
+
+                    buf = io.StringIO()
+                    with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                        with contextlib.redirect_stdout(buf):
+                            rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+                    self.assertEqual(rc, 0)
+                    out = json.loads(buf.getvalue())
+                    self.assertEqual(out['status'], 'validation_passed_review_required')
+                    with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                        res = json.load(fh)
+                    self.assertEqual(res['status'], 'validation_passed_review_required')
+                    self.assertEqual(res['salvaged_from'], reason)
+                    with open(target, 'r', encoding='utf-8') as fh:
+                        self.assertEqual(fh.read(), 'VALUE = 1\n')
+
+    def test_micro_repair_repeated_tool_error_salvage_passes_when_validation_passes(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_repair_salvage_rte.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 2' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'repair-salvage-rte-pass',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 2 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                    'max_steps': 6,
+                    'max_cost_usd': 0.10,
+                }, fh)
+
+            calls = {'n': 0}
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                        fh.write('VALUE = 1\n')
+                    result['steps'] = 2
+                    result['cost'] = 0.01
+                    result['observed_cost'] = 0.01
+                    return
+                with open(task['files'][0], 'w', encoding='utf-8') as fh:
+                    fh.write('VALUE = 2\n')
+                result['steps'] = 3
+                result['cost'] = 0.01
+                result['observed_cost'] = 0.01
+                raise GuardError('repeated_tool_error')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 0)
+            self.assertEqual(calls['n'], 2)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validation_passed_review_required')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertEqual(res['status'], 'validation_passed_review_required')
+            self.assertTrue(res['micro_repair_attempted'])
+            self.assertEqual(res['salvaged_from'], 'micro_repair_repeated_tool_error')
+            with open(target, 'r', encoding='utf-8') as fh:
+                self.assertEqual(fh.read(), 'VALUE = 2\n')
+
+    def test_repeated_tool_error_without_file_change_does_not_salvage(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            cli_path = self._write_stub_cli(tmp)
+            db_path = os.path.join(tmp, 'opencode.db')
+            self._init_db(db_path)
+            state_dir = os.path.join(tmp, 'state')
+
+            repo = os.path.join(tmp, 'repo')
+            target = self._init_git_repo(repo, 'target.py', 'VALUE = 0\n')
+            task_path = os.path.join(tmp, 'task_rte_no_change.json')
+            test_code = (
+                "import pathlib, sys; "
+                "sys.exit(0 if 'VALUE = 1' in pathlib.Path('target.py').read_text() else 1)"
+            )
+            with open(task_path, 'w', encoding='utf-8') as fh:
+                json.dump({
+                    'task_id': 'rte-no-change',
+                    'directory': repo,
+                    'files': [target],
+                    'prompt': 'Set VALUE = 1 in ' + target,
+                    'test_argv': [sys.executable, '-c', test_code],
+                    'worktree': True,
+                }, fh)
+
+            def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
+                raise GuardError('repeated_tool_error')
+
+            buf = io.StringIO()
+            with mock.patch('harness.sandbox.model_run', side_effect=_fake_model_run):
+                with contextlib.redirect_stdout(buf):
+                    rc = run_task(task_path, cli=cli_path, db=db_path, state=state_dir, check=False)
+            self.assertEqual(rc, 1)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'blocked')
+            self.assertEqual(out['reason'], 'repeated_tool_error')
+            with open(os.path.join(out['artifact'], 'result.json'), 'r', encoding='utf-8') as fh:
+                res = json.load(fh)
+            self.assertIsNone(res.get('salvaged_from'))
+
     def test_validate_task_adaptive_steps_floor(self):
         with tempfile.TemporaryDirectory() as tmp:
             f1 = os.path.join(tmp, 'a.py')
@@ -4542,6 +4740,57 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertIn('155:', prompt)
             self.assertIn('[TEST_ARGV FAILURE — fix only the failing assertion/import]', prompt)
 
+    def test_h53_trajspec_line_ranges_and_excerpt_seeding(self):
+        import tempfile
+        from harness.sandbox import _build_candidate1_trajspec_feedback, _python_symbol_spans
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, 'mod_h53.py')
+            lines = ['import os\n'] + [
+                'def filler_%d():\n    return %d\n\n' % (i, i) for i in range(90)
+            ]
+            before = ''.join(lines) + (
+                '@staticmethod\n'
+                'def _internal_helper():\n'
+                '    """Decorator must be counted in the span start."""\n'
+                '    return 7\n'
+            )
+            # Modify _internal_helper on disk; neither prompt nor test.log mentions it.
+            after = before.replace('return 7', 'return 99')
+            self.assertGreater(after.count('\n'), 180)
+            with open(target, 'w') as fh:
+                fh.write(after)
+            run_dir = os.path.join(tmp, 'run')
+            os.makedirs(run_dir)
+            with open(os.path.join(run_dir, 'changes.patch'), 'w') as fh:
+                fh.write('--- a/mod_h53.py\n+++ b/mod_h53.py\n')
+            with open(os.path.join(run_dir, 'test.log'), 'w') as fh:
+                fh.write('FAILED tests/test_x.py::test_y - AssertionError: expected 1, got 2\n')
+            task = {
+                'prompt': 'Fix the failure.',
+                'files': [target],
+                'read_only_files': [],
+                'test_argv': ['/bin/pytest', '-q'],
+            }
+            prompt = build_micro_repair_prompt(task, run_dir, {target: before.encode()})
+            spans = _python_symbol_spans(after)
+            start, end = spans['_internal_helper']
+            self.assertEqual(start, end - 3)  # decorator line counted in start
+            self.assertIn(f'Modified symbols: _internal_helper (L{start}-L{end})', prompt)
+            seed_pos = prompt.index('[CURRENT_ON_DISK_EXCERPTS]')
+            self.assertLess(prompt.index(f'L{start}-L{end}'), seed_pos)  # seeded before excerpts
+            self.assertIn('_internal_helper', prompt[seed_pos:])  # excerpt includes symbol
+            self.assertIn('return 99', prompt[seed_pos:])
+            # Candidate-1 feedback annotates spans too.
+            res = {'status': 'blocked', 'reason': 'validation_failed'}
+            feedback = _build_candidate1_trajspec_feedback(
+                res, {target: before.encode()}, {target: after.encode()})
+            self.assertIn(f'Modified symbols: _internal_helper (L{start}-L{end})', feedback)
+            after_added = before + '\ndef _new_helper():\n    return 1\n'
+            feedback2 = _build_candidate1_trajspec_feedback(
+                res, {target: before.encode()}, {target: after_added.encode()})
+            add_start, add_end = _python_symbol_spans(after_added)['_new_helper']
+            self.assertIn(f'Added symbols: _new_helper (L{add_start}-L{add_end})', feedback2)
+
     def test_extract_failing_test_excerpts_nodeids_and_ast_window(self):
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -4576,6 +4825,56 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             # max_chars respected
             self.assertLessEqual(
                 len(extract_failing_test_excerpts(log, tmp, max_chars=120)), 120)
+
+    def test_extract_failing_test_excerpts_class_header_and_setup(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'tests'))
+            sample_path = os.path.join(tmp, 'tests', 'test_x.py')
+            with open(sample_path, 'w') as fh:
+                fh.write('import pytest\n\n\n'
+                         'class MySuite:\n'
+                         '    attr = 1\n\n'
+                         '    def setUp(self):\n'
+                         '        self.value = 2\n\n'
+                         '    def test_case(self):\n'
+                         '        assert self.value == 2\n\n'
+                         '    def test_other(self):\n'
+                         '        assert False\n')
+            log = 'FAILED tests/test_x.py::MySuite::test_case - AssertionError\n'
+            out = extract_failing_test_excerpts(log, tmp, max_chars=4000)
+            self.assertIn('class MySuite', out)
+            self.assertIn('def setUp', out)
+            self.assertIn('def test_case', out)
+            self.assertIn('attr = 1', out)
+            self.assertNotIn('def test_other', out)
+            line_nums = [
+                int(line.split(':', 1)[0][1:])
+                for line in out.splitlines()
+                if line.startswith('L') and line.split(':', 1)[0][1:].isdigit()
+            ]
+            self.assertEqual(len(line_nums), len(set(line_nums)))
+            self.assertEqual(line_nums, sorted(line_nums))
+
+    def test_extract_failing_test_excerpts_autouse_fixture_included(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, 'tests'))
+            sample_path = os.path.join(tmp, 'tests', 'test_y.py')
+            with open(sample_path, 'w') as fh:
+                fh.write('import pytest\n\n\n'
+                         'class FixtureSuite:\n'
+                         '    @pytest.fixture(autouse=True)\n'
+                         '    def setup_fixture(self):\n'
+                         '        self.ready = True\n\n'
+                         '    def test_with_fixture(self):\n'
+                         '        assert self.ready\n')
+            log = 'FAILED tests/test_y.py::FixtureSuite::test_with_fixture - AssertionError\n'
+            out = extract_failing_test_excerpts(log, tmp, max_chars=4000)
+            self.assertIn('class FixtureSuite', out)
+            self.assertIn('@pytest.fixture(autouse=True)', out)
+            self.assertIn('def setup_fixture', out)
+            self.assertIn('def test_with_fixture', out)
 
     def test_build_micro_repair_prompt_includes_external_failing_test(self):
         import tempfile
@@ -6062,10 +6361,19 @@ class TestH42AutoEscalation(HarnessTestCase):
                 t_single = self._write_task(tmp_path, strategy='single')
                 with _mock.patch('harness.sandbox.run_best_of_2') as mock_b2:
                     with _mock.patch('harness.sandbox.model_run'):
-                        with _mock.patch('harness.sandbox.execute', return_value=(0, 'ok')):
+                        with _mock.patch('harness.sandbox.execute', return_value=0):
                             for task_path in (t_off, t_single):
-                                run_task(str(task_path))
+                                run_task(str(task_path), state=tmp_path / 'state',
+                                         db=tmp_path / 'opencode.db')
                     mock_b2.assert_not_called()
+
+    def test_h42_does_not_write_to_default_state(self):
+        from harness.sandbox import STATE
+
+        before = set((STATE / 'runs').iterdir()) if (STATE / 'runs').is_dir() else set()
+        self.test_harnesses_env_auto_escalate_and_overrides()
+        after = set((STATE / 'runs').iterdir()) if (STATE / 'runs').is_dir() else set()
+        self.assertEqual(after - before, set())
 
     def test_micro_repair_skips_retest_when_files_unchanged(self):
         import sqlite3
@@ -6509,6 +6817,58 @@ class ExportSmlDatasetTest(unittest.TestCase):
             self.assertEqual(len(stdout_records), 1)
             self.assertEqual(stdout_records[0]['run_id'], 'run-clean')
             self.assertEqual(stdout_records[0]['patch'], 'clean patch')
+
+    def test_purge_ephemeral_test_runs(self):
+        from harness import (compute_state_insights, export_sml_dataset,
+                             purge_ephemeral_test_runs, scan_state_runs)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            self._run_dir(state_dir, 'eph-1', 1000, {
+                'task_id': 'h42-test', 'run_id': 'eph-1', 'status': 'blocked',
+                'reason': 'configuration_check_failed',
+                'hashes_before': {'/private/var/folders/k6/abc/T/tmp1/mod.py': 'h1'},
+            })
+            self._run_dir(state_dir, 'eph-2', 1001, {
+                'task_id': 'h42-val', 'run_id': 'eph-2', 'status': 'blocked',
+                'files': ['/tmp/pytest-of-user/pytest-0/t1/a.py'],
+            })
+            self._run_dir(state_dir, 'eph-3', 1002, {
+                'task_id': 'h42-test', 'run_id': 'eph-3', 'status': 'blocked',
+                'files': ['/var/folders/xx/yy/T/mod.py'],
+            })
+            self._run_dir(state_dir, 'real-1', 1003, {
+                'task_id': 'real-task', 'run_id': 'real-1',
+                'status': 'validation_passed_review_required',
+                'files': ['/Users/dev/repo/app.py'],
+            }, patch='patch')
+            self._run_dir(state_dir, 'keep-h42', 1004, {
+                'task_id': 'h42-test', 'run_id': 'keep-h42', 'status': 'blocked',
+                'files': ['/Users/dev/repo/mod.py'],
+            })
+
+            def run_ids(records):
+                return {rec.get('run_id') for rec in records if rec.get('run_id')}
+
+            scanned = scan_state_runs(state_dir)
+            self.assertEqual(
+                sorted(rec['task_id'] for rec in scanned),
+                ['h42-test', 'real-task'])
+
+            insights = compute_state_insights(state_dir)
+            self.assertEqual(insights['task_funnel']['total_tasks'], 2)
+            self.assertEqual(insights['task_funnel']['resolved_tasks'], 1)
+            self.assertEqual(dict(insights['top_blocked_reasons']), {'unknown': 1})
+
+            sft = export_sml_dataset(state_dir, mode='sft')
+            self.assertEqual(sorted(run_ids(sft)), ['real-1'])
+
+            purged = purge_ephemeral_test_runs(state_dir)
+            self.assertEqual(set(purged), {'eph-1', 'eph-2', 'eph-3'})
+            for name in ('eph-1', 'eph-2', 'eph-3'):
+                self.assertFalse((state_dir / 'runs' / name).exists())
+            for name in ('real-1', 'keep-h42'):
+                self.assertTrue((state_dir / 'runs' / name).exists())
 
 
 if __name__ == '__main__':
