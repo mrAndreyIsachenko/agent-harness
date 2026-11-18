@@ -195,6 +195,42 @@ def build_targeted_pytest_argv(test_argv, test_log, *, max_nodeids=5):
     targeted = prefix + flag_args + nodeids
     return targeted if targeted != list(test_argv) else None
 
+def infer_read_only_companion_files(files, *, directory='', existing_read_only=(), worktree=False, max_files=5):
+    """H-62: infer existing implementation companion files for test_<mod>.py editable targets."""
+    editable_set = {str(Path(f).resolve()) for f in files}
+    result = [str(Path(f).resolve()) for f in existing_read_only]
+    seen = set(editable_set) | set(result)
+    dir_path = Path(directory).resolve() if directory else None
+    for f in files:
+        if len(result) >= max_files:
+            break
+        p = Path(f).resolve()
+        if not (p.suffix == '.py' and p.name.startswith('test_') and len(p.name) > len('test_.py')):
+            continue
+        mod_name = p.name[len('test_'):]
+        candidates = []
+        if p.parent.name in ('tests', 'test'):
+            candidates.append(p.parent.parent / mod_name)
+            if dir_path is not None:
+                candidates.append(dir_path / mod_name)
+                candidates.append(dir_path / 'src' / mod_name)
+        candidates.append(p.parent / mod_name)
+        for cand in candidates:
+            if len(result) >= max_files:
+                break
+            try:
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            if str(resolved) in seen or not resolved.is_file():
+                continue
+            if dir_path is not None and not resolved.is_relative_to(dir_path):
+                continue
+            seen.add(str(resolved))
+            result.append(str(resolved))
+    return sorted(result)
+
+
 def validate_task(raw):
     if not isinstance(raw, dict):
         raise GuardError('task_must_be_an_object')
@@ -318,6 +354,13 @@ def validate_task(raw):
             raise GuardError('worktree_files_must_be_under_directory')
         if any(not Path(f).is_relative_to(Path(t['directory'])) for f in t['read_only_files']):
             raise GuardError('worktree_files_must_be_under_directory')
+    t.setdefault('auto_infer_read_only', True)
+    if not isinstance(t['auto_infer_read_only'], bool):
+        raise GuardError('invalid_auto_infer_read_only_flag')
+    if t['mode'] == 'model' and t['auto_infer_read_only'] and len(t['read_only_files']) < 5:
+        t['read_only_files'] = infer_read_only_companion_files(
+            t['files'], directory=t['directory'], existing_read_only=t['read_only_files'],
+            worktree=t['worktree'], max_files=5)
     t.setdefault('include_repo_memory', True)
     if not isinstance(t['include_repo_memory'], bool):
         raise GuardError('invalid_include_repo_memory_flag')
@@ -775,6 +818,53 @@ def _snapshot_files_for_feedback(run_dir, files, tag):
     except OSError:
         pass
 
+def _extract_read_windows_from_worker_log(run_dir, *, max_windows=6):
+    """H-63: extract deduplicated 'L<start>-L<end>' read windows from worker.log tool events."""
+    log_path = Path(run_dir) / 'worker.log'
+    if not log_path.is_file():
+        return []
+    windows = []
+    seen = set()
+    try:
+        lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        part = rec.get('part') if isinstance(rec.get('part'), dict) else rec
+        tool_name = part.get('tool') or part.get('name')
+        if tool_name != 'read':
+            continue
+        state = part.get('state') if isinstance(part.get('state'), dict) else {}
+        inp = state.get('input') if isinstance(state.get('input'), dict) else part.get('input')
+        if isinstance(inp, str):
+            try:
+                inp = json.loads(inp)
+            except ValueError:
+                inp = None
+        if not isinstance(inp, dict):
+            continue
+        path = inp.get('path') or ''
+        offset = inp.get('offset')
+        limit = inp.get('limit')
+        if isinstance(offset, int) and offset >= 1:
+            span = limit if (isinstance(limit, int) and limit >= 1) else 80
+            end = offset + min(span, 200) - 1
+            label = f'{Path(path).name} L{offset}-L{end}' if path else f'L{offset}-L{end}'
+            if label not in seen:
+                seen.add(label)
+                windows.append(label)
+                if len(windows) >= max_windows:
+                    break
+    return windows
+
+
 def build_prior_attempt_feedback(state, task_id, *, max_patch_chars=1500, max_chars=1200):
     """Compact feedback from earlier completed runs of the same task_id."""
     runs_dir = Path(state) / 'runs'
@@ -859,6 +949,9 @@ def build_prior_attempt_feedback(state, task_id, *, max_patch_chars=1500, max_ch
                 extra += '\n[Previous attempt guardrail events]: ' + ', '.join(notable[:8])
     except OSError:
         pass
+    read_windows = _extract_read_windows_from_worker_log(last_dir)
+    if read_windows:
+        extra += '\n[Visited read windows]: ' + ', '.join(read_windows)
     feedback = (f'\n\n[PRIOR_ATTEMPT_FEEDBACK — previous run on this task_id failed with '
                 f'reason={reason} on model={model}; avoid repeating the same mistake]:'
                 + extra + sections)
@@ -1301,6 +1394,9 @@ def _build_candidate1_trajspec_feedback(res, originals, after_snap):
                     test_log.read_text(errors='replace'), '', max_chars=1500))
         except OSError:
             pass
+        read_windows = _extract_read_windows_from_worker_log(artifact)
+        if read_windows:
+            parts.append('Visited read windows: %s' % ', '.join(read_windows))
     return '\n'.join(parts)
 
 def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None, fetch=None):

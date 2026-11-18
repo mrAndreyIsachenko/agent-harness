@@ -7020,6 +7020,104 @@ class TestH55H57Fixes(unittest.TestCase):
         self.assertIn('def check_egress_payload', targeted_excerpt)
         self.assertNotIn('1: """Guard helpers ported from the opencode_guard supervisor.', targeted_excerpt)
 
+    def test_h61_batched_distinct_window_file_reads_not_blocked(self):
+        from harness.finops import metrics, violation
+
+        def msg(parts):
+            return ('assistant', {'cost': 0.0, 'finish': 'stop', 'content': parts})
+
+        def read_at(offset):
+            return {
+                'type': 'tool', 'name': 'read',
+                'state': {'status': 'completed', 'input': {'path': '/a.py', 'offset': offset, 'limit': 50}},
+            }
+
+        snap = self._snap([msg([read_at(o) for o in (1, 100, 200, 300, 400, 500)])])
+        self.assertEqual(metrics(snap)['file_reads'], 1)
+        self.assertIsNone(violation(metrics(snap), 1e9, 25))
+
+        for idx in range(5):
+            snap['messages'].append(msg([read_at(600 + idx * 100)]))
+        self.assertEqual(metrics(snap)['file_reads'], 6)
+        self.assertEqual(violation(metrics(snap), 1e9, 25), 'repeated_file_read_without_write')
+
+    def test_h62_infer_read_only_companion_files_in_validate_task(self):
+        from harness.sandbox import infer_read_only_companion_files, validate_task
+        with tempfile.TemporaryDirectory(prefix='h62-') as tmp:
+            pkg = Path(tmp) / 'pkg'
+            pkg.mkdir()
+            service_file = pkg / 'service.py'
+            service_file.write_text('def run():\n    return 1\n')
+            test_file = pkg / 'tests' / 'test_service.py'
+            test_file.parent.mkdir()
+            test_file.write_text('def test_run():\n    assert run() == 1\n')
+            self.assertIn(
+                str(service_file.resolve()),
+                infer_read_only_companion_files([str(test_file)], directory=Path(tmp)),
+            )
+            t = validate_task({
+                'task_id': 'h62', 'directory': tmp, 'files': [str(test_file)],
+                'test_argv': ['/usr/bin/true'], 'prompt': 'Fix test',
+            })
+            self.assertEqual(t['read_only_files'], [str(Path(service_file).resolve())])
+
+    def test_h63_visited_read_windows_in_trajspec_and_prior_feedback(self):
+        from harness.sandbox import (
+            _build_candidate1_trajspec_feedback,
+            _extract_read_windows_from_worker_log,
+            build_prior_attempt_feedback,
+        )
+        from harness.guards import build_preloaded_file_excerpts
+        with tempfile.TemporaryDirectory(prefix='h63-') as tmp:
+            state_dir = Path(tmp)
+            run_dir = state_dir / 'runs' / 'r1'
+            run_dir.mkdir(parents=True)
+            (run_dir / 'result.json').write_text(json.dumps({
+                'task_id': 't-h63', 'status': 'blocked',
+                'reason': 'repeated_file_read_without_write',
+                'model': 'openrouter/z-ai/glm-5.3-flash', 'started_at': 100,
+            }))
+            (run_dir / 'worker.log').write_text(
+                '{"type": "tool_use", "part": {"tool": "read", "state": {"status": "completed", '
+                '"input": {"path": "/repo/big.py", "offset": 165, "limit": 40}}}}\n'
+                '{"type": "tool_use", "part": {"tool": "read", "state": {"status": "completed", '
+                '"input": {"path": "/repo/big.py", "offset": 340, "limit": 50}}}}\n'
+            )
+            windows = ['big.py L165-L204', 'big.py L340-L389']
+            self.assertEqual(_extract_read_windows_from_worker_log(run_dir), windows)
+            self.assertIn(
+                'Visited read windows: %s' % ', '.join(windows),
+                _build_candidate1_trajspec_feedback(
+                    {'status': 'blocked', 'reason': 'repeated_file_read_without_write',
+                     'artifact': str(run_dir)}, {}, {}),
+            )
+            self.assertIn(
+                '[Visited read windows]: %s' % ', '.join(windows),
+                build_prior_attempt_feedback(state_dir, 't-h63'),
+            )
+
+    def test_h64_resynthesize_pending_traces_after_run_completion(self):
+        from harness.telemetry import synthesize_spans_from_run_dir
+        with tempfile.TemporaryDirectory(prefix='h64-') as tmp:
+            run_dir = Path(tmp) / 'runs' / 't-h64'
+            run_dir.mkdir(parents=True)
+            (run_dir / 'task.json').write_text(json.dumps({'task_id': 't-h64', 'prompt': 'do work'}))
+            (run_dir / 'result.json').write_text(json.dumps({
+                'task_id': 't-h64', 'status': 'pending', 'steps': 0, 'started_at': 1000.0,
+            }))
+            spans1 = synthesize_spans_from_run_dir(run_dir)
+            root1 = [s for s in spans1 if s.get('name') == 'harness.task'][0]
+            self.assertEqual(root1['attributes']['harness.status'], 'pending')
+
+            (run_dir / 'result.json').write_text(json.dumps({
+                'task_id': 't-h64', 'status': 'blocked', 'reason': 'repeated_tool_error',
+                'steps': 5, 'started_at': 1000.0, 'finished_at': 1012.0,
+            }))
+            spans2 = synthesize_spans_from_run_dir(run_dir)
+            root2 = [s for s in spans2 if s.get('name') == 'harness.task'][0]
+            self.assertEqual(root2['attributes']['harness.status'], 'blocked')
+            self.assertEqual(root2['attributes']['harness.steps'], 5)
+
 
 if __name__ == '__main__':
     unittest.main()

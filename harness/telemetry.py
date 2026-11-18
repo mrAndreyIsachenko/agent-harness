@@ -567,6 +567,18 @@ def _needs_resynthesis(spans: list[dict], run_path: Path) -> bool:
         attrs = root.get('attributes') or {}
         if 'input.value' not in attrs:
             return True
+        try:
+            res_payload = json.loads((run_path / 'result.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            res_payload = None
+        if isinstance(res_payload, dict):
+            res_status = str(res_payload.get('status') or '').strip()
+            cached_status = str(attrs.get('harness.status') or '').strip()
+            if res_status and cached_status != res_status:
+                return True
+            res_steps = res_payload.get('steps')
+            if isinstance(res_steps, int) and attrs.get('harness.steps') != res_steps:
+                return True
         if root.get('start_time_ns') == root.get('end_time_ns'):
             # Re-synthesize if duration_seconds or events indicate non-zero duration.
             return (run_path / 'events.jsonl').is_file() or (run_path / 'requests.json').is_file()

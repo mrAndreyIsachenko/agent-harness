@@ -584,6 +584,7 @@ def metrics(snap):
         model_error |= bool(data.get('error'))
         unfinished |= not bool(data.get('finish'))
         turn_input_errors = _Counter()
+        turn_file_read_inputs = _Counter()
         for part in data.get('content', []):
             if part.get('type') != 'tool':
                 continue
@@ -597,18 +598,26 @@ def metrics(snap):
                        json.dumps(st.get('content'), sort_keys=True))] += 1
                 path = (st.get('input') or {}).get('path')
                 if path:
-                    file_reads[path] += 1
+                    inp = json.dumps(st.get('input'), sort_keys=True)
+                    turn_file_read_inputs[(path, inp)] += 1
             elif part.get('name') in {'edit', 'write', 'apply_patch'} and st.get('status') == 'completed':
                 file_reads.clear()
                 reads.clear()
                 errors.clear()
                 turn_input_errors.clear()
+                turn_file_read_inputs.clear()
         per_key_max = {}
         for (key, _inp), cnt in turn_input_errors.items():
             if cnt > per_key_max.get(key, 0):
                 per_key_max[key] = cnt
         for key, inc in per_key_max.items():
             errors[key] += inc
+        per_path_max = {}
+        for (path, _inp), cnt in turn_file_read_inputs.items():
+            if cnt > per_path_max.get(path, 0):
+                per_path_max[path] = cnt
+        for path, inc in per_path_max.items():
+            file_reads[path] += inc
     return dict(cost=snap['cost'], steps=steps, compact=compact, model_error=model_error,
                 unfinished=unfinished, errors=max(errors.values(), default=0), reads=max(reads.values(), default=0),
                 file_reads=max(file_reads.values(), default=0))

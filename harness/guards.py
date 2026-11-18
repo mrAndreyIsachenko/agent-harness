@@ -114,7 +114,7 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sk-or-v1-...", re.compile(r"sk-or-v1-[A-Za-z0-9_-]+")),
     (
         "PRIVATE KEY-----",
-        re.compile(r"-----BEGIN(?: [A-Z0-9]+){0,3} PRIVATE KEY-----"),
+        re.compile(r"(?<![\"'])-----BEGIN(?: [A-Z0-9]+){0,3} PRIVATE KEY-----(?![\"'])"),
     ),
 )
 
