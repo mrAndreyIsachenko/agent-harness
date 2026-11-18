@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import difflib
 import json
+import keyword
 import re
 from bisect import bisect_right
 from collections.abc import Iterable, Mapping
@@ -111,7 +112,10 @@ _STANDARD_ENVELOPE_KEYS: frozenset[str] = frozenset(
 #: High-confidence leaked credential patterns scanned in message text content.
 _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sk-or-v1-...", re.compile(r"sk-or-v1-[A-Za-z0-9_-]+")),
-    ("PRIVATE KEY-----", re.compile(r"PRIVATE KEY-----")),
+    (
+        "PRIVATE KEY-----",
+        re.compile(r"-----BEGIN(?: [A-Z0-9]+){0,3} PRIVATE KEY-----"),
+    ),
 )
 
 #: SQL tool names subject to read-only enforcement.
@@ -1879,16 +1883,115 @@ def _parse_prompt_line_ranges(prompt: str) -> list[tuple[int, int]]:
     return ranges
 
 
+_PROMPT_SYMBOL_STOPWORDS: frozenset[str] = frozenset(
+    {
+        *keyword.kwlist,
+        # Built-in types & typing primitives
+        "str",
+        "int",
+        "float",
+        "bool",
+        "bytes",
+        "dict",
+        "list",
+        "set",
+        "tuple",
+        "frozenset",
+        "type",
+        "object",
+        "None",
+        "True",
+        "False",
+        "Any",
+        "Optional",
+        "Union",
+        "Iterable",
+        "Mapping",
+        "Sequence",
+        "Callable",
+        "Path",
+        "Pattern",
+        "Match",
+        "Exception",
+        # Common module / stdlib names
+        "re",
+        "os",
+        "sys",
+        "json",
+        "ast",
+        "io",
+        "time",
+        "math",
+        "copy",
+        "enum",
+        "uuid",
+        "shutil",
+        "tempfile",
+        "pathlib",
+        "typing",
+        "unittest",
+        "pytest",
+        # Generic variable / parameter names
+        "path",
+        "paths",
+        "file",
+        "files",
+        "line",
+        "lines",
+        "text",
+        "data",
+        "value",
+        "values",
+        "item",
+        "items",
+        "key",
+        "keys",
+        "result",
+        "results",
+        "out",
+        "err",
+        "msg",
+        "args",
+        "kwargs",
+        "self",
+        "cls",
+        "prompt",
+        "model",
+        "payload",
+        "name",
+        "code",
+        "status",
+        "error",
+        "errors",
+        "count",
+        "index",
+        "idx",
+        "start",
+        "end",
+        "node",
+        "tree",
+    }
+)
+
+
 def _extract_prompt_symbols(prompt: str) -> list[str]:
     """Return deduplicated identifier names mentioned in backticks or def/class."""
     symbols: list[str] = []
     seen: set[str] = set()
     for symbol in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", prompt):
+        if (
+            len(symbol) < 3
+            or symbol in _PROMPT_SYMBOL_STOPWORDS
+            or symbol.lower() in _PROMPT_SYMBOL_STOPWORDS
+        ):
+            continue
         if symbol not in seen:
             seen.add(symbol)
             symbols.append(symbol)
     for kind in ("def", "class"):
         for symbol in re.findall(rf"\b{kind}\s+([A-Za-z_][A-Za-z0-9_]*)", prompt):
+            if symbol in _PROMPT_SYMBOL_STOPWORDS:
+                continue
             if symbol not in seen:
                 seen.add(symbol)
                 symbols.append(symbol)

@@ -6976,6 +6976,50 @@ class TestH55H57Fixes(unittest.TestCase):
         self.assertEqual(updated['status'], 'validation_passed_review_required')
         self.assertEqual(updated['salvaged_from'], 'retroactive_repeated_tool_error')
 
+    def test_h60_egress_guard_self_excerpt_and_prompt_symbol_stopwords(self):
+        from harness.guards import (
+            _extract_prompt_symbols,
+            build_preloaded_file_excerpts,
+            check_egress_payload,
+        )
+
+        for header in (
+            '-----BEGIN RSA PRIVATE KEY-----',
+            '-----BEGIN OPENSSH PRIVATE KEY-----',
+            '-----BEGIN PRIVATE KEY-----',
+        ):
+            violations = check_egress_payload({'messages': [{'role': 'user', 'content': header}]})
+            self.assertTrue(
+                any('PRIVATE KEY-----' in v for v in violations),
+                f'Expected PRIVATE KEY----- violation for {header!r}, got {violations!r}',
+            )
+
+        guards_path = Path(__file__).resolve().parent.parent / 'harness' / 'guards.py'
+        guards_source = guards_path.read_text(encoding='utf-8')
+        self.assertEqual(
+            check_egress_payload({'messages': [{'role': 'user', 'content': guards_source}]}),
+            [],
+        )
+        excerpt = build_preloaded_file_excerpts([str(guards_path)], 'Inspect lines 105-125')
+        self.assertEqual(
+            check_egress_payload({'messages': [{'role': 'user', 'content': excerpt}]}),
+            [],
+        )
+
+        self.assertEqual(
+            _extract_prompt_symbols(
+                'Update `check_egress_payload` taking `payload`: `dict`, `str`, `int`, `path`, `id`'
+            ),
+            ['check_egress_payload'],
+        )
+
+        targeted_excerpt = build_preloaded_file_excerpts(
+            [str(guards_path)],
+            'Update `check_egress_payload` with `str` and `dict`',
+        )
+        self.assertIn('def check_egress_payload', targeted_excerpt)
+        self.assertNotIn('1: """Guard helpers ported from the opencode_guard supervisor.', targeted_excerpt)
+
 
 if __name__ == '__main__':
     unittest.main()
