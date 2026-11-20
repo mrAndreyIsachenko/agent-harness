@@ -2,6 +2,8 @@
 
 Subcommands:
     preflight <file>...   Validate allowed-file syntax (exit 1 on errors).
+    heal --directory <dir> -- <test_argv...>
+                          Autonomous pytest failure healer.
     skeleton <file>...    Print line-threshold skeletons for the given files.
     bench-report          Render a Markdown benchmark comparison from two
                           JSON files of run records.
@@ -361,6 +363,60 @@ def _run_run(args: argparse.Namespace) -> int:
     return int(result)
 
 
+def _run_heal(args: argparse.Namespace) -> int:
+    from harness.sandbox import DEFAULT_MODEL, heal_directory
+
+    test_argv = list(args.test_argv or [])
+    if test_argv and test_argv[0] == '--':
+        test_argv = test_argv[1:]
+    if not test_argv:
+        print(json.dumps({'status': 'error', 'reason': 'test_argv_required'}))
+        return 2
+    result = heal_directory(
+        args.directory,
+        test_argv,
+        dry_run=args.dry_run,
+        edit_tests=args.edit_tests,
+        model=args.model or DEFAULT_MODEL,
+        worktree=args.worktree,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True, default=str))
+    return 0 if result.get('status') in (
+        'already_passing',
+        'task_synthesized',
+        'validation_passed_review_required',
+        'patch_ready_review_required',
+        'passed',
+        'validated',
+    ) else 1
+
+
+def _run_plan(args: argparse.Namespace) -> int:
+    from harness.proxy import GuardError
+    from harness.sandbox import execute_plan, validate_plan
+
+    try:
+        raw_plan = json.loads(Path(args.plan_manifest).read_text())
+        if args.validate_only:
+            plan = validate_plan(raw_plan)
+            print(json.dumps({
+                'plan_id': plan['plan_id'],
+                'status': 'validated',
+                'waves': [[n['task_id'] for n in w] for w in plan['waves']],
+                'max_parallel': plan['max_parallel'],
+            }, indent=2, sort_keys=True))
+            return 0
+        result = execute_plan(raw_plan, state=Path(args.state_dir) if args.state_dir else None)
+        print(json.dumps(result, indent=2, sort_keys=True, default=str))
+        return 0 if result.get('status') == 'succeeded' else 1
+    except (GuardError, OSError, ValueError) as exc:
+        print(json.dumps({
+            'status': 'blocked',
+            'reason': str(exc) if isinstance(exc, GuardError) else type(exc).__name__,
+        }))
+        return 1
+
+
 def _run_export_dataset(args: argparse.Namespace) -> int:
     records = export_sml_dataset(
         args.state_dir,
@@ -523,6 +579,21 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--upstream-url", default=None, help="optional upstream LLM API base URL")
     run.add_argument("--state-dir", default=None, help="optional state directory override")
     run.set_defaults(handler=_run_run)
+
+    heal = subparsers.add_parser("heal", help="autonomous pytest failure healer")
+    heal.add_argument("--directory", required=True, help="directory to heal")
+    heal.add_argument("--dry-run", action="store_true", help="synthesize without applying edits")
+    heal.add_argument("--edit-tests", action="store_true", help="allow editing test files")
+    heal.add_argument("--worktree", action="store_true", help="isolate edits in a transactional git worktree")
+    heal.add_argument("--model", default=None, help="model ID override (default: sandbox DEFAULT_MODEL)")
+    heal.add_argument("test_argv", nargs=argparse.REMAINDER, metavar="-- <test_argv...>")
+    heal.set_defaults(handler=_run_heal)
+
+    plan_cmd = subparsers.add_parser('plan', help='execute a parallel worktree DAG plan manifest')
+    plan_cmd.add_argument('plan_manifest', help='path to JSON plan manifest')
+    plan_cmd.add_argument('--validate-only', action='store_true', help='validate plan DAG without executing')
+    plan_cmd.add_argument('--state-dir', default=None, help='optional state directory override')
+    plan_cmd.set_defaults(handler=_run_plan)
 
     replay = subparsers.add_parser(
         "replay",

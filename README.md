@@ -62,7 +62,7 @@ budget. Upstream 429/5xx responses arm the circuit breaker
 | `harness.proxy` | `OpenRouterGuardProxy` / `openrouter_proxy` context manager: gate, notices, stale-read compaction, egress & read-only SQL guards, `vLLM` upstream mode, cost & generation-id capture, circuit breaker, span recording |
 | `harness.report` | Run-record normalization, benchmark aggregation, Markdown comparison, live state-directory stats, offline A/B replay (`simulate_replay`, `format_replay_markdown`), SML SFT/DPO dataset export (`export_sml_dataset`) |
 | `harness.telemetry` | Stdlib-only OpenTelemetry/GenAI tracer, OTLP JSON & Protobuf export (`to_otlp_protobuf`), Arize AX / Phoenix flush, trace-tree rendering |
-| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `replay`, `trace`, `serve`, `run`, `export-dataset` subcommands |
+| `harness.cli` | `preflight`, `skeleton`, `bench-report`, `stats`, `replay`, `trace`, `serve`, `run`, `heal`, `plan`, `export-dataset` subcommands |
 
 H-10 adds the supervisor-side half of the picture. `harness.sandbox`
 validates each task manifest against its schema (`task_id`, `directory`,
@@ -467,6 +467,9 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-58** | Explicit allowed-files allowlist and denied-path reporting in `Permission denied: read` guard hint (`_extract_allowed_read_paths_from_prompt`) | `guards.py` |
 | **H-59** | Bounded proportional wall-clock timeout for `micro_repair` (`compute_repair_timeout_seconds`, `active_timeout_seconds`) | `sandbox.py` |
 | **H-65** | Local import companion inference (`infer_read_only_companion_files` second pass parsing `Import`/`ImportFrom` of editable `.py` files) and worktree path aliases (`file_aliases` / `read_only_file_aliases` merging original repo paths in `isolated_worktree`) | `sandbox.py` |
+| **H-66** | Parallel worktree DAG plan executor (`validate_plan`, `execute_plan`, `harness plan [--validate-only] [--state-dir]` CLI): validates wave/task DAG manifests and executes them with wave-parallel workers | `sandbox.py`, `cli.py`, `__init__.py` |
+| **H-67** | Cross-file symbol context preloading (`build_cross_file_symbol_context`: AST-derived imported symbol signatures, class/dataclass fields, UPPER_CASE constants, and `conftest.py` pytest fixture broker) gated by the `include_symbol_context` task flag | `guards.py`, `sandbox.py` |
+| **H-68** | Autonomous Pytest Failure Healer (`synthesize_heal_task`, `heal_directory`, `harness heal` CLI): synthesizes a task from a failing pytest invocation, optionally edits tests, isolates risky edits in a transactional worktree, and reports structured heal results | `sandbox.py`, `cli.py`, `__init__.py` |
 
 ## Quickstart
 

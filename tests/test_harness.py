@@ -62,10 +62,10 @@ from harness.sandbox import (GuardError, _PYTEST_PROBE_CACHE,
                              build_micro_repair_prompt, build_prior_attempt_feedback, capture_files,
                              compute_repair_max_steps, compute_repair_timeout_seconds, config_for, execute,
                              file_hashes, isolated_worktree, locks,
-                             main as sandbox_main, model_run, owned_process,
-                             preflight, resolve_pytest_test_argv, run_best_of_2,
-                             run_task, stop_group,
-                             validate_task, verify_permissions)
+                             execute_plan, main as sandbox_main, model_run,
+                             owned_process, preflight, resolve_pytest_test_argv,
+                             run_best_of_2, run_task, stop_group,
+                             validate_plan, validate_task, verify_permissions)
 from harness.telemetry import OPENINFERENCE_SPAN_KINDS, HarnessTracer, format_trace_tree
 
 GLM = 'openrouter/z-ai/glm-5.3-flash'
@@ -7172,6 +7172,351 @@ class TestH55H57Fixes(unittest.TestCase):
                 for p in originals:
                     self.assertIn({'action': 'read', 'resource': p, 'effect': 'allow'}, perms)
                     self.assertNotIn({'action': 'edit', 'resource': p, 'effect': 'allow'}, perms)
+
+    def test_h67_cross_file_symbol_context_and_fixtures(self):
+        from harness.guards import build_cross_file_symbol_context
+        with tempfile.TemporaryDirectory(prefix='h67-') as tmp:
+            root = Path(tmp).resolve()
+            (root / 'consts.py').write_text(
+                'MAX_RETRIES = 5\n'
+                'DEFAULT_NAME = "medvidi"\n'
+                'def retry_call(fn, attempts=None):\n'
+                '    """Call ``fn`` up to ``attempts`` times."""\n'
+                '    INTERNAL_BODY_TOKEN = fn()\n'
+                '    return INTERNAL_BODY_TOKEN\n'
+                'class RetryPolicy:\n'
+                '    max_attempts: int = 3\n'
+                '    backoff: float = 0.5\n'
+                '    def should_retry(self, exc):\n'
+                '        CLASS_BODY_TOKEN = True\n'
+                '        return CLASS_BODY_TOKEN\n'
+                '@dataclass\n'
+                'class Config:\n'
+                '    name: str = "x"\n'
+                '    retries: int = 1\n')
+            test_file = root / 'test_worker.py'
+            test_file.write_text(
+                'from consts import MAX_RETRIES, DEFAULT_NAME, retry_call, '
+                'RetryPolicy, Config\n'
+                'def test_worker(retry_call):\n'
+                '    assert MAX_RETRIES\n')
+            (root / 'conftest.py').write_text(
+                'import pytest\n'
+                '@pytest.fixture\n'
+                'def retry_call():\n'
+                '    return 1\n')
+            ctx = build_cross_file_symbol_context(
+                [str(test_file)], 'Fix test_worker', directory=str(root))
+            self.assertIn('[Cross-File Symbol Signatures & Fixtures]', ctx)
+            # Function signature + docstring, but not the body.
+            self.assertIn('def retry_call', ctx)
+            self.assertIn('Call ``fn`` up to ``attempts`` times.', ctx)
+            self.assertNotIn('INTERNAL_BODY_TOKEN', ctx)
+            # Class fields and method signatures without bodies.
+            self.assertIn('class RetryPolicy', ctx)
+            self.assertIn('max_attempts', ctx)
+            self.assertIn('def should_retry', ctx)
+            self.assertNotIn('CLASS_BODY_TOKEN', ctx)
+            self.assertIn('class Config', ctx)
+            self.assertIn('retries', ctx)
+            # UPPER_CASE constants.
+            self.assertIn('MAX_RETRIES', ctx)
+            self.assertIn('DEFAULT_NAME', ctx)
+            # conftest.py fixture broker for test_* parameters.
+            self.assertIn('conftest.py', ctx)
+            self.assertIn('@pytest.fixture', ctx)
+            self.assertIn('def retry_call()', ctx)
+            self.assertNotIn('FIXTURE_BODY_TOKEN', ctx)
+
+    def test_h67_max_chars_and_sandbox_integration(self):
+        from harness.guards import build_cross_file_symbol_context
+        from harness.sandbox import GuardError, model_run, validate_task
+        with tempfile.TemporaryDirectory(prefix='h67b-') as tmp:
+            root = Path(tmp).resolve()
+            big = root / 'bigmod.py'
+            big.write_text('\n'.join('VALUE_%d = %d' % (i, i) for i in range(200)))
+            target = root / 'test_target.py'
+            target.write_text('from bigmod import '
+                              + ', '.join('VALUE_%d' % i for i in range(50)) + '\n'
+                              'def test_target():\n'
+                              '    assert VALUE_0\n')
+            full = build_cross_file_symbol_context(
+                [str(target)], 'Fix test_target', directory=str(root),
+                read_only_files=[str(big)])
+            capped = build_cross_file_symbol_context(
+                [str(target)], 'Fix test_target', directory=str(root),
+                read_only_files=[str(big)], max_chars=500)
+            self.assertLessEqual(len(capped), 500)
+            self.assertGreater(len(full), 500)
+            # validate_task: default True, explicit False, invalid type.
+            t = validate_task({
+                'task_id': 'h67', 'directory': str(root), 'files': [str(target)],
+                'test_argv': ['/usr/bin/true'], 'prompt': 'Fix test',
+            })
+            self.assertTrue(t['include_symbol_context'])
+            t = validate_task({
+                'task_id': 'h67', 'directory': str(root), 'files': [str(target)],
+                'test_argv': ['/usr/bin/true'], 'prompt': 'Fix test',
+                'include_symbol_context': False,
+            })
+            self.assertFalse(t['include_symbol_context'])
+            with self.assertRaises(GuardError) as cm:
+                validate_task({
+                    'task_id': 'h67', 'directory': str(root), 'files': [str(target)],
+                    'test_argv': ['/usr/bin/true'], 'prompt': 'Fix test',
+                    'include_symbol_context': 'yes',
+                })
+            self.assertEqual(str(cm.exception), 'invalid_include_symbol_context_flag')
+
+            # model_run injects the symbol context header when enabled.
+            import sys
+            from unittest import mock
+            argv_dump = root / 'argv.txt'
+            stub = root / 'stub_cli.py'
+            stub.write_text(
+                '#!/usr/bin/env python3\n'
+                'import sys\n'
+                'with open(%r, "w", encoding="utf-8") as out:\n'
+                '    out.write(sys.argv[-1] if len(sys.argv) > 1 else "")\n'
+                % str(argv_dump))
+            stub.chmod(0o755)
+            run_dir = root / 'state' / 'runs' / 'h67'
+            run_dir.mkdir(parents=True)
+            result = {'session_id': 'ses_test_h67', 'cost': None}
+            base_task = {
+                'task_id': 'h67', 'mode': 'model',
+                'model': 'openrouter/z-ai/glm-5.3-flash',
+                'directory': str(root),
+                'files': [str(target)],
+                'read_only_files': [str(big)],
+                'test_argv': ['/usr/bin/true'],
+                'timeout_seconds': 30,
+                'max_steps': 8,
+                'prompt': 'Implement the change.',
+            }
+
+            def run_model_run(task):
+                with mock.patch('harness.sandbox.snapshot',
+                                return_value={'id': 'ses_test_h67'}), \
+                        mock.patch('harness.sandbox.metrics',
+                                   return_value={'steps': 1, 'cost': 0.001,
+                                                 'unfinished': False,
+                                                 'model_error': False}), \
+                        mock.patch('harness.sandbox.violation',
+                                   lambda *a, **k: None), \
+                        mock.patch('harness.sandbox.capture_requests',
+                                   lambda *a, **k: None), \
+                        mock.patch('harness.sandbox.capture_files',
+                                   lambda *a, **k: None):
+                    model_run(stub, root / 'opencode.db', task,
+                              run_dir, result, 0.15)
+                return argv_dump.read_text(encoding='utf-8')
+
+            prompt_on = run_model_run(base_task)
+            self.assertIn('[Cross-File Symbol Signatures & Fixtures]', prompt_on)
+            self.assertIn('MAX_RETRIES' if 'MAX_RETRIES' in prompt_on else 'VALUE_0', prompt_on)
+            # Disabled flag -> no symbol context section.
+            off_task = dict(base_task, include_symbol_context=False)
+            prompt_off = run_model_run(off_task)
+            self.assertNotIn('[Cross-File Symbol Signatures & Fixtures]', prompt_off)
+            # [CURRENT_PATCH] tasks skip symbol context too.
+            patch_task = dict(base_task,
+                              prompt='Implement.\n[CURRENT_PATCH]\n--- a\n+++ b\n')
+            prompt_patch = run_model_run(patch_task)
+            self.assertNotIn('[Cross-File Symbol Signatures & Fixtures]', prompt_patch)
+
+
+class TestH68Heal(unittest.TestCase):
+    """H-68: autonomous pytest failure healer (synthesize_heal_task / heal_directory / CLI heal)."""
+
+    def _make_repo(self, tmp, service_body):
+        pkg = os.path.join(tmp, 'pkg')
+        tests = os.path.join(pkg, 'tests')
+        os.makedirs(tests, exist_ok=True)
+        for init_py in (os.path.join(pkg, '__init__.py'), os.path.join(tests, '__init__.py')):
+            with open(init_py, 'w', encoding='utf-8') as fh:
+                fh.write('')
+        service_py = os.path.join(pkg, 'service.py')
+        test_py = os.path.join(tests, 'test_service.py')
+        with open(service_py, 'w', encoding='utf-8') as fh:
+            fh.write(service_body + '\n')
+        with open(test_py, 'w', encoding='utf-8') as fh:
+            fh.write(
+                'from pkg.service import compute\n\n'
+                'class TestSvc:\n'
+                '    def test_compute(self):\n'
+                '        assert compute() == 3\n'
+            )
+        return service_py, test_py
+
+    def test_h68_synthesize_heal_task_classifies_impl_and_tests(self):
+        from harness.sandbox import synthesize_heal_task
+        with tempfile.TemporaryDirectory() as tmp:
+            service_py, test_py = self._make_repo(tmp, 'def compute():\n    return 2\n')
+            log = (
+                'Traceback (most recent call last):\n'
+                '  File "%s", line 10, in test_compute\n'
+                '    assert compute() == 3\n'
+                '  File "%s", line 5, in compute\n'
+                'E   assert 2 == 3\n'
+                'FAILED pkg/tests/test_service.py::TestSvc::test_compute - AssertionError\n'
+                '1 failed, 1 passed in 0.05s\n' % (test_py, service_py)
+            )
+            task = synthesize_heal_task(tmp, [sys.executable, '-m', 'pytest', 'pkg/tests'], log)
+            self.assertIsNotNone(task)
+            self.assertIn(str(Path(service_py).resolve()), task['files'])
+            self.assertIn(str(Path(test_py).resolve()), task['read_only_files'])
+            self.assertEqual(task['test_argv'],
+                             [sys.executable, '-m', 'pytest',
+                              'pkg/tests/test_service.py::TestSvc::test_compute'])
+            # Passing log -> no heal task.
+            self.assertIsNone(synthesize_heal_task(tmp, [sys.executable, '-m', 'pytest', 'pkg/tests'], '2 passed in 0.01s'))
+            # edit_tests=True allows editing the failing test file too.
+            task_edits = synthesize_heal_task(tmp, [sys.executable, '-m', 'pytest', 'pkg/tests'], log, edit_tests=True)
+            self.assertIn(str(Path(service_py).resolve()), task_edits['files'])
+            self.assertIn(str(Path(test_py).resolve()), task_edits['files'])
+
+    def test_h68_heal_directory_already_passing_and_dry_run(self):
+        from harness.sandbox import heal_directory
+        with tempfile.TemporaryDirectory() as tmp:
+            service_py, test_py = self._make_repo(tmp, 'def compute():\n    raise ValueError("boom")\n')
+            res = heal_directory(str(tmp), [sys.executable, '-m', 'pytest', '-q'], dry_run=True)
+            self.assertEqual(res['status'], 'task_synthesized')
+            self.assertIn(str(Path(service_py).resolve()), res['task']['files'])
+            self.assertIn(str(Path(test_py).resolve()), res['task']['read_only_files'])
+
+            res_mock = heal_directory(str(tmp), [sys.executable, '-m', 'pytest', '-q'],
+                                      runner=lambda task: {'status': 'mocked_ok'})
+            self.assertEqual(res_mock['status'], 'mocked_ok')
+            self.assertIn('synthesized_task', res_mock)
+
+            with open(service_py, 'w', encoding='utf-8') as fh:
+                fh.write('def compute():\n    return 3\n')
+            res_pass = heal_directory(str(tmp), [sys.executable, '-m', 'pytest', '-q'])
+            self.assertEqual(res_pass, {'status': 'already_passing', 'returncode': 0})
+
+    def test_h68_cli_heal_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service_py, _ = self._make_repo(tmp, 'def compute():\n    raise ValueError("boom")\n')
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(['heal', '--directory', str(tmp), '--dry-run', '--',
+                               sys.executable, '-m', 'pytest', '-q'])
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload['status'], 'task_synthesized')
+            self.assertIn(str(Path(service_py).resolve()), payload['task']['files'])
+
+
+class TestH66PlanOrchestrator(HarnessTestCase):
+    def _plan_node(self, tmp, node_id, files, depends_on=None, extra=None):
+        node = {
+            'task_id': node_id,
+            'directory': tmp,
+            'files': [str(Path(tmp) / f) for f in files],
+            'test_argv': [sys.executable, '-c', 'import sys; sys.exit(0)'],
+            'prompt': 'Fix it.',
+            'depends_on': depends_on or [],
+        }
+        node.update(extra or {})
+        return node
+
+    def _plan(self, tmp, nodes, final_test_argv=None):
+        for node in nodes:
+            for f in node['files']:
+                Path(f).parent.mkdir(parents=True, exist_ok=True)
+                Path(f).write_text('# placeholder\n')
+        return {
+            'plan_id': 'plan-h66',
+            'directory': tmp,
+            'nodes': nodes,
+            'final_test_argv': final_test_argv,
+        }
+
+    def test_h66_validate_plan_cycle_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._plan_node(tmp, 'a', ['a.py'], depends_on=['b'])
+            b = self._plan_node(tmp, 'b', ['b.py'], depends_on=['a'])
+            with self.assertRaisesRegex(GuardError, 'cyclic_plan_dependency'):
+                validate_plan(self._plan(tmp, [a, b]))
+
+    def test_h66_validate_plan_parallel_file_overlap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n1 = self._plan_node(tmp, 'n1', ['shared.py'])
+            n2 = self._plan_node(tmp, 'n2', ['shared.py'])
+            with self.assertRaisesRegex(
+                    GuardError, 'parallel_nodes_share_editable_files'):
+                validate_plan(self._plan(tmp, [n1, n2]))
+
+    def test_h66_execute_plan_parallel_waves_and_final_test(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n1 = self._plan_node(tmp, 'n1', ['a.py'])
+            n2 = self._plan_node(tmp, 'n2', ['b.py'])
+            n3 = self._plan_node(tmp, 'n3', ['c.py'], depends_on=['n1', 'n2'])
+            calls = []
+
+            def runner(node):
+                calls.append((node['task_id'], node.get('worktree')))
+                return {'status': 'validation_passed_review_required',
+                        'cost': 0.1, 'steps': 2}
+
+            final_argv = [sys.executable, '-c',
+                          'import sys; sys.exit(0)']
+            res = execute_plan(
+                self._plan(tmp, [n1, n2, n3], final_test_argv=final_argv),
+                runner=runner)
+            self.assertEqual(res['status'], 'succeeded')
+            self.assertEqual(res['waves'], [['n1', 'n2'], ['n3']])
+            self.assertEqual(res['final_test_returncode'], 0)
+            self.assertAlmostEqual(res['total_cost'], 0.3)
+            self.assertEqual(res['total_steps'], 6)
+            worktrees = dict(calls)
+            self.assertTrue(worktrees['n1'])
+            self.assertTrue(worktrees['n2'])
+
+            final_argv = [sys.executable, '-c',
+                          'import sys; sys.exit(1)']
+            res = execute_plan(
+                self._plan(tmp, [n1, n2, n3], final_test_argv=final_argv),
+                runner=runner)
+            self.assertEqual(res['status'], 'blocked')
+            self.assertEqual(res['reason'], 'final_validation_failed')
+            self.assertEqual(res['final_test_returncode'], 1)
+
+    def test_h66_execute_plan_stops_on_wave1_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n1 = self._plan_node(tmp, 'n1', ['a.py'])
+            n2 = self._plan_node(tmp, 'n2', ['b.py'])
+            n3 = self._plan_node(tmp, 'n3', ['c.py'], depends_on=['n1'])
+            called = []
+
+            def runner(node):
+                called.append(node['task_id'])
+                if node['task_id'] == 'n1':
+                    return {'status': 'blocked', 'reason': 'boom'}
+                return {'status': 'validation_passed_review_required',
+                        'cost': 0.1, 'steps': 2}
+
+            res = execute_plan(self._plan(tmp, [n1, n2, n3]), runner=runner)
+            self.assertEqual(res['status'], 'blocked')
+            self.assertEqual(res['failed_node'], 'n1')
+            self.assertNotIn('n3', called)
+            skipped = [r for r in res['node_results']
+                       if r.get('task_id') == 'n3']
+            self.assertEqual(skipped[0]['status'], 'skipped_upstream_failure')
+
+    def test_h66_cli_plan_validate_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            n1 = self._plan_node(tmp, 'n1', ['a.py'])
+            plan_path = Path(tmp) / 'plan.json'
+            plan_path.write_text(json.dumps(self._plan(tmp, [n1])))
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = cli_main(['plan', str(plan_path), '--validate-only'])
+            self.assertEqual(rc, 0)
+            out = json.loads(buf.getvalue())
+            self.assertEqual(out['status'], 'validated')
+            self.assertEqual(out['waves'], [['n1']])
 
 
 if __name__ == '__main__':

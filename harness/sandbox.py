@@ -8,6 +8,7 @@ journal and test suites keep working unchanged.
 import argparse
 import ast
 import base64
+import concurrent.futures
 import difflib
 import fcntl
 import fnmatch
@@ -59,8 +60,9 @@ from .finops import (
     verify_db,
     violation,
 )
-from .guards import (build_file_skeletons, build_preloaded_file_excerpts,
-                     extract_compact_test_failure, extract_failing_test_excerpts)
+from .guards import (build_cross_file_symbol_context, build_file_skeletons,
+                     build_preloaded_file_excerpts, extract_compact_test_failure,
+                     extract_failing_test_excerpts)
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
 from .report import build_repo_memory_hint
 from .routing import DEFAULT_MODEL, MODELS, TEACHER_MODELS, ProviderHealthStore
@@ -195,6 +197,170 @@ def build_targeted_pytest_argv(test_argv, test_log, *, max_nodeids=5):
                 skip_next = True
     targeted = prefix + flag_args + nodeids
     return targeted if targeted != list(test_argv) else None
+
+
+_FRAME_RE = re.compile(r'^([^\s:][^:]*\.py):(\d+):', re.MULTILINE)
+_TB_FRAME_RE = re.compile(r'File "([^"]+\.py)", line (\d+)')
+
+
+def synthesize_heal_task(directory: str, test_argv: list, test_log: str, *,
+                         task_id: str | None = None, edit_tests: bool = False,
+                         model: str = DEFAULT_MODEL, worktree: bool = False) -> dict | None:
+    """H-68: synthesize a guarded heal task from a failing pytest log.
+
+    Returns a validated task dict, or None when the log shows no failures or
+    no in-repo Python source files can be identified as heal targets.
+    """
+    failure_markers = ('FAILED ', 'ERROR collecting', 'ERROR ', 'Traceback (most recent call last)')
+    has_failures = (
+        'FAILED ' in test_log
+        or 'ERROR collecting' in test_log
+        or 'ERROR ' in test_log
+        or ('Traceback (most recent call last)' in test_log
+            and re.search(r'^(FAILED|ERROR)', test_log, re.MULTILINE))
+        or re.search(r'^=+ FAILURES =+', test_log, re.MULTILINE)
+        or re.search(r'^=+ ERRORS =+', test_log, re.MULTILINE)
+        or re.search(r'=+ \d+ failed', test_log)
+    )
+    if not has_failures:
+        return None
+    base_dir = Path(directory).resolve()
+
+    nodeids: list[str] = []
+    for m in re.finditer(r'^FAILED\s+(\S+)', test_log, re.MULTILINE):
+        if m.group(1) not in nodeids:
+            nodeids.append(m.group(1))
+    for m in re.finditer(r'^(?:ERROR collecting\s+(\S+)|ERROR\s+(\S+))', test_log, re.MULTILINE):
+        nid = m.group(1) or m.group(2)
+        if nid and nid not in nodeids:
+            nodeids.append(nid)
+
+    def _existing_repo_file(ref: str):
+        if not ref or not ref.endswith('.py'):
+            return None
+        p = Path(ref)
+        try:
+            if not p.is_absolute():
+                p = base_dir / ref
+            p = p.resolve()
+        except OSError:
+            return None
+        parts = set(p.parts)
+        if '.venv' in parts or 'site-packages' in parts:
+            return None
+        if not (p.is_file() and p.is_relative_to(base_dir)):
+            return None
+        return p
+
+    frame_paths: list[Path] = []
+    seen_paths: set[str] = set()
+
+    def _add_frame(p):
+        if p is None:
+            return
+        key = str(p)
+        if key not in seen_paths:
+            seen_paths.add(key)
+            frame_paths.append(p)
+
+    for m in _FRAME_RE.finditer(test_log):
+        _add_frame(_existing_repo_file(m.group(1)))
+    for m in _TB_FRAME_RE.finditer(test_log):
+        _add_frame(_existing_repo_file(m.group(1)))
+    for nid in nodeids:
+        path_part = nid.split('::', 1)[0]
+        _add_frame(_existing_repo_file(path_part))
+
+    if not frame_paths:
+        return None
+    # Deepest frames first: reverse extraction order, dedupe preserving first-seen order.
+    ordered = list(reversed(frame_paths))
+
+    def _is_test_file(p: Path) -> bool:
+        name = p.name
+        return name.startswith('test_') or name.endswith('_test.py') or name == 'conftest.py'
+
+    test_files = [str(p) for p in ordered if _is_test_file(p)]
+    impl_files = [str(p) for p in ordered if not _is_test_file(p)]
+
+    if not edit_tests:
+        if impl_files:
+            files = impl_files[:3]
+            read_only_files = (test_files + impl_files[3:])[:5]
+        else:
+            files = test_files[:3]
+            read_only_files = test_files[3:8]
+    else:
+        candidates = ordered
+        files = [str(p) for p in candidates[:3]]
+        read_only_files = [str(p) for p in candidates[3:8]]
+    if not files:
+        return None
+
+    targeted = build_targeted_pytest_argv(test_argv, test_log) or list(test_argv)
+
+    # Compact error excerpt: E-lines plus the tail of the FAILURES/ERRORS section.
+    error_lines = [line for line in test_log.splitlines() if line.startswith('E   ')]
+    section_match = re.search(r'^=+ (?:FAILURES|ERRORS) =+\s*$', test_log, re.MULTILINE)
+    if section_match:
+        section = test_log[section_match.end():]
+        section = re.split(r'^=+ .* =+\s*$', section, maxsplit=1, flags=re.MULTILINE)[0]
+        tail = [line for line in section.splitlines() if line.strip()][-25:]
+    else:
+        tail = [line for line in test_log.splitlines() if line.strip()][-25:]
+    excerpt_lines = error_lines + [''] + tail if error_lines else tail
+
+    nodeid_lines = [f'- {nid}' for nid in nodeids] or ['- (no explicit nodeids captured)']
+    prompt_lines = [
+        'Heal the failing tests in this repository.',
+        '',
+        'Failed nodeids:',
+        *nodeid_lines,
+        '',
+        'Error excerpt:',
+        *(excerpt_lines),
+        '',
+        f'Editable files (fix the root cause here with a minimal patch): {files}',
+        f'Read-only reference files (do NOT edit): {read_only_files}',
+        '',
+        'Fix the root cause of the failures with a minimal patch.',
+    ]
+    prompt = '\n'.join(prompt_lines)
+
+    tid = task_id or f'heal-{uuid.uuid4().hex[:8]}'
+    raw = {'task_id': tid, 'directory': str(base_dir), 'files': files,
+           'read_only_files': read_only_files, 'test_argv': targeted,
+           'prompt': prompt, 'model': model, 'worktree': worktree}
+    return validate_task(raw)
+
+
+def heal_directory(directory, test_argv, *, dry_run=False, edit_tests=False,
+                   model=DEFAULT_MODEL, worktree=False, runner=None) -> dict:
+    """H-68: run tests in a directory and, on failure, synthesize and run a heal task."""
+    if runner is None:
+        runner = execute
+    resolved_argv = resolve_pytest_test_argv(test_argv, directory)
+    with tempfile.TemporaryDirectory() as td:
+        log_path = Path(td) / 'initial_test.log'
+        rc = execute(resolved_argv, directory, 120, log_path)
+        test_log = log_path.read_text(encoding='utf-8', errors='replace')
+    if rc == 0:
+        return {'status': 'already_passing', 'returncode': 0}
+    task = synthesize_heal_task(directory, test_argv, test_log,
+                               edit_tests=edit_tests, model=model, worktree=worktree)
+    if task is None:
+        return {'status': 'no_heal_target', 'returncode': rc, 'initial_test_output': test_log}
+    if dry_run:
+        return {'status': 'task_synthesized', 'task': task, 'initial_test_output': test_log}
+    if runner is execute:
+        with tempfile.TemporaryDirectory() as td:
+            task_path = Path(td) / 'task.json'
+            task_path.write_text(json.dumps(task), encoding='utf-8')
+            res = run_task(task_path, _quiet=True, _return_result=True)
+    else:
+        res = runner(task)
+    return dict(res, synthesized_task=task)
+
 
 def infer_read_only_companion_files(files, *, directory='', existing_read_only=(), worktree=False, max_files=5):
     """H-62: infer existing implementation companion files for test_<mod>.py editable targets."""
@@ -420,6 +586,9 @@ def validate_task(raw):
     t.setdefault('include_repo_memory', True)
     if not isinstance(t['include_repo_memory'], bool):
         raise GuardError('invalid_include_repo_memory_flag')
+    t.setdefault('include_symbol_context', True)
+    if not isinstance(t['include_symbol_context'], bool):
+        raise GuardError('invalid_include_symbol_context_flag')
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
         raise GuardError('invalid_auto_micro_repair_flag')
@@ -612,6 +781,11 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
             read_only_files=task.get('read_only_files', []))
     else:
         excerpts = ''
+    symbol_context = ''
+    if '[CURRENT_PATCH]' not in task['prompt'] and task.get('include_symbol_context', True):
+        symbol_context = build_cross_file_symbol_context(
+            task['files'], task['prompt'], directory=task.get('directory', ''),
+            read_only_files=task.get('read_only_files', ()))
     ro_line = ''
     if task.get('read_only_files'):
         ro_line = ('\nRead-only reference files (do NOT edit): '
@@ -639,7 +813,7 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
                   + '. Source files are read-only. Do not reconstruct whole files. '
                   'No shell or network. Exit immediately after writing the patch; no extra summary call. '
                   'The supervisor checks the patch without applying it; testing follows reviewed application.')
-    prompt = skeletons + excerpts + prompt
+    prompt = skeletons + excerpts + (symbol_context + '\n\n' if symbol_context else '') + prompt
     argv = [str(cli), 'run', '--standalone', '--auto', '--format', 'json', '--agent', 'guarded_worker',
             '--session', sid, '--title', task['task_id'], '--model', task['model'], prompt]
     result['cost'] = None
@@ -1589,6 +1763,279 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
                           'winning_model': None, 'artifact': None,
                           'cost': None, 'observed_cost': None, 'steps': None}))
         return 1
+
+def validate_plan(raw_plan):
+    """H-66: validate and normalize a parallel worktree DAG plan."""
+    if not isinstance(raw_plan, dict):
+        raise GuardError('plan_must_be_an_object')
+    plan_id = raw_plan.get('plan_id')
+    if not isinstance(plan_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', plan_id):
+        raise GuardError('invalid_plan_id')
+    directory = raw_plan.get('directory')
+    if not isinstance(directory, str) or not Path(directory).is_absolute() \
+            or not Path(directory).is_dir():
+        raise GuardError('invalid_working_directory')
+    directory = str(Path(directory).resolve())
+    max_parallel = raw_plan.get('max_parallel', 2)
+    if isinstance(max_parallel, bool) or not isinstance(max_parallel, int) \
+            or not (1 <= max_parallel <= 4):
+        raise GuardError('invalid_max_parallel')
+    final_test_argv = raw_plan.get('final_test_argv')
+    if final_test_argv is not None:
+        final_test_argv = executable_argv(final_test_argv)
+    nodes = raw_plan.get('nodes')
+    if not isinstance(nodes, list) or not nodes or len(nodes) > 8 \
+            or not all(isinstance(n, dict) for n in nodes):
+        raise GuardError('invalid_plan_nodes')
+    normalized = []
+    seen_ids = set()
+    for node in nodes:
+        node_copy = dict(node)
+        node_copy.setdefault('directory', directory)
+        depends_on = node_copy.get('depends_on', [])
+        if not isinstance(depends_on, list) or not all(isinstance(d, str) for d in depends_on):
+            raise GuardError('invalid_depends_on')
+        node_copy['depends_on'] = list(depends_on)
+        validate_task(node_copy)
+        task_id = node_copy.get('task_id')
+        if task_id in seen_ids:
+            raise GuardError('duplicate_plan_task_id')
+        seen_ids.add(task_id)
+        normalized.append(node_copy)
+    node_map = {n['task_id']: n for n in normalized}
+    for node in normalized:
+        for dep in node['depends_on']:
+            if dep not in node_map:
+                raise GuardError('unknown_plan_dependency')
+    remaining = {n['task_id']: set(n['depends_on']) for n in normalized}
+    waves = []
+    placed = set()
+    by_id = {n['task_id']: n for n in normalized}
+    while remaining:
+        ready = [tid for tid, deps in remaining.items() if deps <= placed]
+        if not ready:
+            raise GuardError('cyclic_plan_dependency')
+        waves.append([by_id[tid] for tid in ready])
+        placed.update(ready)
+        for tid in ready:
+            del remaining[tid]
+    if len(waves) < len(nodes) and sum(len(w) for w in waves) < len(nodes):
+        raise GuardError('cyclic_plan_dependency')
+    for wave in waves:
+        if len(wave) > 1:
+            for i in range(len(wave)):
+                for j in range(i + 1, len(wave)):
+                    shared = set(wave[i]['files']) & set(wave[j]['files'])
+                    if shared:
+                        raise GuardError('parallel_nodes_share_editable_files')
+    return {
+        'plan_id': plan_id,
+        'directory': directory,
+        'nodes': normalized,
+        'waves': waves,
+        'max_parallel': max_parallel,
+        'final_test_argv': final_test_argv,
+    }
+
+_PLAN_SUCCESS_STATUSES = ('validation_passed_review_required',
+                          'patch_ready_review_required', 'succeeded')
+
+def _sync_plan_artifacts(node_id, res, plan_dir, node_files=()):
+    """Sync un-applied changes.patch / after/ files from a worktree run into the plan directory.
+
+    ``res['artifact']`` may be either:
+    - a dict with a ``changes.patch`` text key and an ``after`` mapping of
+      relative path -> content; or
+    - a str/Path directory containing a ``changes.patch`` file and an
+      ``after/`` directory whose files are matched to ``node_files`` by
+      relative path or filename.
+
+    Returns None on success or a reason string when git apply reports a conflict.
+    """
+    artifact = res.get('artifact')
+    after_items = []
+    if isinstance(artifact, (str, Path)):
+        artifact_dir = Path(artifact)
+        patch_path = artifact_dir / 'changes.patch'
+        patch = patch_path.read_text(encoding='utf-8', errors='replace') \
+            if patch_path.is_file() else None
+        after_dir = artifact_dir / 'after'
+        if after_dir.is_dir():
+            node_lookup = {}
+            for nf in node_files or ():
+                p = Path(nf)
+                node_lookup[p.name] = p
+                node_lookup[str(p)] = p
+                try:
+                    node_lookup[str(p.resolve())] = p
+                except OSError:
+                    pass
+            for candidate in sorted(after_dir.rglob('*')):
+                if not candidate.is_file():
+                    continue
+                rel = candidate.relative_to(after_dir)
+                target = node_lookup.get(str(rel)) or node_lookup.get(rel.name)
+                if target is None and len(set(node_files or ())) == 1:
+                    target = Path(list(dict.fromkeys(node_files or ()))[0])
+                if target is None:
+                    target = Path(plan_dir) / str(rel)
+                after_items.append((str(target),
+                                    candidate.read_text(encoding='utf-8',
+                                                        errors='replace')))
+    else:
+        artifact = artifact or {}
+        patch = artifact.get('changes.patch')
+        after = artifact.get('after') or {}
+        for path, content in after.items():
+            after_items.append((str(Path(plan_dir) / path), content))
+    for path, content in after_items:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.is_file() and target.read_text() == content:
+            continue
+        target.write_text(content)
+    if patch:
+        proc = subprocess.run(['git', 'apply', '--check', '-'],
+                              input=patch, cwd=plan_dir, capture_output=True,
+                              text=True)
+        if proc.returncode == 0:
+            proc = subprocess.run(['git', 'apply', '-'],
+                                  input=patch, cwd=plan_dir, capture_output=True,
+                                  text=True)
+            if proc.returncode != 0:
+                return 'worktree_patch_conflict'
+        else:
+            reverse = subprocess.run(['git', 'apply', '--reverse', '--check', '-'],
+                                     input=patch, cwd=plan_dir, capture_output=True,
+                                     text=True)
+            if reverse.returncode != 0:
+                return 'worktree_patch_conflict'
+    return None
+
+def execute_plan(raw_plan, *, runner=execute, state=None):
+    """H-66: execute a validated parallel worktree DAG plan wave by wave."""
+    plan = validate_plan(raw_plan)
+    status = 'succeeded'
+    reason = None
+    failed_node = None
+    final_test_returncode = None
+    node_results = []
+
+    def _run_plan_node(node):
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(prefix='plan_node_', suffix='.json')
+            with os.fdopen(fd, 'w') as fh:
+                json.dump(node, fh)
+            return run_task(tmp_path, state=state, _quiet=True, _return_result=True)
+        finally:
+            if tmp_path:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    actual_runner = _run_plan_node if runner is execute else runner
+
+    for wave_idx, wave in enumerate(plan['waves']):
+        results = {}
+        if len(wave) == 1:
+            try:
+                results[wave[0]['task_id']] = actual_runner(dict(wave[0]))
+            except Exception as exc:  # noqa: BLE001 - surfaced as blocked node
+                results[wave[0]['task_id']] = {
+                    'task_id': wave[0]['task_id'], 'status': 'blocked',
+                    'reason': str(exc) if isinstance(exc, GuardError) else type(exc).__name__}
+        else:
+            parallel_nodes = []
+            for node in wave:
+                node_copy = dict(node)
+                node_copy['worktree'] = True
+                parallel_nodes.append(node_copy)
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=plan['max_parallel']) as pool:
+                futures = {pool.submit(actual_runner, dict(n)): n
+                           for n in parallel_nodes}
+                for fut, node in futures.items():
+                    try:
+                        results[node['task_id']] = fut.result()
+                    except Exception as exc:  # noqa: BLE001
+                        results[node['task_id']] = {
+                            'task_id': node['task_id'], 'status': 'blocked',
+                            'reason': str(exc) if isinstance(exc, GuardError)
+                            else type(exc).__name__}
+        for node in wave:
+            res = dict(results.get(node['task_id']) or {})
+            res.setdefault('task_id', node['task_id'])
+            res.setdefault('wave', wave_idx)
+            if 'wave' not in res:
+                res['wave'] = wave_idx
+            node_results.append(res)
+        first_failed = None
+        failed_node_id = None
+        for node in wave:
+            res = results.get(node['task_id']) or {}
+            if res.get('status') == 'blocked' \
+                    or res.get('status') not in _PLAN_SUCCESS_STATUSES:
+                first_failed = res
+                failed_node_id = node['task_id']
+                break
+        if first_failed is not None:
+            status = 'blocked'
+            failed_node = failed_node_id or first_failed.get('task_id')
+            reason = first_failed.get('reason') or 'node_failed'
+            for rem_idx, rem_wave in enumerate(plan['waves'][wave_idx + 1:], wave_idx + 1):
+                for n in rem_wave:
+                    node_results.append({'task_id': n['task_id'],
+                                         'status': 'skipped_upstream_failure',
+                                         'wave': rem_idx})
+            break
+        for node in wave:
+            res = results.get(node['task_id']) or {}
+            conflict = _sync_plan_artifacts(node['task_id'], res,
+                                            plan['directory'],
+                                            node_files=node.get('files', ()))
+            if conflict:
+                    status = 'blocked'
+                    reason = conflict
+                    failed_node = node['task_id']
+                    for rem_idx, rem_wave in enumerate(plan['waves'][wave_idx + 1:],
+                                                       wave_idx + 1):
+                        for n in rem_wave:
+                            node_results.append({'task_id': n['task_id'],
+                                                 'status': 'skipped_upstream_failure',
+                                                 'wave': rem_idx})
+                    break
+        if status == 'blocked':
+            break
+
+    if status == 'succeeded' and plan.get('final_test_argv') is not None:
+        try:
+            proc = subprocess.run(plan['final_test_argv'], cwd=plan['directory'],
+                                  capture_output=True, text=True, timeout=120)
+            final_test_returncode = proc.returncode
+            if proc.returncode != 0:
+                status = 'blocked'
+                reason = 'final_validation_failed'
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            final_test_returncode = None
+            status = 'blocked'
+            reason = 'final_validation_failed'
+            del exc
+
+    total_cost = round(sum((r.get('cost') or 0.0) for r in node_results), 8)
+    total_steps = sum((r.get('steps') or 0) for r in node_results)
+    return {
+        'plan_id': plan['plan_id'],
+        'status': status,
+        'reason': reason,
+        'failed_node': failed_node,
+        'waves': [[n['task_id'] for n in w] for w in plan['waves']],
+        'node_results': node_results,
+        'total_cost': total_cost,
+        'total_steps': total_steps,
+        'final_test_returncode': final_test_returncode,
+    }
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

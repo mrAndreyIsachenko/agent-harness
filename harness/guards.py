@@ -33,6 +33,7 @@ from typing import Any
 
 __all__ = [
     "FORBIDDEN_EGRESS_KEYS",
+    "build_cross_file_symbol_context",
     "build_file_skeletons",
     "check_allowed_files_syntax",
     "check_egress_payload",
@@ -2190,6 +2191,319 @@ def build_preloaded_file_excerpts(
     if not chunks:
         return ""
     return header + "\n".join(chunks) + "\n\n"
+
+
+def build_cross_file_symbol_context(
+    files: Iterable[str],
+    prompt: str = "",
+    *,
+    directory: str = "",
+    read_only_files: Iterable[str] = (),
+    max_chars: int = 2400,
+) -> str:
+    """Build compact imported-symbol signatures from files outside ``files``.
+
+    Parses each editable ``.py`` file, resolves its local imports (including
+    relative imports and ``from pkg import submod`` module imports) to ``.py``
+    files under ``directory`` (or next to the importing file), and extracts
+    compact slices for the needed symbols: function signatures plus first
+    docstring line (no bodies), class headers with fields and public method
+    signatures, and explicitly imported UPPER_CASE constants. When any file is
+    a pytest test file, matching fixtures from nearby ``conftest.py`` files
+    are included too. Output is strictly capped at ``max_chars``; returns
+    ``""`` when nothing was extracted.
+    """
+    prompt_symbols = _extract_prompt_symbols(prompt)
+    editable_paths = [str(p) for p in files if str(p).endswith(".py")]
+    editable_set = set(editable_paths)
+    read_only_set = {str(p) for p in read_only_files}
+    base = Path(directory).resolve() if directory else None
+    base_raw = Path(directory) if directory else None
+
+    def _resolve_module_file(parts: list[str], level: int, importer: Path) -> str | None:
+        if not parts:
+            return None
+        mod_rel = "/".join(parts)
+        if level:
+            start = importer.parent
+            for _ in range(max(0, level - 1)):
+                start = start.parent
+            bases = [start]
+        else:
+            bases = [importer.parent]
+            if base_raw is not None:
+                bases.extend([base_raw, base_raw / "src"])
+        seen_bases: set[str] = set()
+        for base_dir in bases:
+            if str(base_dir) in seen_bases:
+                continue
+            seen_bases.add(str(base_dir))
+            for candidate in (
+                base_dir / (mod_rel + ".py"),
+                base_dir / mod_rel / "__init__.py",
+            ):
+                try:
+                    resolved = candidate.resolve()
+                except OSError:
+                    continue
+                if base is not None and not resolved.is_relative_to(base):
+                    continue
+                if resolved.is_file():
+                    return str(resolved)
+        return None
+
+    # 1-2: collect needed symbols per resolved target module.
+    needed: dict[str, set[str]] = {}
+    for fpath in editable_paths:
+        try:
+            text = Path(fpath).read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=fpath)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        importer = Path(fpath)
+        module_aliases: set[str] = set()
+        imported_names: set[str] = set()
+        targets: set[str] = set()
+        attr_refs: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    resolved = _resolve_module_file(alias.name.split("."), 0, importer)
+                    if resolved:
+                        targets.add(resolved)
+                    module_aliases.add(alias.asname or alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                mod_parts = (node.module or "").split(".") if node.module else []
+                for alias in node.names:
+                    resolved = _resolve_module_file(mod_parts, node.level, importer)
+                    if resolved:
+                        targets.add(resolved)
+                        if alias.name != "*":
+                            imported_names.add(alias.asname or alias.name)
+                    if alias.name != "*":
+                        sub = _resolve_module_file(
+                            mod_parts + [alias.name], node.level, importer
+                        )
+                        if sub:
+                            targets.add(sub)
+                            module_aliases.add(alias.asname or alias.name)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id in module_aliases
+            ):
+                attr_refs.add(node.attr)
+        for target in targets:
+            bucket = needed.setdefault(target, set())
+            bucket.update(prompt_symbols)
+            bucket.update(imported_names)
+            bucket.update(attr_refs)
+
+    def _signature(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        returns = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+        return f"{prefix} {node.name}({ast.unparse(node.args)}){returns}:"
+
+    def _docline(node: ast.AST) -> str | None:
+        doc = ast.get_docstring(node)
+        if doc:
+            first = doc.strip().splitlines()[0].strip()
+            return f'"""{first}"""'
+        return None
+
+    def _extract_symbol_lines(
+        tree: ast.Module, lines: list[str], names: set[str]
+    ) -> list[str]:
+        out: list[str] = []
+        matched = False
+
+        def emit_function(node: ast.FunctionDef | ast.AsyncFunctionDef, indent: str) -> None:
+            out.append(f"{indent}{_signature(node)}")
+            doc = _docline(node)
+            if doc:
+                out.append(f"{indent}    {doc}")
+            out.append(f"{indent}    ...")
+
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name in names:
+                    matched = True
+                    emit_function(node, "")
+            elif isinstance(node, ast.ClassDef):
+                if node.name not in names:
+                    continue
+                matched = True
+                bases = ", ".join(ast.unparse(b) for b in node.bases)
+                out.append(f"class {node.name}({bases}):" if bases else f"class {node.name}:")
+                for item in node.body:
+                    if isinstance(item, ast.AnnAssign):
+                        out.append(f"    {ast.unparse(item)}")
+                    elif isinstance(item, ast.Assign):
+                        target_names = [
+                            t.id for t in item.targets if isinstance(t, ast.Name)
+                        ]
+                        if target_names and all(
+                            n.isupper() and len(n) > 1 for n in target_names
+                        ):
+                            out.append(f"    {ast.unparse(item)}")
+                    elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if item.name.startswith("_") and item.name != "__init__":
+                            continue
+                        emit_function(item, "    ")
+            elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                target_names: list[str] = []
+                if isinstance(node, ast.Assign):
+                    target_names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                elif isinstance(node.target, ast.Name):
+                    target_names = [node.target.id]
+                if any(n in names and n.isupper() and len(n) > 1 for n in target_names):
+                    matched = True
+                    src_line = lines[node.lineno - 1].strip() if node.lineno <= len(lines) else ""
+                    out.append(src_line[:120])
+        if not matched:
+            # Fallback: no specifically named symbol matched -> top-level public.
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if not node.name.startswith("_"):
+                        emit_function(node, "")
+                elif isinstance(node, ast.ClassDef) and not node.name.startswith("_"):
+                    bases = ", ".join(ast.unparse(b) for b in node.bases)
+                    out.append(
+                        f"class {node.name}({bases}):" if bases else f"class {node.name}:"
+                    )
+        return out
+
+    sections: list[str] = []
+    for target, names in needed.items():
+        if target in editable_set:
+            continue
+        try:
+            text = Path(target).read_text(encoding="utf-8")
+            tree = ast.parse(text, filename=target)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        lines = text.splitlines()
+        if target in read_only_set:
+            if len(lines) <= 150 or names & set(prompt_symbols):
+                continue
+        symbol_lines = _extract_symbol_lines(tree, lines, names)
+        if not symbol_lines:
+            continue
+        if base_raw is not None:
+            try:
+                rel = Path(target).relative_to(base_raw).as_posix()
+            except ValueError:
+                rel = target
+        else:
+            rel = target
+        sections.append(f"# {rel}\n" + "\n".join(symbol_lines))
+
+    # 4: pytest fixture inference from nearby conftest.py files.
+    test_files = [
+        p
+        for p in editable_paths
+        if (lambda n: n.startswith("test_") or n.endswith("_test"))(Path(p).stem)
+    ]
+    if test_files:
+        fixture_stop = set(_PROMPT_SYMBOL_STOPWORDS)
+        needed_fixtures: set[str] = {
+            token
+            for token in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", prompt)
+            if len(token) >= 3 and token not in fixture_stop and token.lower() not in fixture_stop
+        }
+        for tpath in test_files:
+            try:
+                test_tree = ast.parse(Path(tpath).read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+            for node in ast.walk(test_tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                    for arg in (
+                        *node.args.posonlyargs,
+                        *node.args.args,
+                        *node.args.kwonlyargs,
+                    ):
+                        if arg.arg not in ("self", "cls"):
+                            needed_fixtures.add(arg.arg)
+        seen_conftests: list[str] = []
+        for tpath in test_files:
+            current = Path(tpath).parent
+            while True:
+                conftest = current / "conftest.py"
+                if conftest.is_file() and str(conftest) not in editable_set:
+                    seen_conftests.append(str(conftest))
+                if base_raw is not None and current == base_raw:
+                    break
+                if current.parent == current:
+                    break
+                if base_raw is not None and current.parent and not current.parent.is_relative_to(base_raw):
+                    break
+                current = current.parent
+        for conftest_path in dict.fromkeys(seen_conftests):
+            try:
+                ctext = Path(conftest_path).read_text(encoding="utf-8")
+                ctree = ast.parse(ctext, filename=conftest_path)
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+            clines = ctext.splitlines()
+            fixture_lines: list[str] = []
+            for node in ctree.body:
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                is_fixture = False
+                for deco in node.decorator_list:
+                    func = deco.func if isinstance(deco, ast.Call) else deco
+                    if (isinstance(func, ast.Attribute) and func.attr == "fixture") or (
+                        isinstance(func, ast.Name) and func.id == "fixture"
+                    ):
+                        is_fixture = True
+                        break
+                if not is_fixture or node.name not in needed_fixtures:
+                    continue
+                for deco in node.decorator_list:
+                    fixture_lines.append("@pytest.fixture" if not isinstance(deco, ast.Call) else "@pytest.fixture(...)")
+                returns_suffix = f" -> {ast.unparse(node.returns)}" if node.returns else ""
+                fixture_lines.append(f"def {node.name}({ast.unparse(node.args)}){returns_suffix}:")
+                doc = _docline(node)
+                if doc:
+                    fixture_lines.append(f'    {doc}')
+                else:
+                    for sub in ast.walk(node):
+                        if isinstance(sub, (ast.Return, ast.Yield)) and sub.lineno <= len(clines):
+                            fixture_lines.append(f"    {clines[sub.lineno - 1].strip()[:120]}")
+                            break
+            if not fixture_lines:
+                continue
+            if base_raw is not None:
+                try:
+                    rel = Path(conftest_path).relative_to(base_raw).as_posix()
+                except ValueError:
+                    rel = conftest_path
+            else:
+                rel = conftest_path
+            sections.append(f"# {rel} (pytest fixtures)\n" + "\n".join(fixture_lines))
+
+    if not sections:
+        return ""
+    header = "[Cross-File Symbol Signatures & Fixtures]:\n"
+    total = len(header)
+    body: list[str] = []
+    for section in sections:
+        remaining = max_chars - total - 1
+        if remaining <= 0:
+            break
+        if len(section) > remaining:
+            section = section[:remaining].rstrip("\n")
+            if not section:
+                break
+            body.append(section)
+            break
+        body.append(section)
+        total += len(section) + 1
+    if not body:
+        return ""
+    return header + "\n".join(body)
 
 
 def extract_compact_test_failure(
