@@ -466,6 +466,7 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-57** | Retroactive post-edit salvage backfill for historical passing runs (`backfill_salvaged_runs`, `harness stats --backfill-salvage`) | `report.py`, `cli.py` |
 | **H-58** | Explicit allowed-files allowlist and denied-path reporting in `Permission denied: read` guard hint (`_extract_allowed_read_paths_from_prompt`) | `guards.py` |
 | **H-59** | Bounded proportional wall-clock timeout for `micro_repair` (`compute_repair_timeout_seconds`, `active_timeout_seconds`) | `sandbox.py` |
+| **H-65** | Local import companion inference (`infer_read_only_companion_files` second pass parsing `Import`/`ImportFrom` of editable `.py` files) and worktree path aliases (`file_aliases` / `read_only_file_aliases` merging original repo paths in `isolated_worktree`) | `sandbox.py` |
 
 ## Quickstart
 

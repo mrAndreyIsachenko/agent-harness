@@ -6,6 +6,7 @@ journal and test suites keep working unchanged.
 """
 
 import argparse
+import ast
 import base64
 import difflib
 import fcntl
@@ -228,6 +229,61 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                 continue
             seen.add(str(resolved))
             result.append(str(resolved))
+    # H-65: second pass — infer companions from local imports of editable .py files.
+    if len(result) < max_files:
+        for f in files:
+            if len(result) >= max_files:
+                break
+            p = Path(f).resolve()
+            if p.suffix != '.py' or not p.is_file():
+                continue
+            try:
+                tree = ast.parse(p.read_text(encoding='utf-8', errors='ignore'))
+            except (SyntaxError, OSError, ValueError):
+                continue
+            roots = [p.parent]
+            if p.parent.parent != p.parent:
+                roots.append(p.parent.parent)
+            if dir_path is not None:
+                roots.append(dir_path)
+            mod_candidates = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    if node.level and node.level > 0:
+                        base = p.parent
+                        for _ in range(node.level - 1):
+                            base = base.parent
+                        if node.module:
+                            base = base / node.module.replace('.', '/')
+                        mod_candidates.append(base)
+                        for alias in node.names:
+                            mod_candidates.append(base / alias.name)
+                    elif node.module:
+                        rel = node.module.replace('.', '/')
+                        mod_candidates.append(rel)
+                        for alias in node.names:
+                            mod_candidates.append(rel + '/' + alias.name)
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        mod_candidates.append(alias.name.replace('.', '/'))
+            for cand in mod_candidates:
+                if len(result) >= max_files:
+                    break
+                cand_paths = ([root / cand for root in roots]
+                              if isinstance(cand, str) else [cand])
+                for cand_path in cand_paths:
+                    m_path = cand_path if cand_path.suffix == '.py' else cand_path.with_suffix('.py')
+                    try:
+                        resolved = m_path.resolve()
+                    except OSError:
+                        continue
+                    if str(resolved) in seen or not resolved.is_file():
+                        continue
+                    if dir_path is not None and not resolved.is_relative_to(dir_path):
+                        continue
+                    seen.add(str(resolved))
+                    result.append(str(resolved))
+                    break
     return sorted(result)
 
 
@@ -1005,6 +1061,15 @@ def isolated_worktree(task, run_dir):
                        origin_files=list(task['files']), origin_hashes=_fh(task['files']),
                        read_only_files=wt_ro_files,
                        test_argv=remap(task['test_argv']))
+        # H-65: keep original repo paths reachable as read-only aliases so a
+        # worker that references task['files'] / task['read_only_files'] paths
+        # is not permission-denied inside the worktree. Original paths must
+        # NEVER gain edit access via file_aliases (config_for grants 'edit' on
+        # file_aliases in model mode), so both sets go to read_only_file_aliases.
+        wt_task['file_aliases'] = list(task.get('file_aliases') or ())
+        wt_task['read_only_file_aliases'] = sorted(
+            {*(task.get('read_only_file_aliases') or ()),
+             *task.get('read_only_files', ()), *task.get('files', ())})
         if 'command_argv' in task:
             wt_task['command_argv'] = remap(task['command_argv'])
         yield wt_task

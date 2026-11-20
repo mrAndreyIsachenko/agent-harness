@@ -7118,6 +7118,61 @@ class TestH55H57Fixes(unittest.TestCase):
             self.assertEqual(root2['attributes']['harness.status'], 'blocked')
             self.assertEqual(root2['attributes']['harness.steps'], 5)
 
+    def test_h65_infer_imported_companions_and_worktree_read_only_aliases(self):
+        import subprocess
+        from harness.sandbox import (
+            config_for,
+            infer_read_only_companion_files,
+            isolated_worktree,
+            validate_task,
+        )
+        with tempfile.TemporaryDirectory(prefix='h65-') as tmp:
+            pkg = Path(tmp) / 'pkg'
+            (pkg / 'tests').mkdir(parents=True)
+            (pkg / 'shared').mkdir(parents=True)
+            (pkg / 'helper.py').write_text('def run_helper():\n    return 1\n')
+            (pkg / 'shared' / 'util.py').write_text('def util():\n    return 2\n')
+            test_file = pkg / 'tests' / 'test_alpha.py'
+            test_file.write_text('from pkg.helper import run_helper\nfrom ..shared import util\n')
+            self.assertIn(str((pkg / 'helper.py').resolve()),
+                          infer_read_only_companion_files([str(test_file)], directory=Path(tmp)))
+            self.assertIn(str((pkg / 'shared' / 'util.py').resolve()),
+                          infer_read_only_companion_files([str(test_file)], directory=Path(tmp)))
+            t = validate_task({
+                'task_id': 'h65', 'directory': tmp, 'files': [str(test_file)],
+                'test_argv': ['/usr/bin/true'], 'prompt': 'Fix test',
+            })
+            self.assertIn(str((pkg / 'helper.py').resolve()), t['read_only_files'])
+            self.assertIn(str((pkg / 'shared' / 'util.py').resolve()), t['read_only_files'])
+
+        # Worktree: original repo paths must be read-only aliases, never editable.
+        with tempfile.TemporaryDirectory(prefix='h65-wt-') as tmp:
+            repo = Path(tmp) / 'repo'
+            (repo / 'pkg' / 'tests').mkdir(parents=True)
+            (repo / 'pkg' / 'helper.py').write_text('def run_helper():\n    return 1\n')
+            mod = repo / 'pkg' / 'tests' / 'test_alpha.py'
+            mod.write_text('def test_alpha():\n    assert True\n')
+            for argv in (['init', '-q'], ['add', '.'], ['commit', '-qm', 'init'],
+                         ['config', 'user.email', 't@t'], ['config', 'user.name', 't']):
+                subprocess.run(['/usr/bin/git'] + argv, cwd=repo, capture_output=True, check=True)
+            run_dir = Path(tmp) / 'runs' / 'h65'
+            run_dir.mkdir(parents=True)
+            task = validate_task({
+                'task_id': 'h65-wt', 'directory': str(repo), 'files': [str(mod)],
+                'read_only_files': [str(repo / 'pkg' / 'helper.py')],
+                'test_argv': ['/usr/bin/true'], 'prompt': 'Fix test', 'worktree': True,
+                'auto_infer_read_only': False,
+            })
+            originals = set(task['files']) | set(task['read_only_files'])
+            with isolated_worktree(task, str(run_dir)) as wt:
+                self.assertEqual(wt['file_aliases'], list(task.get('file_aliases') or []))
+                self.assertTrue(set(task['files']) <= set(wt['read_only_file_aliases']))
+                self.assertTrue(set(task['read_only_files']) <= set(wt['read_only_file_aliases']))
+                perms = config_for(wt)['agents']['guarded_worker']['permissions']
+                for p in originals:
+                    self.assertIn({'action': 'read', 'resource': p, 'effect': 'allow'}, perms)
+                    self.assertNotIn({'action': 'edit', 'resource': p, 'effect': 'allow'}, perms)
+
 
 if __name__ == '__main__':
     unittest.main()
