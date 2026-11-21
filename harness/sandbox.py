@@ -1764,6 +1764,236 @@ def run_best_of_2(task_path, *, cli=None, db=None, state=None, upstream_url=None
                           'cost': None, 'observed_cost': None, 'steps': None}))
         return 1
 
+
+_ROLLOUT_PASS_STATUSES = frozenset({
+    'pass',
+    'passed',
+    'success',
+    'succeeded',
+    'ok',
+    'complete',
+    'completed',
+    'done',
+    '0',
+    'true',
+    'validation_passed_review_required',
+    'patch_ready_review_required',
+    'validated',
+})
+
+
+def restore_files(snapshot):
+    """Restore exact file bytes from a {path: bytes | None} snapshot or a run_dir."""
+    if isinstance(snapshot, (str, Path)):
+        run_dir = Path(snapshot)
+        before_path = run_dir / 'files.before.json'
+        if not before_path.exists():
+            raise GuardError('missing_files_snapshot')
+        raw = json.loads(before_path.read_text(encoding='utf-8'))
+        snapshot = {
+            name: base64.b64decode(item['base64']) if item.get('base64') is not None else None
+            for name, item in raw.items()
+        }
+    for name, data in snapshot.items():
+        p = Path(name)
+        if data is None:
+            if p.exists():
+                p.unlink()
+        else:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+
+
+def _snapshot_file_bytes(files):
+    return {
+        name: (Path(name).read_bytes() if Path(name).exists() else None)
+        for name in files
+    }
+
+
+def _diff_file_snapshots(before, after):
+    diff = []
+    for name in before:
+        old_bytes = before[name]
+        new_bytes = after.get(name)
+        if old_bytes == new_bytes:
+            continue
+        try:
+            old_text = (old_bytes or b'').decode('utf-8')
+            new_text = (new_bytes or b'').decode('utf-8')
+        except UnicodeDecodeError:
+            continue
+        diff.extend(
+            difflib.unified_diff(
+                old_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=name,
+                tofile=name,
+            )
+        )
+    return ''.join(
+        line if line.endswith('\n') else line + '\n\\ No newline at end of file\n'
+        for line in diff
+    )
+
+
+def run_group_rollout(
+    task: dict,
+    *,
+    group_size: int = 4,
+    models: list[str] | None = None,
+    state_dir: str | Path | None = None,
+    runner=None,
+) -> dict:
+    """Execute ``group_size`` isolated rollouts on ``task`` and compute GRPO advantages."""
+    if isinstance(group_size, bool) or not isinstance(group_size, int) or not (1 <= group_size <= 16):
+        raise GuardError('invalid_group_size')
+    validated = validate_task(dict(task))
+    resolved_state = Path(state_dir) if state_dir is not None else STATE
+    model_cycle = [m for m in (models or []) if m]
+    tracked = list(validated['files']) + (
+        [validated['patch_file']] if validated['mode'] == 'patch' else []
+    )
+    originals = _snapshot_file_bytes(tracked)
+
+    def _default_runner(rollout_task):
+        fd, tmp_path = tempfile.mkstemp(prefix='rollout_', suffix='.json')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                json.dump(rollout_task, fh)
+            return run_task(tmp_path, state=resolved_state, _quiet=True, _return_result=True)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    active_runner = _default_runner if runner is None else runner
+    rollouts = []
+    snapshots = []
+
+    for rollout_index in range(group_size):
+        restore_files(originals)
+        rollout_model = (
+            model_cycle[rollout_index % len(model_cycle)]
+            if model_cycle
+            else validated.get('model')
+        )
+        rollout_task = dict(validated)
+        rollout_task['task_id'] = validated['task_id']
+        rollout_task['rollout_index'] = rollout_index
+        rollout_task['strategy'] = 'single'
+        rollout_task['auto_escalate'] = False
+        rollout_task.pop('candidate_models', None)
+        if rollout_model is not None and rollout_task['mode'] != 'command':
+            rollout_task['model'] = rollout_model
+
+        try:
+            res = active_runner(rollout_task)
+            if not isinstance(res, dict):
+                res = {'status': 'blocked', 'reason': 'invalid_runner_result'}
+        except Exception as exc:  # noqa: BLE001
+            res = {
+                'status': 'blocked',
+                'reason': str(exc) if isinstance(exc, GuardError) else type(exc).__name__,
+            }
+
+        after_snap = _snapshot_file_bytes(tracked)
+        snapshots.append(after_snap)
+        patch = _diff_file_snapshots(originals, after_snap)
+        artifact_path = res.get('artifact')
+        if not patch and artifact_path:
+            patch_file = Path(artifact_path) / 'changes.patch'
+            if patch_file.is_file():
+                patch = patch_file.read_text(encoding='utf-8', errors='replace')
+
+        status_str = str(res.get('status') or '').strip().lower()
+        passed = res.get('passed') is True or status_str in _ROLLOUT_PASS_STATUSES
+        raw_steps = res.get('steps')
+        steps = int(raw_steps) if raw_steps is not None else (1 if passed else 0)
+        guard_interventions = int(res.get('guard_interventions') or 0)
+        sql_or_egress_violations = max(
+            int(res.get('sql_or_egress_violations') or 0),
+            int(res.get('sql_violations') or 0) + int(res.get('egress_violations') or 0),
+        )
+        r_process = max(0.0, 1.0 - 0.25 * guard_interventions - 0.5 * sql_or_egress_violations)
+        evidence_ok = (
+            bool(patch.strip())
+            or res.get('test_return_code') == 0
+            or bool(res.get('evidence_ok'))
+        )
+        r_evidence = 1.0 if steps > 0 and evidence_ok else 0.0
+        r_outcome = 1.0 if passed else 0.0
+        r_total = round(r_outcome * r_evidence * r_process, 6)
+        run_id = (
+            str(res['run_id'])
+            if res.get('run_id')
+            else (
+                Path(artifact_path).name
+                if artifact_path
+                else f"{validated['task_id']}-rollout-{rollout_index}"
+            )
+        )
+
+        rollouts.append({
+            'task_id': validated['task_id'],
+            'rollout_index': rollout_index,
+            'run_id': run_id,
+            'model': rollout_model,
+            'status': res.get('status'),
+            'passed': passed,
+            'steps': steps,
+            'cost': res.get('cost'),
+            'salvaged_from': res.get('salvaged_from'),
+            'artifact': artifact_path,
+            'patch': patch,
+            'r_outcome': r_outcome,
+            'r_evidence': r_evidence,
+            'r_process': r_process,
+            'r_total': r_total,
+        })
+
+    rewards = [entry['r_total'] for entry in rollouts]
+    mean_r = sum(rewards) / len(rewards)
+    std_r = math.sqrt(sum((r - mean_r) ** 2 for r in rewards) / len(rewards))
+    advantages = [(r - mean_r) / (std_r + 1e-6) for r in rewards]
+    for entry, adv in zip(rollouts, advantages):
+        entry['advantage'] = round(adv, 6)
+
+    passing = [
+        (entry, snap)
+        for entry, snap in zip(rollouts, snapshots)
+        if entry['passed']
+    ]
+    if passing:
+        best_entry, best_snap = min(
+            passing,
+            key=lambda pair: (
+                -pair[0]['r_total'],
+                1 if pair[0].get('salvaged_from') else 0,
+                pair[0]['steps'],
+                float('inf') if pair[0].get('cost') is None else pair[0]['cost'],
+                pair[0]['rollout_index'],
+            ),
+        )
+        restore_files(best_snap)
+        best_run_id = best_entry['run_id']
+    else:
+        restore_files(originals)
+        best_run_id = None
+
+    pass_count = len(passing)
+    return {
+        'task_id': validated['task_id'],
+        'group_size': group_size,
+        'pass_count': pass_count,
+        'pass_rate': round(pass_count / group_size, 6),
+        'mean_reward': round(mean_r, 6),
+        'std_reward': round(std_r, 6),
+        'best_run_id': best_run_id,
+        'rollouts': rollouts,
+    }
+
 def validate_plan(raw_plan):
     """H-66: validate and normalize a parallel worktree DAG plan."""
     if not isinstance(raw_plan, dict):

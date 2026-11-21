@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .proxy import GuardError
+from .routing import is_local_or_sml_model
 
 DB = Path(os.environ.get("HARNESS_DB") or os.environ.get("OPENCODE_DB") or (Path.home() / ".local/share/opencode/opencode.db"))
 STATE = Path(os.environ.get("HARNESS_STATE_DIR") or (Path.home() / ".local/share/agent-harness/state"))
@@ -34,6 +35,11 @@ def _is_generation_id(value):
     if not isinstance(value, str) or not value.startswith('gen-') or len(value) == 4:
         return False
     return all(c in _GEN_ID_CHARS for c in value[4:])
+
+
+def _is_local_zero_cost(model=None, upstream_mode='openrouter'):
+    """Local/SML models and direct vLLM/llama.cpp upstreams are billed at $0 API cost."""
+    return upstream_mode in ('vllm', 'llamacpp') or bool(is_local_or_sml_model(model))
 
 
 class _Counter(dict):
@@ -90,8 +96,14 @@ def event(run_dir, kind, **fields):
         f.flush()
         os.fsync(f.fileno())
 
-def request_records(snap, proxy_summary=None):
+def request_records(snap, proxy_summary=None, *, model=None, upstream_mode='openrouter'):
     """Capture billing metadata only, never prompts, tool outputs or reasoning."""
+    summary = proxy_summary if isinstance(proxy_summary, dict) else {}
+    if upstream_mode == 'openrouter' and 'upstream_mode' in summary:
+        upstream_mode = summary.get('upstream_mode') or upstream_mode
+    if model is None:
+        model = summary.get('default_model')
+    local = _is_local_zero_cost(model, upstream_mode)
     records = []
     def ids(value):
         if isinstance(value, dict):
@@ -123,6 +135,8 @@ def request_records(snap, proxy_summary=None):
         provider_ids = sorted(set(local_ids + ([proxy_gid] if proxy_gid else [])))
         state = 'failed' if data.get('error') else 'finished' if data.get('finish') else 'in_flight'
         cost = data.get('cost')
+        if local and cost is None and state == 'finished':
+            cost = 0.0
         if local_ids:
             identity_status = 'recorded'
         elif proxy_gid:
@@ -622,16 +636,53 @@ def metrics(snap):
                 unfinished=unfinished, errors=max(errors.values(), default=0), reads=max(reads.values(), default=0),
                 file_reads=max(file_reads.values(), default=0))
 
-def violation(m, budget, max_steps):
-    for condition, reason in [(m['cost'] >= budget, 'cost_limit'), (m['steps'] > max_steps, 'step_limit'),
-                              (m['compact'], 'compaction'), (m['model_error'], 'model_error'),
-                              (m['errors'] >= 2, 'repeated_tool_error'), (m['reads'] >= 3, 'repeated_identical_read'),
-                              (m['file_reads'] >= 6, 'repeated_file_read_without_write')]:
+def step_cost(model=None, *, upstream_mode='openrouter', cost=None):
+    """Effective API step cost: local/SML models and vllm/llamacpp upstreams are $0."""
+    return 0.0 if _is_local_zero_cost(model, upstream_mode) else cost
+
+
+def budget_gate(m_or_snap, budget=0.15, max_steps=16, *, model=None, upstream_mode='openrouter'):
+    """Check a metrics dict (or a telemetry snapshot) against the budget gate.
+
+    Accepts either a metrics dict (contains ``'steps'``), a snapshot dict
+    (contains ``'messages'``, run through :func:`metrics`), or a request-level
+    dict with ``'model'``/``'upstream_mode'``/``'cost'``/``'steps'`` keys.
+    Local/SML models and vllm/llamacpp upstreams have their cost forced to
+    ``0.0`` (never ``unpriced_model``) while ``max_steps`` stays strict.
+    """
+    if not isinstance(m_or_snap, dict):
+        raise GuardError('budget_gate_requires_metrics_or_snapshot')
+    if model is None:
+        model = m_or_snap.get('model')
+    if upstream_mode == 'openrouter' and 'upstream_mode' in m_or_snap:
+        upstream_mode = m_or_snap.get('upstream_mode') or 'openrouter'
+    if 'messages' in m_or_snap and 'steps' not in m_or_snap:
+        m = dict(metrics(m_or_snap))
+    else:
+        m = dict(m_or_snap)
+    if _is_local_zero_cost(model, upstream_mode):
+        m['cost'] = 0.0
+        m['unpriced_model'] = False
+    return violation(m, budget, max_steps, model=model, upstream_mode=upstream_mode)
+
+
+def violation(m, budget, max_steps, *, model=None, upstream_mode='openrouter'):
+    local = _is_local_zero_cost(model, upstream_mode)
+    # Local/SML models and vllm/llamacpp upstreams have no API pricing: treat
+    # the step API cost as $0 and never block as 'unpriced_model'.
+    api_cost = 0.0 if local else (m.get('cost') or 0.0)
+    unpriced = False if local else (bool(m.get('unpriced_model')) or m.get('cost') is None)
+    for condition, reason in [(api_cost >= budget, 'cost_limit'), (unpriced, 'unpriced_model'),
+                              (m.get('steps', 0) > max_steps, 'step_limit'),
+                              (m.get('compact'), 'compaction'), (m.get('model_error'), 'model_error'),
+                              (m.get('errors', 0) >= 2, 'repeated_tool_error'),
+                              (m.get('reads', 0) >= 3, 'repeated_identical_read'),
+                              (m.get('file_reads', 0) >= 6, 'repeated_file_read_without_write')]:
         if condition:
             return reason
     return None
 
-def can_settle_from_proxy_local(snap, proxy_summary):
+def can_settle_from_proxy_local(snap, proxy_summary, *, model=None, upstream_mode='openrouter'):
     if snap is None or proxy_summary is None:
         return False
     raw_dispatched = proxy_summary.get('dispatched') or []
@@ -643,7 +694,7 @@ def can_settle_from_proxy_local(snap, proxy_summary):
     blocked_count = int(proxy_summary.get('blocked_count') or 0)
     if blocked_count <= 0:
         return False
-    records = request_records(snap, proxy_summary)
+    records = request_records(snap, proxy_summary, model=model, upstream_mode=upstream_mode)
     k = len(dispatched)
     if k == 0:
         return all(r.get('state') == 'blocked_locally' for r in records)
@@ -656,7 +707,9 @@ def can_settle_from_proxy_local(snap, proxy_summary):
     if not all(r.get('state') == 'blocked_locally' for r in records[k:]):
         return False
     local_sum = math.fsum(number(r['cost'], 'local_request_cost') for r in records[:k])
-    return number(snap['cost'], 'telemetry_cost') + 1e-10 >= local_sum
+    telemetry_cost = snap.get('cost')
+    telemetry_cost = 0.0 if telemetry_cost is None else number(telemetry_cost, 'telemetry_cost')
+    return telemetry_cost + 1e-10 >= local_sum
 
 
 def _extract_tokens(tokens: object) -> tuple[int, int]:
@@ -684,6 +737,11 @@ def export_sml_cost_manifest(
     *,
     gpu_hours: float = 0.0,
     gpu_hourly_rate_usd: float = 0.0,
+    hardware_name: str = 'local_or_openrouter',
+    num_gpus: int = 1,
+    price_as_of: str = '2026-11-20',
+    billed_instance_seconds: float | None = None,
+    estimated_pre_run_cost_usd: float = 0.0,
 ) -> dict:
     """Export a Small Model Lab CostRecord manifest from a harness run directory."""
     run_path = Path(run_dir)
@@ -806,6 +864,15 @@ def export_sml_cost_manifest(
     compute_cost_usd = round(gpu_h * hourly_rate, 6)
     total_cost_usd = round(compute_cost_usd + api_cost_usd, 6)
 
+    num_gpus_int = int(num_gpus)
+    active_sec = wall_clock_seconds
+    billed_sec = float(billed_instance_seconds) if billed_instance_seconds is not None else wall_clock_seconds
+    active_gpu_h = gpu_h if gpu_h > 0 else round((active_sec / 3600.0) * num_gpus_int, 6)
+    billed_gpu_h = gpu_h if (gpu_h > 0 and billed_instance_seconds is None) else round((billed_sec / 3600.0) * num_gpus_int, 6)
+    infra_overhead = round(max(0.0, billed_sec - active_sec) / billed_sec, 6) if billed_sec > 0 else 0.0
+    active_cost = round(compute_cost_usd + api_cost_usd, 6)
+    billed_cost = round(billed_gpu_h * hourly_rate + api_cost_usd, 6)
+
     manifest = {
         'wall_clock_seconds': wall_clock_seconds,
         'gpu_hours': gpu_h,
@@ -818,6 +885,17 @@ def export_sml_cost_manifest(
         'completion_tokens': completion_tokens,
         'request_count': request_count,
         'cost_accounting_status': cost_accounting_status,
+        'hardware_name': str(hardware_name),
+        'price_as_of': str(price_as_of),
+        'num_gpus': num_gpus_int,
+        'active_training_seconds': active_sec,
+        'billed_instance_seconds': billed_sec,
+        'active_gpu_hours': active_gpu_h,
+        'billed_gpu_hours': billed_gpu_h,
+        'infrastructure_overhead_fraction': infra_overhead,
+        'active_cost_usd': active_cost,
+        'billed_cost_usd': billed_cost,
+        'estimated_pre_run_cost_usd': float(estimated_pre_run_cost_usd),
     }
     if output_path is not None:
         out = Path(output_path)

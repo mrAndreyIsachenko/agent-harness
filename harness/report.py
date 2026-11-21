@@ -9,6 +9,7 @@ record itself does not carry.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import statistics
@@ -1061,6 +1062,27 @@ _GUARD_INTERVENTION_MARKERS = (
 )
 
 
+def _message_text(msg) -> str:
+    """Render a message record (dict, string, or arbitrary JSON) as text."""
+    if isinstance(msg, str):
+        return msg
+    if isinstance(msg, dict) and isinstance(msg.get("content"), str):
+        return msg["content"]
+    try:
+        return json.dumps(msg, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(msg)
+
+
+def _matched_guard_marker(msg):
+    """Return the guard-intervention marker contained in ``msg``, or None."""
+    content = _message_text(msg)
+    for marker in _GUARD_INTERVENTION_MARKERS:
+        if marker in content:
+            return marker
+    return None
+
+
 def _is_clean_sft_run(result: dict, messages: list[dict]) -> bool:
     """Return False for runs tainted by micro-repair, salvage, or guard hints."""
     if not isinstance(result, dict):
@@ -1068,16 +1090,7 @@ def _is_clean_sft_run(result: dict, messages: list[dict]) -> bool:
     if result.get("micro_repair_attempted") or result.get("salvaged_from"):
         return False
     for msg in messages or []:
-        if isinstance(msg, str):
-            content = msg
-        elif isinstance(msg, dict) and isinstance(msg.get("content"), str):
-            content = msg["content"]
-        else:
-            try:
-                content = json.dumps(msg, ensure_ascii=False)
-            except (TypeError, ValueError):
-                content = str(msg)
-        if any(marker in content for marker in _GUARD_INTERVENTION_MARKERS):
+        if _matched_guard_marker(msg) is not None:
             return False
     return True
 
@@ -1103,8 +1116,11 @@ def export_sml_dataset(
     guard-intervention marker are filtered out. With ``max_steps``, only runs
     with a positive step count at or below the cap are kept.
     """
-    if mode not in ("sft", "dpo"):
-        raise ValueError(f"Unsupported mode: {mode!r}; expected 'sft' or 'dpo'")
+    if mode not in ("sft", "dpo", "sft-chat", "grpo", "probes"):
+        raise ValueError(
+            f"Unsupported mode: {mode!r}; expected one of "
+            "'sft', 'dpo', 'sft-chat', 'grpo', 'probes'"
+        )
 
     records: list[dict] = []
     if mode == "sft":
@@ -1140,7 +1156,195 @@ def export_sml_dataset(
                 "messages": messages,
             })
         dataset = records
-    else:  # mode == "dpo"
+    elif mode == "sft-chat":
+        for run_dir, result in _iter_run_records(state_dir):
+            summary = summarize_run(result, _load_proxy_summary(run_dir / "requests.json"))
+            run_id = _first(result, ("run_id", "runId", "id")) or run_dir.name
+            task_id = summary.get("task_id")
+            status = str(summary.get("status") or "").lower()
+            messages = _load_run_messages(run_dir)
+            passed = summary.get("passed") is True or status in PASS_STATUSES
+            if not (passed and messages):
+                continue
+            steps = summary.get("steps", 0)
+            if max_steps is not None and (steps <= 0 or steps > max_steps):
+                continue
+            if clean_only and not _is_clean_sft_run(result, messages):
+                continue
+            mask = [False] * len(messages)
+            for i, msg in enumerate(messages):
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                j = i + 1
+                tainted = False
+                while (
+                    j < len(messages)
+                    and isinstance(messages[j], dict)
+                    and messages[j].get("role") in ("tool", "user")
+                ):
+                    if _matched_guard_marker(messages[j]) is not None:
+                        tainted = True
+                        break
+                    j += 1
+                mask[i] = not tainted
+            records.append({
+                "task_id": task_id,
+                "run_id": run_id,
+                "model": summary.get("model"),
+                "steps": steps,
+                "cost_usd": summary.get("cost_usd", 0.0),
+                "messages": messages,
+                "assistant_turn_mask": mask,
+            })
+        dataset = records
+    elif mode == "grpo":
+        groups: dict[object, list[dict]] = {}
+        group_order: list[object] = []
+        for run_dir, result in _iter_run_records(state_dir):
+            summary = summarize_run(result, _load_proxy_summary(run_dir / "requests.json"))
+            run_id = _first(result, ("run_id", "runId", "id")) or run_dir.name
+            task_id = summary.get("task_id")
+            status = str(summary.get("status") or "").lower()
+            files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
+            prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            prompt = str(prompt_value) if prompt_value is not None else ""
+            patch_path = run_dir / "changes.patch"
+            patch = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
+            messages = _load_run_messages(run_dir)
+            steps = summary.get("steps", 0)
+            if max_steps is not None and (steps <= 0 or steps > max_steps):
+                continue
+            if clean_only and not _is_clean_sft_run(result, messages):
+                continue
+            key = task_id if task_id else (tuple(sorted(files)), " ".join(prompt.split()).lower())
+            passed = summary.get("passed") is True or status in PASS_STATUSES
+            guard_interventions = max(
+                _to_int(result.get("guard_interventions")),
+                sum(1 for msg in messages if _matched_guard_marker(msg) is not None),
+            )
+            sql_or_egress_violations = max(
+                _to_int(result.get("sql_or_egress_violations")),
+                max(
+                    _to_int(result.get("sql_violations")),
+                    len(check_readonly_sql_tool_calls(messages)),
+                ) + _to_int(result.get("egress_violations")),
+            )
+            r_process = max(0.0, 1.0 - 0.25 * guard_interventions - 0.5 * sql_or_egress_violations)
+            evidence_tool_ok = any(
+                isinstance(msg, dict)
+                and msg.get("role") == "tool"
+                and bool(_message_text(msg).strip())
+                and msg.get("is_error") is not True
+                and not _message_text(msg).lower().startswith(
+                    ("error", "traceback", "[ast preflight error")
+                )
+                for msg in messages
+            )
+            r_evidence = 1.0 if steps > 0 and (
+                bool(patch.strip()) or result.get("test_return_code") == 0 or evidence_tool_ok
+            ) else 0.0
+            r_outcome = 1.0 if passed else 0.0
+            r_total = round(r_outcome * r_evidence * r_process, 6)
+            entry = {
+                "task_id": task_id,
+                "run_id": run_id,
+                "model": summary.get("model"),
+                "steps": steps,
+                "prompt": prompt,
+                "patch": patch,
+                "messages": messages,
+                "r_outcome": r_outcome,
+                "r_evidence": r_evidence,
+                "r_process": r_process,
+                "r_total": r_total,
+            }
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(entry)
+        for key in group_order:
+            totals = [entry["r_total"] for entry in groups[key]]
+            if len(totals) >= 2:
+                mean = sum(totals) / len(totals)
+                std = math.sqrt(sum((x - mean) ** 2 for x in totals) / len(totals))
+                for entry in groups[key]:
+                    entry["group_advantage"] = round((entry["r_total"] - mean) / (std + 1e-6), 6)
+            else:
+                for entry in groups[key]:
+                    entry["group_advantage"] = 0.0
+            records.extend(groups[key])
+        dataset = records
+    elif mode == "probes":
+        groups: dict[object, list[dict]] = {}
+        group_order: list[object] = []
+        for run_dir, result in _iter_run_records(state_dir):
+            summary = summarize_run(result, _load_proxy_summary(run_dir / "requests.json"))
+            status = str(summary.get("status") or "").lower()
+            files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
+            prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            prompt = str(prompt_value) if prompt_value is not None else ""
+            task_id = summary.get("task_id")
+            key = task_id if task_id else (tuple(sorted(files)), " ".join(prompt.split()).lower())
+            steps = summary.get("steps", 0)
+            if max_steps is not None and (steps <= 0 or steps > max_steps):
+                continue
+            entry = {
+                "task_id": task_id,
+                "run_id": _first(result, ("run_id", "runId", "id")) or run_dir.name,
+                "passed": summary.get("passed") is True or status in PASS_STATUSES,
+                "messages": _load_run_messages(run_dir),
+            }
+            if key not in groups:
+                groups[key] = []
+                group_order.append(key)
+            groups[key].append(entry)
+        for key in group_order:
+            group = groups[key]
+            for run_index, entry in enumerate(group):
+                messages = entry["messages"]
+                for i, msg in enumerate(messages):
+                    if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
+                        continue
+                    following = messages[i + 1] if i + 1 < len(messages) else None
+                    if not (isinstance(following, dict) and following.get("role") in ("user", "tool")):
+                        continue
+                    marker = _matched_guard_marker(following)
+                    if marker is None:
+                        continue
+                    anchor = None
+                    for j in range(i + 1, len(messages)):
+                        candidate = messages[j]
+                        if not (isinstance(candidate, dict) and candidate.get("role") == "assistant"):
+                            continue
+                        nxt = messages[j + 1] if j + 1 < len(messages) else None
+                        if nxt is None or _matched_guard_marker(nxt) is None:
+                            anchor = candidate
+                            break
+                    if anchor is None:
+                        for later in group[run_index + 1:]:
+                            if not later["passed"]:
+                                continue
+                            later_messages = later["messages"]
+                            for j, candidate in enumerate(later_messages):
+                                if not (isinstance(candidate, dict) and candidate.get("role") == "assistant"):
+                                    continue
+                                nxt = later_messages[j + 1] if j + 1 < len(later_messages) else None
+                                if nxt is None or _matched_guard_marker(nxt) is None:
+                                    anchor = candidate
+                                    break
+                            if anchor is not None:
+                                break
+                    if anchor is None:
+                        continue
+                    records.append({
+                        "task_id": entry["task_id"],
+                        "run_id": entry["run_id"],
+                        "intervention_type": marker.lstrip("[").rstrip(":").strip(),
+                        "positive_anchor_turn": anchor,
+                        "negative_target_turn": msg,
+                    })
+        dataset = records
+    elif mode == "dpo":
         groups: dict[object, list[dict]] = {}
         group_order: list[object] = []
         for run_dir, result in _iter_run_records(state_dir):

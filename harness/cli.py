@@ -417,6 +417,36 @@ def _run_plan(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_rollout(args: argparse.Namespace) -> int:
+    from harness.proxy import GuardError
+    from harness.sandbox import STATE as DEFAULT_SANDBOX_STATE, run_group_rollout
+
+    state_dir = args.state_dir or os.environ.get("HARNESS_STATE_DIR") or DEFAULT_SANDBOX_STATE
+    models = [m.strip() for m in args.models.split(",") if m.strip()] if args.models else None
+    try:
+        task = json.loads(Path(args.task_manifest).read_text(encoding="utf-8"))
+        summary = run_group_rollout(
+            task,
+            group_size=args.group_size,
+            models=models,
+            state_dir=state_dir,
+        )
+    except (GuardError, OSError, ValueError) as exc:
+        print(json.dumps({
+            "status": "blocked",
+            "reason": str(exc) if isinstance(exc, GuardError) else type(exc).__name__,
+        }))
+        return 1
+    rendered = json.dumps(summary, indent=2, sort_keys=True, default=str)
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(rendered + "\n", encoding="utf-8")
+    else:
+        print(rendered)
+    return 0 if summary.get("pass_count", 0) > 0 else 1
+
+
 def _run_export_dataset(args: argparse.Namespace) -> int:
     records = export_sml_dataset(
         args.state_dir,
@@ -580,6 +610,30 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--state-dir", default=None, help="optional state directory override")
     run.set_defaults(handler=_run_run)
 
+    rollout = subparsers.add_parser(
+        "rollout",
+        help="run a group of independent rollouts on a task for GRPO and rejection sampling",
+    )
+    rollout.add_argument("task_manifest", help="path to JSON task manifest")
+    rollout.add_argument(
+        "--group-size",
+        type=int,
+        default=4,
+        help="number of rollouts per group (1..16, default: %(default)s)",
+    )
+    rollout.add_argument(
+        "--models",
+        default=None,
+        help="comma-separated list of model IDs to cycle across rollouts",
+    )
+    rollout.add_argument("--state-dir", default=None, help="optional state directory override")
+    rollout.add_argument(
+        "--output",
+        default=None,
+        help="optional JSON output path (default: print summary to stdout)",
+    )
+    rollout.set_defaults(handler=_run_rollout)
+
     heal = subparsers.add_parser("heal", help="autonomous pytest failure healer")
     heal.add_argument("--directory", required=True, help="directory to heal")
     heal.add_argument("--dry-run", action="store_true", help="synthesize without applying edits")
@@ -643,7 +697,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_dataset.add_argument(
         "--mode",
-        choices=("sft", "dpo"),
+        choices=("sft", "dpo", "sft-chat", "grpo", "probes"),
         default="sft",
         help="dataset export mode (default: %(default)s)",
     )

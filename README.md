@@ -423,11 +423,12 @@ $ harness stats --state-dir state/ --insights       # live stats + failure insig
 $ harness replay --state-dir state/                 # offline A/B replay simulation
 $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
 $ harness trace --sync-state state/                 # backfill runs to Phoenix OTLP (H-20)
+$ harness rollout task.json --group-size 4          # group rollouts for GRPO / rejection sampling (H-73)
 $ harness export-dataset --state-dir state/ --mode sft --clean-only --max-steps 6 --output sft.jsonl
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-59
+## Capabilities H-15 .. H-73
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -470,6 +471,11 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-66** | Parallel worktree DAG plan executor (`validate_plan`, `execute_plan`, `harness plan [--validate-only] [--state-dir]` CLI): validates wave/task DAG manifests and executes them with wave-parallel workers | `sandbox.py`, `cli.py`, `__init__.py` |
 | **H-67** | Cross-file symbol context preloading (`build_cross_file_symbol_context`: AST-derived imported symbol signatures, class/dataclass fields, UPPER_CASE constants, and `conftest.py` pytest fixture broker) gated by the `include_symbol_context` task flag | `guards.py`, `sandbox.py` |
 | **H-68** | Autonomous Pytest Failure Healer (`synthesize_heal_task`, `heal_directory`, `harness heal` CLI): synthesizes a task from a failing pytest invocation, optionally edits tests, isolates risky edits in a transactional worktree, and reports structured heal results | `sandbox.py`, `cli.py`, `__init__.py` |
+| **H-69** | Extended Small Model Lab dataset export modes (`export_sml_dataset`, `harness export-dataset --mode sft\|dpo\|sft-chat\|grpo\|probes`) with `assistant_turn_mask`, gated multiplicative GRPO rewards & group advantages, and Lancet contrastive probe pairs | `report.py`, `cli.py` |
+| **H-70** | Full `sml.tracking.cost.CostRecord` 12-field compatibility in `export_sml_cost_manifest` and `X-SML-Task-Id` / `X-SML-Request-Id` (`<scenario>-step-<N>`) task routing in `OpenRouterGuardProxy` | `finops.py`, `proxy.py` |
+| **H-71** | Native `Tenet` / `Small Model Lab` model routing (`TENET_PROVIDER_ROUTING`, `is_local_or_sml_model`, `upstream_mode="llamacpp"`) and `check_cot_and_slop_integrity` (`<think>...</think>` unclosed/collapse & slop prefix warnings) | `routing.py`, `guards.py` |
+| **H-72** | In-proxy `check_cot_and_slop_integrity` enforcement (`cot_slop_warnings`, OpenInference `GUARDRAIL` `cot_slop_integrity` spans) and `$0` API-cost billing gate for local/SML models (`vllm`, `llamacpp`, `tenet-*`, `sml-*`) | `finops.py`, `proxy.py` |
+| **H-73** | Group rollout runner (`run_group_rollout`, `harness rollout <task.json> --group-size G`) for On-Policy GRPO and Teacher Rejection Sampling with snapshot/worktree isolation, multiplicative rewards, group-normalized advantages, and best-patch restoration | `sandbox.py`, `cli.py`, `__init__.py` |
 
 ## Quickstart
 

@@ -26,9 +26,10 @@ import unittest
 import urllib.error
 import urllib.request
 
-from harness import OpenRouterGuardProxy, export_sml_dataset
+from harness import OpenRouterGuardProxy, export_sml_dataset, openrouter_proxy
 from harness.cli import main as cli_main
 from harness.finops import (auto_reconcile_from_proxy,
+                            budget_gate,
                             build_unexposed_settlement_evidence,
                             can_settle_from_proxy_local, capture_requests,
                             connect, export_sml_cost_manifest,
@@ -38,7 +39,8 @@ from harness.finops import (auto_reconcile_from_proxy,
                             verify_db, violation)
 from harness.guards import (FORBIDDEN_EGRESS_KEYS, _EDIT_FAILURE_HINT,
                             _message_text, build_file_skeletons,
-                            check_allowed_files_syntax, check_egress_payload,
+                            check_allowed_files_syntax, check_cot_and_slop_integrity,
+                            check_egress_payload,
                             check_readonly_sql_tool_calls, check_sql_syntax,
                             collect_python_top_symbols, compact_context_window,
                             compact_stale_reads, detect_duplicate_tool_calls,
@@ -55,8 +57,9 @@ from harness.routing import (DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
                              ERROR_RECOVERY_MAX_TOKENS_CAP,
                              ERROR_RECOVERY_REASONING_MAX_TOKENS, LATE_TURN_REASONING_MAX_TOKENS,
                              LATE_TURN_START, QUIET_LATE_TURN_REASONING_MAX_TOKENS,
+                             TENET_PROVIDER_ROUTING,
                              ProviderHealthStore, apply_provider_routing,
-                             select_escalated_model)
+                             is_local_or_sml_model, select_escalated_model)
 from harness.sandbox import (GuardError, _PYTEST_PROBE_CACHE,
                              _snapshot_files_for_feedback,
                              build_micro_repair_prompt, build_prior_attempt_feedback, capture_files,
@@ -64,7 +67,7 @@ from harness.sandbox import (GuardError, _PYTEST_PROBE_CACHE,
                              file_hashes, isolated_worktree, locks,
                              execute_plan, main as sandbox_main, model_run,
                              owned_process, preflight, resolve_pytest_test_argv,
-                             run_best_of_2, run_task, stop_group,
+                             run_best_of_2, run_group_rollout, run_task, stop_group,
                              validate_plan, validate_task, verify_permissions)
 from harness.telemetry import OPENINFERENCE_SPAN_KINDS, HarnessTracer, format_trace_tree
 
@@ -2317,6 +2320,17 @@ class TestSmlCostManifestAndEscalation(HarnessTestCase):
             'completion_tokens': 50,
             'request_count': 2,
             'cost_accounting_status': 'settled',
+            'hardware_name': 'local_or_openrouter',
+            'price_as_of': '2026-11-20',
+            'num_gpus': 1,
+            'active_training_seconds': 42.5,
+            'billed_instance_seconds': 42.5,
+            'active_gpu_hours': 0.5,
+            'billed_gpu_hours': 0.5,
+            'infrastructure_overhead_fraction': 0.0,
+            'active_cost_usd': 0.637345,
+            'billed_cost_usd': 0.637345,
+            'estimated_pre_run_cost_usd': 0.0,
         }
         self.assertEqual(manifest, expected)
         self.assertTrue(os.path.exists(out_path))
@@ -2349,6 +2363,39 @@ class TestSmlCostManifestAndEscalation(HarnessTestCase):
         self.assertEqual(manifest['completion_tokens'], 25)
         self.assertEqual(manifest['request_count'], 2)
         self.assertEqual(manifest['cost_accounting_status'], 'estimated')
+
+    def test_export_sml_cost_manifest_costrecord_fields(self):
+        run_dir = self.path('run-costrecord')
+        os.makedirs(run_dir, exist_ok=True)
+        with open(os.path.join(run_dir, 'result.json'), 'w') as fh:
+            json.dump({
+                'task_id': 't3',
+                'session_id': 's3',
+                'cost': 0.02,
+                'wall_clock_seconds': 100.0,
+            }, fh)
+        manifest = export_sml_cost_manifest(
+            run_dir,
+            gpu_hours=0.0,
+            gpu_hourly_rate_usd=2.0,
+            hardware_name='a100_node',
+            num_gpus=4,
+            price_as_of='2026-11-21',
+            billed_instance_seconds=120.0,
+            estimated_pre_run_cost_usd=0.5,
+        )
+        self.assertEqual(manifest['hourly_rate_usd'], 2.0)
+        self.assertEqual(manifest['hardware_name'], 'a100_node')
+        self.assertEqual(manifest['price_as_of'], '2026-11-21')
+        self.assertEqual(manifest['num_gpus'], 4)
+        self.assertEqual(manifest['active_training_seconds'], 100.0)
+        self.assertEqual(manifest['billed_instance_seconds'], 120.0)
+        self.assertEqual(manifest['active_gpu_hours'], 0.111111)
+        self.assertEqual(manifest['billed_gpu_hours'], 0.133333)
+        self.assertEqual(manifest['infrastructure_overhead_fraction'], 0.166667)
+        self.assertEqual(manifest['active_cost_usd'], 0.02)
+        self.assertEqual(manifest['billed_cost_usd'], 0.286666)
+        self.assertEqual(manifest['estimated_pre_run_cost_usd'], 0.5)
 
     def test_select_escalated_model_and_apply_provider_routing(self):
         msgs_one_err = [
@@ -3948,6 +3995,76 @@ class TestProxyPerTaskSmlManifests(HarnessTestCase):
         self.assertEqual(ep2['api_cost_usd'], 0.009)
         self.assertEqual(ep2['total_cost_usd'], 0.009)
         self.assertEqual(ep2['cost_accounting_status'], 'estimated')
+
+    def test_sml_request_id_headers_route_task_summaries_and_flush(self):
+        from harness.proxy import openrouter_proxy
+
+        class _EchoUpstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                self.rfile.read(length)
+                payload = json.dumps({
+                    'id': 'gen-sml-x1',
+                    'choices': [{'message': {'role': 'assistant', 'content': 'ok'}}],
+                    'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'cost': 0.001},
+                }).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _EchoUpstream)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        results_dir = self.path('sml-results-rid')
+
+        def _send(base_url, headers):
+            body = json.dumps({
+                'model': GLM,
+                'messages': [{'role': 'user', 'content': 'hi'}],
+            }).encode()
+            req = urllib.request.Request(
+                base_url + '/chat/completions',
+                data=body,
+                headers=headers,
+                method='POST',
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+
+        try:
+            with openrouter_proxy(
+                lambda: None,
+                upstream_url=f'http://127.0.0.1:{upstream.server_port}',
+                sml_results_dir=results_dir,
+            ) as proxy:
+                _send(proxy.base_url, {'Content-Type': 'application/json',
+                                       'X-SML-Request-Id': 'scenario_01-step-2'})
+                _send(proxy.base_url, {'Content-Type': 'application/json',
+                                       'X-SML-Task-Id': 'scenario_02'})
+                summaries = proxy.task_summaries()
+                flushed = proxy.flush_sml_manifests(results_dir)
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+
+        self.assertEqual(summaries['scenario_01']['request_count'], 1)
+        self.assertEqual(summaries['scenario_01']['sml_request_ids'], ['scenario_01-step-2'])
+        self.assertEqual(summaries['scenario_02']['request_count'], 1)
+        self.assertEqual(summaries['scenario_02']['sml_request_ids'], [])
+
+        cost_path = os.path.join(results_dir, 'scenario_01', 'cost.json')
+        self.assertTrue(os.path.exists(cost_path))
+        with open(cost_path) as fh:
+            manifest = json.load(fh)
+        self.assertEqual(manifest['request_count'], 1)
+        self.assertEqual(manifest['prompt_tokens'], 10)
+        self.assertEqual(manifest['completion_tokens'], 5)
+        self.assertEqual(manifest['api_cost_usd'], 0.001)
+        self.assertEqual(os.path.join(results_dir, 'scenario_01', 'cost.json'), flushed['scenario_01'])
 
 
 class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
@@ -6863,6 +6980,203 @@ class ExportSmlDatasetTest(unittest.TestCase):
             self.assertEqual(stdout_records[0]['run_id'], 'run-clean')
             self.assertEqual(stdout_records[0]['patch'], 'clean patch')
 
+    def test_export_sml_dataset_sft_chat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            messages = [
+                {'role': 'user', 'content': 'fix the bug'},
+                {'role': 'assistant', 'content': 'trying an edit'},
+                {'role': 'tool', 'content': '[HARNESS_EDIT_HINT: old_string not found]'},
+                {'role': 'assistant', 'content': 'final answer'},
+            ]
+            self._run_dir(
+                state_dir, 'run-chat', 1000,
+                {'task_id': 'task-a', 'run_id': 'run-chat',
+                 'status': 'validation_passed_review_required',
+                 'model': 'flash', 'steps': 4, 'cost_usd': 0.1, 'files': []},
+                request_lines=[{'messages': messages}])
+            self._run_dir(
+                state_dir, 'run-blocked', 2000,
+                {'task_id': 'task-b', 'run_id': 'run-blocked', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash'},
+                request_lines=[{'messages': [{'role': 'assistant', 'content': 'oops'}]}])
+
+            records = export_sml_dataset(state_dir, mode='sft-chat')
+
+        self.assertEqual(len(records), 1)
+        rec = records[0]
+        self.assertEqual(rec['run_id'], 'run-chat')
+        self.assertEqual(rec['messages'], messages)
+        self.assertEqual(rec['assistant_turn_mask'], [False, False, False, True])
+
+    def test_export_sml_dataset_grpo(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            self._run_dir(
+                state_dir, 'task-1-win', 1000,
+                {'task_id': 'task-1', 'run_id': 'r1-win',
+                 'status': 'validation_passed_review_required',
+                 'model': 'flash', 'steps': 4, 'prompt': 'p1', 'files': []},
+                patch='good patch',
+                request_lines=[{'messages': [
+                    {'role': 'user', 'content': 'p1'},
+                    {'role': 'assistant', 'content': 'done'}]}])
+            self._run_dir(
+                state_dir, 'task-1-lose', 2000,
+                {'task_id': 'task-1', 'run_id': 'r1-lose', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash',
+                 'steps': 2, 'prompt': 'p1', 'files': []},
+                patch='')
+            self._run_dir(
+                state_dir, 'task-2-solo', 3000,
+                {'task_id': 'task-2', 'run_id': 'r2-solo',
+                 'status': 'validation_passed_review_required',
+                 'model': 'pro', 'steps': 3, 'prompt': 'p2', 'files': []},
+                patch='solo patch')
+
+            records = export_sml_dataset(state_dir, mode='grpo')
+            by_run = {r['run_id']: r for r in records}
+
+        self.assertEqual(set(by_run), {'r1-win', 'r1-lose', 'r2-solo'})
+        win = by_run['r1-win']
+        lose = by_run['r1-lose']
+        solo = by_run['r2-solo']
+        self.assertEqual(win['r_outcome'], 1.0)
+        self.assertEqual(win['r_evidence'], 1.0)
+        self.assertEqual(win['r_process'], 1.0)
+        self.assertEqual(win['r_total'], 1.0)
+        self.assertEqual(lose['r_outcome'], 0.0)
+        self.assertEqual(lose['r_evidence'], 0.0)
+        self.assertEqual(lose['r_total'], 0.0)
+        self.assertAlmostEqual(win['group_advantage'], 1.0, places=5)
+        self.assertAlmostEqual(lose['group_advantage'], -1.0, places=5)
+        self.assertEqual(solo['r_total'], 1.0)
+        self.assertEqual(solo['group_advantage'], 0.0)
+        self.assertEqual(win['prompt'], 'p1')
+        self.assertEqual(win['patch'], 'good patch')
+        # guard hints lower r_process; sql/egress violations drive it to 0.5 floor
+        self._run_dir(
+            state_dir, 'task-3-guarded', 4000,
+            {'task_id': 'task-3', 'run_id': 'r3-guarded', 'status': 'blocked',
+             'reason': 'validation_failed', 'model': 'flash', 'steps': 5,
+             'prompt': 'p3', 'files': []},
+            patch='x',
+            request_lines=[{'messages': [
+                {'role': 'assistant', 'content': 'SELECT * FROM t'},
+                {'role': 'tool', 'content': '[GUARD LOOP WARNING: stop]'}]}])
+        guarded = export_sml_dataset(state_dir, mode='grpo')
+        g = [r for r in guarded if r['run_id'] == 'r3-guarded'][0]
+        self.assertEqual(g['r_outcome'], 0.0)
+        self.assertEqual(g['r_evidence'], 1.0)
+        self.assertLess(g['r_process'], 1.0)
+        self.assertEqual(g['r_total'], 0.0)
+
+    def test_export_sml_dataset_probes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            # intra-run recovery: negative at index 1, clean anchor at index 3
+            self._run_dir(
+                state_dir, 'task-1-fail', 1000,
+                {'task_id': 'task-1', 'run_id': 'r1-fail', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash', 'prompt': 'p',
+                 'files': []},
+                request_lines=[{'messages': [
+                    {'role': 'user', 'content': 'p'},
+                    {'role': 'assistant', 'content': 'wrong approach'},
+                    {'role': 'tool', 'content': '[HARNESS_EDIT_HINT: mismatch]'},
+                    {'role': 'assistant', 'content': 'recovered attempt'},
+                    {'role': 'tool', 'content': 'ok result'}]}])
+            # cross-run recovery: negative at end of failing run, anchor in later passing run
+            self._run_dir(
+                state_dir, 'task-2-fail', 2000,
+                {'task_id': 'task-2', 'run_id': 'r2-fail', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash', 'prompt': 'q',
+                 'files': []},
+                request_lines=[{'messages': [
+                    {'role': 'user', 'content': 'q'},
+                    {'role': 'assistant', 'content': 'bad path'},
+                    {'role': 'user', 'content': '[HARNESS_READ_HINT: denied path]'}]}])
+            self._run_dir(
+                state_dir, 'task-2-pass', 3000,
+                {'task_id': 'task-2', 'run_id': 'r2-pass',
+                 'status': 'validation_passed_review_required',
+                 'model': 'pro', 'prompt': 'q', 'files': []},
+                request_lines=[{'messages': [
+                    {'role': 'user', 'content': 'q'},
+                    {'role': 'assistant', 'content': 'good path'}]}])
+
+            records = export_sml_dataset(state_dir, mode='probes')
+            by_run = {}
+            for rec in records:
+                by_run.setdefault(rec['run_id'], []).append(rec)
+
+        self.assertEqual(sorted(by_run), ['r1-fail', 'r2-fail'])
+        intra = by_run['r1-fail'][0]
+        self.assertEqual(intra['intervention_type'], 'HARNESS_EDIT_HINT')
+        self.assertEqual(intra['negative_target_turn'], {'role': 'assistant', 'content': 'wrong approach'})
+        self.assertEqual(intra['positive_anchor_turn'], {'role': 'assistant', 'content': 'recovered attempt'})
+        cross = by_run['r2-fail'][0]
+        self.assertEqual(cross['intervention_type'], 'HARNESS_READ_HINT')
+        self.assertEqual(cross['negative_target_turn'], {'role': 'assistant', 'content': 'bad path'})
+        self.assertEqual(cross['positive_anchor_turn'], {'role': 'assistant', 'content': 'good path'})
+
+    def test_cli_export_sml_dataset_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            messages = [
+                {'role': 'user', 'content': 'go'},
+                {'role': 'assistant', 'content': 'trying'},
+                {'role': 'tool', 'content': '[HARNESS_EDIT_HINT: nope]'},
+                {'role': 'assistant', 'content': 'final'},
+            ]
+            self._run_dir(
+                state_dir, 'run-1', 1000,
+                {'task_id': 'task-a', 'run_id': 'run-1',
+                 'status': 'validation_passed_review_required',
+                 'model': 'flash', 'steps': 4, 'prompt': 'go', 'files': []},
+                patch='patch a',
+                request_lines=[{'messages': messages}])
+            self._run_dir(
+                state_dir, 'run-0-rejected', 500,
+                {'task_id': 'task-a', 'run_id': 'run-0', 'status': 'blocked',
+                 'reason': 'validation_failed', 'model': 'flash',
+                 'steps': 2, 'prompt': 'go', 'files': []},
+                patch='')
+
+            for mode in ('sft-chat', 'grpo', 'probes'):
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    self.assertEqual(cli_main(['export-dataset', '--state-dir', str(state_dir),
+                                               '--mode', mode]), 0)
+                stdout_records = [json.loads(line) for line in buffer.getvalue().splitlines()
+                                  if line.strip().startswith('{')]
+                self.assertTrue(stdout_records, mode)
+                for rec in stdout_records:
+                    self.assertIn('run_id', rec)
+
+            out_path = Path(tmp) / 'sft-chat.jsonl'
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli_main(['export-dataset', '--state-dir', str(state_dir),
+                                           '--mode', 'sft-chat', '--output', str(out_path)]), 0)
+            with out_path.open('r', encoding='utf-8') as handle:
+                chat = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual(len(chat), 1)
+            self.assertEqual(chat[0]['run_id'], 'run-1')
+            self.assertEqual(chat[0]['assistant_turn_mask'], [False, False, False, True])
+
+            grpo_out = Path(tmp) / 'grpo.jsonl'
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(cli_main(['export-dataset', '--state-dir', str(state_dir),
+                                           '--mode', 'grpo', '--output', str(grpo_out)]), 0)
+            with grpo_out.open('r', encoding='utf-8') as handle:
+                grpo = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual({r['run_id'] for r in grpo}, {'run-0', 'run-1'})
+            self.assertIn('group_advantage', grpo[0])
+            # same group (task-a): two runs -> ±1 advantage
+            advantages = {r['run_id']: r['group_advantage'] for r in grpo}
+            self.assertAlmostEqual(advantages['run-1'], 1.0, places=5)
+            self.assertAlmostEqual(advantages['run-0'], -1.0, places=5)
+
     def test_purge_ephemeral_test_runs(self):
         from harness import (compute_state_insights, export_sml_dataset,
                              purge_ephemeral_test_runs, scan_state_runs)
@@ -7517,6 +7831,364 @@ class TestH66PlanOrchestrator(HarnessTestCase):
             out = json.loads(buf.getvalue())
             self.assertEqual(out['status'], 'validated')
             self.assertEqual(out['waves'], [['n1']])
+
+
+class TestTenetRoutingAndCotIntegrity(unittest.TestCase):
+    def _apply(self, model, **kwargs):
+        body = json.dumps({'model': model,
+                           'messages': [{'role': 'user', 'content': 'hi'}]}).encode()
+        return json.loads(apply_provider_routing(body, '/v1/chat/completions', **kwargs))
+
+    def test_is_local_or_sml_model_prefixes(self):
+        for model in ('tenet-7b', 'sml-8b', 'local/foo', 'gguf/bar', 'vllm/baz',
+                      'mr-andrey-isachenko/tenet-7b',
+                      'openrouter/mr-andrey-isachenko/tenet-7b'):
+            self.assertTrue(is_local_or_sml_model(model), model)
+
+    def test_is_local_or_sml_model_rejects_cloud(self):
+        for model in ('openrouter/z-ai/glm-5.1',
+                      'deepseek/deepseek-v4.1-flash-1017', None, '', '   '):
+            self.assertFalse(is_local_or_sml_model(model), model)
+
+    def test_apply_provider_routing_llamacpp(self):
+        out = self._apply('openrouter/z-ai/glm-5.1', upstream_mode='llamacpp')
+        self.assertNotIn('provider', out)
+        self.assertEqual(out['reasoning'], {'max_tokens': DEFAULT_REASONING_MAX_TOKENS})
+        self.assertEqual(out['max_tokens'], 8192)
+
+    def test_apply_provider_routing_tenet_openrouter(self):
+        out = self._apply('tenet-7b', upstream_mode='openrouter')
+        self.assertEqual(out['provider'], TENET_PROVIDER_ROUTING)
+        self.assertEqual(out['reasoning'], {'max_tokens': DEFAULT_REASONING_MAX_TOKENS})
+        self.assertEqual(out['max_tokens'], 8192)
+
+    def test_apply_provider_routing_tenet_sticky_degraded(self):
+        out = self._apply('openrouter/mr-andrey-isachenko/tenet-7b',
+                          upstream_mode='openrouter',
+                          degraded_providers={'featherless'},
+                          sticky_provider='chutes')
+        order = out['provider']['order']
+        self.assertEqual(order[0], 'chutes')
+        self.assertEqual(order[-1], 'featherless')
+
+    def test_select_escalated_model_new_signals(self):
+        for signal in ('[COT INTEGRITY WARNING: unclosed <think>',
+                       '[SLOP GUARD WARNING: filler'):
+            messages = [{'role': 'assistant', 'content': signal} for _ in range(2)]
+            self.assertEqual(
+                select_escalated_model(messages, current_model='tenet-7b',
+                                       fallback_teacher_model='teacher-model'),
+                'teacher-model')
+
+    def test_cot_unclosed_think(self):
+        warnings = check_cot_and_slop_integrity(
+            [{'role': 'assistant', 'content': 'planning <think> still going'}])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('[COT INTEGRITY WARNING', warnings[0])
+
+    def test_cot_empty_post_think(self):
+        warnings = check_cot_and_slop_integrity(
+            [{'role': 'assistant', 'content': '<think>thinking...</think>   '}])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('empty post-</think>', warnings[0])
+
+    def test_cot_empty_post_think_with_tool_calls(self):
+        msg = {'role': 'assistant', 'content': '<think>ok</think> ',
+               'tool_calls': [{'id': '1'}]}
+        self.assertEqual(check_cot_and_slop_integrity([msg]), [])
+
+    def test_slop_prefixes(self):
+        for prefix in ('Certainly! Here is', "Sure, I'd be happy to", 'As an AI'):
+            warnings = check_cot_and_slop_integrity(
+                [{'role': 'assistant', 'content': prefix + ' the fix'}])
+            self.assertEqual(len(warnings), 1)
+            self.assertIn('[SLOP GUARD WARNING', warnings[0])
+        warnings = check_cot_and_slop_integrity(
+            [{'role': 'assistant',
+              'content': '<think>x</think> Certainly! Here is the fix'}])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('[SLOP GUARD WARNING', warnings[0])
+
+    def test_clean_assistant_response(self):
+        self.assertEqual(check_cot_and_slop_integrity(
+            [{'role': 'assistant', 'content': '<think>ok</think> Here is the patch.'}]), [])
+
+    def test_non_assistant_or_empty_messages(self):
+        self.assertEqual(check_cot_and_slop_integrity([]), [])
+        self.assertEqual(check_cot_and_slop_integrity(
+            [{'role': 'user', 'content': 'Certainly! Here is'}]), [])
+        self.assertEqual(check_cot_and_slop_integrity('not a list'), [])
+
+    def test_budget_gate_local_models_zero_cost(self):
+        for model in ('tenet-7b', 'sml-8b'):
+            self.assertIsNone(budget_gate({'cost': None, 'steps': 4}, 0.15, 16, model=model))
+            self.assertIsNone(budget_gate({'cost': None, 'steps': 4, 'unpriced_model': True},
+                                          0.15, 16, model=model))
+        for mode in ('vllm', 'llamacpp'):
+            self.assertIsNone(budget_gate({'cost': None, 'steps': 4}, 0.15, 16, upstream_mode=mode))
+
+    def test_budget_gate_unpriced_and_step_limit_strict(self):
+        self.assertEqual(
+            budget_gate({'cost': None, 'steps': 4}, 0.15, 16, model='openrouter/z-ai/glm-5.1'),
+            'unpriced_model')
+        self.assertEqual(
+            budget_gate({'cost': 0.0, 'steps': 4, 'unpriced_model': True}, 0.15, 16),
+            'unpriced_model')
+        for kwargs in ({'model': 'tenet-7b'}, {'upstream_mode': 'llamacpp'}):
+            self.assertEqual(
+                budget_gate({'cost': None, 'steps': 17}, 0.15, 16, **kwargs), 'step_limit')
+            self.assertIsNone(
+                budget_gate({'cost': 0.20, 'steps': 2}, 0.15, 16, **kwargs))
+        self.assertEqual(
+            budget_gate({'cost': 0.20, 'steps': 2}, 0.15, 16, model='openrouter/z-ai/glm-5.1'),
+            'cost_limit')
+
+    def test_budget_gate_snapshot_and_step_cost_alias(self):
+        from harness.finops import step_cost
+        snap = {'cost': None, 'messages': [('assistant', {'finish': 'stop', 'content': []})]}
+        self.assertIsNone(budget_gate(snap, 0.15, model='tenet-7b'))
+        self.assertEqual(budget_gate(snap, 0.15), 'unpriced_model')
+        self.assertEqual(step_cost('tenet-7b', cost=0.42), 0.0)
+        self.assertEqual(step_cost(upstream_mode='vllm', cost=0.42), 0.0)
+        self.assertEqual(step_cost('openrouter/z-ai/glm-5.1', cost=0.42), 0.42)
+        self.assertIsNone(step_cost('openrouter/z-ai/glm-5.1', cost=None))
+
+    def test_request_records_local_finished_cost_defaults_zero(self):
+        snap = {'cost': None,
+                'messages': [('assistant', {'finish': 'stop', 'cost': None, 'content': []})]}
+        for kwargs in ({'model': 'tenet-7b'},
+                       {'upstream_mode': 'llamacpp'},
+                       {'upstream_mode': 'openrouter', 'model': None}):
+            summary = {'dispatched': [], 'blocked_count': 0}
+            if kwargs == {'upstream_mode': 'openrouter', 'model': None}:
+                summary['upstream_mode'] = 'vllm'
+            recs = request_records(snap, summary, **kwargs)
+            self.assertEqual(recs[0]['cost'], 0.0, kwargs)
+            self.assertEqual(recs[0]['state'], 'finished')
+
+    def test_can_settle_from_proxy_local_zero_cost_finished(self):
+        snap = {'cost': None,
+                'messages': [('assistant', {'finish': 'stop', 'cost': None, 'content': []})]}
+        summary = {'dispatched': [{'completed': True, 'http_status': 200, 'error': None,
+                                   'generation_id': 'gen-abc'}], 'blocked_count': 1}
+        self.assertTrue(can_settle_from_proxy_local(snap, summary, model='tenet-7b'))
+
+    def test_proxy_cot_slop_integrity_injection_and_llamacpp_mode(self):
+        upstream, captured = _scripted_upstream([{'status': 200}, {'status': 200}])
+        with openrouter_proxy(lambda: None,
+                              upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                              tracer=HarnessTracer(), upstream_mode='llamacpp') as proxy:
+            msgs = [{'role': 'user', 'content': 'do it'},
+                    {'role': 'assistant', 'content': 'planning <think> still going'},
+                    {'role': 'user', 'content': 'continue'}]
+            body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+            self.assertEqual(_post_chat(proxy.base_url, body), 200)
+            self.assertEqual(_post_chat(proxy.base_url, body), 200)
+            summary = proxy.summary()
+        self.assertEqual(len(captured), 2)
+        self.assertNotIn('[COT INTEGRITY WARNING', captured[0]['messages'][-1]['content'])
+        forwarded = captured[1]['messages'][-1]['content']
+        self.assertIn('[COT INTEGRITY WARNING', forwarded)
+        self.assertEqual(summary['cot_slop_warnings'], 1)
+        cot_spans = [s for s in summary['spans'] if s.get('name') == 'guard.cot_slop_integrity']
+        self.assertEqual(len(cot_spans), 1)
+        span = cot_spans[0]
+        self.assertEqual(span.get('attributes', {}).get('openinference.span.kind'), 'GUARDRAIL')
+        self.assertEqual(span.get('attributes', {}).get('guardrail.type'), 'cot_slop_integrity')
+        self.assertTrue(span.get('attributes', {}).get('guardrail.triggered'))
+        upstream.shutdown()
+        upstream.server_close()
+        with self.assertRaises(ValueError):
+            OpenRouterGuardProxy(lambda: None, upstream_mode='nonsense')
+
+    def test_proxy_slop_guard_warning_counts(self):
+        upstream, captured = _scripted_upstream([{'status': 200}, {'status': 200}])
+        proxy = OpenRouterGuardProxy(lambda: None,
+                                     upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                                     tracer=HarnessTracer())
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        msgs = [{'role': 'user', 'content': 'do it'},
+                {'role': 'assistant', 'content': 'Certainly! Here is the fix'},
+                {'role': 'user', 'content': 'continue'}]
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            _post_chat(proxy.base_url, body)
+            _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        forwarded = captured[1]['messages'][-1]['content']
+        self.assertIn('[SLOP GUARD WARNING', forwarded)
+        self.assertEqual(proxy.summary()['cot_slop_warnings'], 1)
+
+
+class TestGroupRollout(HarnessTestCase):
+    def _make_task(self, tmp: str, target: Path) -> dict:
+        return {
+            'task_id': 'grpo-task-1',
+            'mode': 'model',
+            'directory': tmp,
+            'files': [str(target)],
+            'prompt': 'Fix add(a, b).',
+            'test_argv': [sys.executable, '-c', 'import sys; sys.exit(0)'],
+            'model': GLM,
+            'max_steps': 6,
+            'max_cost_usd': 0.10,
+            'max_task_cost_usd': 0.50,
+            'timeout_seconds': 30,
+            'limit_reason': 'test_rollout',
+        }
+
+    def test_group_rollout_validation_and_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'calc.py'
+            target.write_text('def add(a, b):\n    return 0\n', encoding='utf-8')
+            task = self._make_task(tmp, target)
+            for bad_size in (0, -1, 17, True, '4'):
+                with self.assertRaises(GuardError):
+                    run_group_rollout(task, group_size=bad_size, runner=lambda t: {'status': 'passed'})
+            with self.assertRaises(GuardError):
+                run_group_rollout({'task_id': '../bad'}, group_size=2, runner=lambda t: {'status': 'passed'})
+
+    def test_group_rollout_file_isolation_advantages_and_best_patch(self):
+        import math
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'calc.py'
+            original_code = 'def add(a, b):\n    return 0\n'
+            target.write_text(original_code, encoding='utf-8')
+            task = self._make_task(tmp, target)
+            seen = []
+
+            def fake_runner(rollout_task):
+                # Every rollout must start from the exact original file bytes.
+                self.assertEqual(target.read_text(encoding='utf-8'), original_code)
+                idx = rollout_task['rollout_index']
+                seen.append((rollout_task['task_id'], idx, rollout_task['model']))
+                if idx == 0:
+                    target.write_text('def add(a, b):\n    return a - b\n', encoding='utf-8')
+                    return {'run_id': 'run-0', 'status': 'validation_failed', 'steps': 2, 'test_return_code': 1}
+                if idx == 1:
+                    target.write_text('def add(a, b):\n    return a + b  # guarded\n', encoding='utf-8')
+                    return {
+                        'run_id': 'run-1',
+                        'status': 'validation_passed_review_required',
+                        'steps': 3,
+                        'cost': 0.02,
+                        'guard_interventions': 1,
+                        'test_return_code': 0,
+                    }
+                if idx == 2:
+                    target.write_text('def add(a, b):\n    return a + b\n', encoding='utf-8')
+                    return {
+                        'run_id': 'run-2',
+                        'status': 'validation_passed_review_required',
+                        'steps': 2,
+                        'cost': 0.01,
+                        'test_return_code': 0,
+                    }
+                target.write_text('broken syntax\n', encoding='utf-8')
+                return {'run_id': 'run-3', 'status': 'blocked', 'steps': 1, 'test_return_code': 1}
+
+            res = run_group_rollout(
+                task,
+                group_size=4,
+                models=['m1', 'm2'],
+                state_dir=Path(tmp) / 'state',
+                runner=fake_runner,
+            )
+
+            self.assertEqual(seen, [
+                ('grpo-task-1', 0, 'm1'),
+                ('grpo-task-1', 1, 'm2'),
+                ('grpo-task-1', 2, 'm1'),
+                ('grpo-task-1', 3, 'm2'),
+            ])
+            self.assertEqual(res['task_id'], 'grpo-task-1')
+            self.assertEqual(res['group_size'], 4)
+            self.assertEqual(res['pass_count'], 2)
+            self.assertAlmostEqual(res['pass_rate'], 0.5)
+            self.assertEqual(res['best_run_id'], 'run-2')
+
+            rewards = [r['r_total'] for r in res['rollouts']]
+            self.assertEqual(rewards, [0.0, 0.75, 1.0, 0.0])
+            mean_r = sum(rewards) / len(rewards)
+            std_r = math.sqrt(sum((r - mean_r) ** 2 for r in rewards) / len(rewards))
+            expected_advs = [round((r - mean_r) / (std_r + 1e-6), 6) for r in rewards]
+            self.assertAlmostEqual(res['mean_reward'], round(mean_r, 6))
+            self.assertAlmostEqual(res['std_reward'], round(std_r, 6))
+            self.assertEqual([r['advantage'] for r in res['rollouts']], expected_advs)
+            self.assertIn('+    return a + b', res['rollouts'][2]['patch'])
+            # Best passing rollout's patch must remain on disk.
+            self.assertEqual(target.read_text(encoding='utf-8'), 'def add(a, b):\n    return a + b\n')
+
+    def test_group_rollout_all_failed_restores_originals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'calc.py'
+            original_code = 'def add(a, b):\n    return 0\n'
+            target.write_text(original_code, encoding='utf-8')
+            task = self._make_task(tmp, target)
+
+            def fail_runner(rollout_task):
+                target.write_text(f'# broken attempt {rollout_task["rollout_index"]}\n', encoding='utf-8')
+                return {'status': 'validation_failed', 'steps': 1, 'test_return_code': 1}
+
+            res = run_group_rollout(task, group_size=2, runner=fail_runner)
+            self.assertEqual(res['pass_count'], 0)
+            self.assertIsNone(res['best_run_id'])
+            self.assertEqual([r['advantage'] for r in res['rollouts']], [0.0, 0.0])
+            self.assertEqual(target.read_text(encoding='utf-8'), original_code)
+
+    def test_cli_rollout_subcommand_writes_output(self):
+        from unittest.mock import patch
+        from harness import cli as harness_cli
+        import harness.sandbox as sandbox_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'calc.py'
+            target.write_text('def add(a, b):\n    return 0\n', encoding='utf-8')
+            task_path = Path(tmp) / 'task.json'
+            out_path = Path(tmp) / 'rollout_group.json'
+            state_dir = Path(tmp) / 'state'
+            task_path.write_text(json.dumps(self._make_task(tmp, target)), encoding='utf-8')
+
+            captured_kwargs = {}
+
+            def fake_group_rollout(task, *, group_size=4, models=None, state_dir=None, runner=None):
+                captured_kwargs['task_id'] = task['task_id']
+                captured_kwargs['group_size'] = group_size
+                captured_kwargs['models'] = models
+                captured_kwargs['state_dir'] = str(state_dir)
+                return {
+                    'task_id': task['task_id'],
+                    'group_size': group_size,
+                    'pass_count': 1,
+                    'pass_rate': round(1 / group_size, 6),
+                    'mean_reward': 0.5,
+                    'std_reward': 0.5,
+                    'best_run_id': 'run-0',
+                    'rollouts': [],
+                }
+
+            with patch.object(sandbox_mod, 'run_group_rollout', side_effect=fake_group_rollout):
+                rc = harness_cli.main([
+                    'rollout',
+                    str(task_path),
+                    '--group-size', '3',
+                    '--models', 'm1,m2',
+                    '--state-dir', str(state_dir),
+                    '--output', str(out_path),
+                ])
+
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured_kwargs, {
+                'task_id': 'grpo-task-1',
+                'group_size': 3,
+                'models': ['m1', 'm2'],
+                'state_dir': str(state_dir),
+            })
+            written = json.loads(out_path.read_text(encoding='utf-8'))
+            self.assertEqual(written['best_run_id'], 'run-0')
+            self.assertEqual(written['group_size'], 3)
 
 
 if __name__ == '__main__':

@@ -36,6 +36,7 @@ __all__ = [
     "build_cross_file_symbol_context",
     "build_file_skeletons",
     "check_allowed_files_syntax",
+    "check_cot_and_slop_integrity",
     "check_egress_payload",
     "check_readonly_sql_tool_calls",
     "check_sql_syntax",
@@ -3158,3 +3159,38 @@ def compact_context_window(
         "tokens_after": current_tokens,
         "truncated_messages": truncated_messages,
     }
+
+
+def check_cot_and_slop_integrity(messages: list[dict[str, Any]]) -> list[str]:
+    """Flag unclosed ``<think>`` blocks, post-``</think>`` collapse, and filler openers."""
+    if not isinstance(messages, list):
+        return []
+    assistant: Mapping[str, Any] | None = None
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            assistant = message
+    if assistant is None:
+        return []
+    text = _message_text(assistant)
+    warnings: list[str] = []
+    if text.rfind("<think>") > text.rfind("</think>"):
+        warnings.append(
+            "[COT INTEGRITY WARNING: unclosed <think> block detected; close </think> concisely "
+            "before emitting tool call or final answer]"
+        )
+        response_text = text
+    elif "</think>" in text:
+        response_text = text[text.rfind("</think>") + len("</think>"):]
+        if not response_text.strip() and not assistant.get("tool_calls"):
+            warnings.append(
+                "[COT INTEGRITY WARNING: empty post-</think> response (length collapse); "
+                "provide a concrete answer or tool call after </think>]"
+            )
+    else:
+        response_text = text
+    opener = response_text.lstrip().lower()
+    if opener.startswith(("certainly! here is", "sure, i'd be happy to", "as an ai")):
+        warnings.append(
+            "[SLOP GUARD WARNING: omit conversational filler and output direct technical action or artifact]"
+        )
+    return warnings

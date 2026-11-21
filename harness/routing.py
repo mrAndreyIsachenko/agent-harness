@@ -42,6 +42,11 @@ GLM_51_PROVIDER_ROUTING = {
     'order': ['chutes', 'z-ai', 'siliconflow'],
     'allow_fallbacks': True,
 }
+TENET_PROVIDER_ROUTING = {
+    'quantizations': ['fp8', 'bf16', 'fp16'],
+    'order': ['featherless', 'chutes', 'novita', 'deepinfra'],
+    'allow_fallbacks': True,
+}
 MODEL_PROVIDER_PREFS = {
     'openrouter/z-ai/glm-5.3-flash': GLM_53_FLASH_PROVIDER_ROUTING,
     'openrouter/z-ai/glm-5.1': GLM_51_PROVIDER_ROUTING,
@@ -57,7 +62,8 @@ ERROR_SIGNAL_SUBSTRINGS = ('[AST PREFLIGHT ERROR', '[GUARD LOOP WARNING',
                            'Traceback (most recent call last)', 'SyntaxError',
                            'FAILED ', 'AssertionError',
                            'could not be parsed as JSON', '[HARNESS_EDIT_HINT',
-                           '[HARNESS PLATEAU GUARD')
+                           '[HARNESS PLATEAU GUARD',
+                           '[COT INTEGRITY WARNING', '[SLOP GUARD WARNING')
 GLM_51_REASONING_MAX_TOKENS = DEFAULT_REASONING_MAX_TOKENS
 DEFAULT_MAX_TOKENS_CAP = 8192
 GLM_51_MAX_TOKENS_CAP = DEFAULT_MAX_TOKENS_CAP
@@ -112,6 +118,17 @@ def _message_text(message):
     return '\n'.join(chunks)
 
 
+def is_local_or_sml_model(model: str | None) -> bool:
+    """Return True for local / SML / Tenet identifiers that must not use cloud routing."""
+    if not isinstance(model, str):
+        return False
+    name = model.strip()
+    if name.startswith('openrouter/'):
+        name = name[len('openrouter/'):]
+    return name.startswith(('tenet-', 'sml-', 'local/', 'gguf/', 'vllm/',
+                            'mr-andrey-isachenko/tenet-'))
+
+
 def select_escalated_model(
     messages,
     *,
@@ -138,7 +155,7 @@ def apply_provider_routing(body, path, *, default_model=None, turn_index=1, reas
                            degraded_providers=None, sticky_provider=None,
                            upstream_mode: str = "openrouter",
                            fallback_teacher_model: str | None = None) -> bytes:
-    if upstream_mode not in ("openrouter", "vllm", "openai"):
+    if upstream_mode not in ("openrouter", "vllm", "openai", "llamacpp"):
         raise ValueError(f"unsupported upstream_mode: {upstream_mode!r}")
     if not body or not path.rstrip('/').endswith(('/chat/completions', '/responses')):
         return body
@@ -162,8 +179,13 @@ def apply_provider_routing(body, path, *, default_model=None, turn_index=1, reas
         raw_model = selected_model
         changed = True
     canonical = raw_model if raw_model.startswith('openrouter/') else 'openrouter/' + raw_model
-    if upstream_mode == "openrouter" and canonical in MODEL_PROVIDER_PREFS:
-        desired_provider = json.loads(json.dumps(MODEL_PROVIDER_PREFS[canonical]))
+    bare_model = raw_model[len('openrouter/'):] if raw_model.startswith('openrouter/') else raw_model
+    is_tenet_model = bare_model.startswith(('tenet-', 'mr-andrey-isachenko/tenet-'))
+    routing_prefs = MODEL_PROVIDER_PREFS.get(canonical)
+    if routing_prefs is None and is_tenet_model and upstream_mode == "openrouter":
+        routing_prefs = TENET_PROVIDER_ROUTING
+    if upstream_mode == "openrouter" and routing_prefs is not None:
+        desired_provider = json.loads(json.dumps(routing_prefs))
         degraded = degraded_providers or set()
         if degraded and isinstance(desired_provider.get('order'), list):
             order = desired_provider['order']
@@ -188,12 +210,19 @@ def apply_provider_routing(body, path, *, default_model=None, turn_index=1, reas
             changed = True
     apply_caps = (
         canonical in MODEL_PROVIDER_PREFS
-        or upstream_mode in ("vllm", "openai")
+        or (is_tenet_model and upstream_mode == "openrouter")
+        or upstream_mode in ("vllm", "openai", "llamacpp")
         or reasoning_max_tokens is not None
         or fallback_teacher_model is not None
     )
-    if canonical in MODEL_REQUEST_CAPS and apply_caps:
+    if canonical in MODEL_REQUEST_CAPS:
         caps = MODEL_REQUEST_CAPS[canonical]
+    elif is_tenet_model and upstream_mode == "openrouter":
+        caps = {'reasoning_max_tokens': DEFAULT_REASONING_MAX_TOKENS,
+                'max_tokens_cap': DEFAULT_MAX_TOKENS_CAP}
+    else:
+        caps = None
+    if caps is not None and apply_caps:
         if reasoning_max_tokens is not None:
             rmax = reasoning_max_tokens
         elif turn_index >= LATE_TURN_START and caps.get('reasoning_max_tokens'):

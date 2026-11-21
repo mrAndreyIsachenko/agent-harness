@@ -17,6 +17,7 @@ from .guards import (
     build_file_skeletons,
     build_preloaded_file_excerpts,
     check_allowed_files_syntax,
+    check_cot_and_slop_integrity,
     check_egress_payload,
     check_readonly_sql_tool_calls,
     check_sql_syntax,
@@ -45,7 +46,9 @@ from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HE
                       GLM_53_FLASH_PROVIDER_ROUTING, LATE_TURN_REASONING_MAX_TOKENS,
                       LATE_TURN_START, MODELS, MODEL_PROVIDER_PREFS, MODEL_REQUEST_CAPS,
                       QUIET_LATE_TURN_REASONING_MAX_TOKENS, TEACHER_MODELS,
-                      ProviderHealthStore, apply_provider_routing, select_escalated_model)
+                      TENET_PROVIDER_ROUTING,
+                      ProviderHealthStore, apply_provider_routing,
+                      is_local_or_sml_model, select_escalated_model)
 from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
                         HarnessTracer, format_trace_tree,
                         sync_state_traces_to_phoenix, synthesize_spans_from_run_dir)
@@ -61,14 +64,14 @@ from .sandbox import (
     file_hashes, interruptions, isolated_worktree, locks, main, metrics, model_run,
     number, owned_process, preflight, prior_cost, private_log, private_write,
     reconcile_run, request_records, resolved_cost, resolve_pytest_test_argv,
-    run_best_of_2, run_task, snapshot, stop_group,
+    run_best_of_2, run_group_rollout, run_task, snapshot, stop_group,
     validate_plan,
     validate_task, verify_db, verify_permissions, violation,
 )
 
 __all__ = [
     '__version__',
-    'check_allowed_files_syntax', 'check_sql_syntax', 'collect_python_top_symbols',
+    'check_allowed_files_syntax', 'check_cot_and_slop_integrity', 'check_sql_syntax', 'collect_python_top_symbols',
     '_message_text', 'detect_duplicate_tool_calls', 'detect_edit_oscillation', '_sql_skeleton_lines',
     'build_file_skeletons', 'build_cross_file_symbol_context',
     'build_preloaded_file_excerpts', 'extract_compact_test_failure',
@@ -83,7 +86,8 @@ __all__ = [
     'GLM_51_PROVIDER_ROUTING', 'MODEL_PROVIDER_PREFS', 'DEFAULT_REASONING_MAX_TOKENS',
     'LATE_TURN_REASONING_MAX_TOKENS', 'LATE_TURN_START', 'QUIET_LATE_TURN_REASONING_MAX_TOKENS',
     'ERROR_RECOVERY_REASONING_MAX_TOKENS', 'ERROR_SIGNAL_SUBSTRINGS', 'DEFAULT_MAX_TOKENS_CAP',
-    'MODEL_REQUEST_CAPS', 'apply_provider_routing', 'ProviderHealthStore',
+    'MODEL_REQUEST_CAPS', 'TENET_PROVIDER_ROUTING', 'is_local_or_sml_model',
+    'apply_provider_routing', 'ProviderHealthStore',
     'DEFAULT_PROVIDER_HEALTH_TTL_SECONDS',
     'summarize_run', 'aggregate_benchmark_runs', 'format_benchmark_markdown',
     'export_sml_dataset',
@@ -99,7 +103,7 @@ __all__ = [
     'file_hashes', 'interruptions', 'isolated_worktree', 'locks', 'main', 'metrics', 'model_run',
     'number', 'owned_process', 'preflight', 'prior_cost', 'private_log', 'private_write',
     'reconcile_run', 'request_records', 'resolved_cost', 'resolve_pytest_test_argv',
-    'run_best_of_2', 'run_task', 'snapshot', 'stop_group',
+    'run_best_of_2', 'run_group_rollout', 'run_task', 'snapshot', 'stop_group',
     'validate_plan',
     'validate_task', 'verify_db', 'verify_permissions', 'violation',
 ]

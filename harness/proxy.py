@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .guards import (
     check_allowed_files_syntax,
+    check_cot_and_slop_integrity,
     check_egress_payload,
     check_readonly_sql_tool_calls,
     collect_python_top_symbols,
@@ -82,6 +83,8 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
         self.allowed_models = list(allowed_models) if allowed_models is not None else None
         self.enforce_egress_guard = bool(enforce_egress_guard)
         self.enforce_readonly_sql = bool(enforce_readonly_sql)
+        if upstream_mode not in ('openrouter', 'vllm', 'openai', 'llamacpp'):
+            raise ValueError(f'unsupported upstream_mode: {upstream_mode!r}')
         self.upstream_mode = upstream_mode
         self.fallback_teacher_model = fallback_teacher_model
         self.max_context_tokens = max_context_tokens
@@ -98,6 +101,7 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
         self._auth_bearer = None
         self._compacted_reads = 0
         self._edit_hints_injected = 0
+        self._cot_slop_warnings = 0
         self.degraded_providers = (set(health_store.active_degraded())
                                    if health_store is not None else set())
         self.sticky_provider = (health_store.get_sticky(default_model)
@@ -133,7 +137,8 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
                     'blocked': [dict(b) for b in self._blocked],
                     'spans': list(self.tracer.spans),
                     'compacted_reads': self._compacted_reads,
-                    'edit_hints_injected': self._edit_hints_injected}
+                    'edit_hints_injected': self._edit_hints_injected,
+                    'cot_slop_warnings': self._cot_slop_warnings}
 
     def task_summaries(self) -> dict[str, dict]:
         with self._lock:
@@ -153,6 +158,7 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
                     'started_at': None,
                     'finished_at': None,
                     'wall_clock_seconds': 0.0,
+                    'sml_request_ids': [],
                 }
             return grouped[task_id]
 
@@ -171,6 +177,8 @@ class OpenRouterGuardProxy(http.server.ThreadingHTTPServer):
                 continue
             bucket = _bucket(task_id)
             bucket['request_count'] += 1
+            if item.get('sml_request_id'):
+                bucket['sml_request_ids'].append(item['sml_request_id'])
             bucket['api_cost_usd'] += float(item.get('stream_cost') or 0.0)
             bucket['prompt_tokens'] += int(item.get('prompt_tokens') or 0)
             bucket['completion_tokens'] += int(item.get('completion_tokens') or 0)
@@ -267,6 +275,13 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
         self._capture_auth()
         raw_task_id = self.headers.get('X-Harness-Task-Id')
         task_id = raw_task_id.strip() if isinstance(raw_task_id, str) and raw_task_id.strip() else None
+        raw_sml_req_id = self.headers.get('X-SML-Request-Id')
+        sml_request_id = raw_sml_req_id.strip() if isinstance(raw_sml_req_id, str) and raw_sml_req_id.strip() else None
+        if task_id is None:
+            raw_sml_task_id = self.headers.get('X-SML-Task-Id')
+            task_id = raw_sml_task_id.strip() if isinstance(raw_sml_task_id, str) and raw_sml_task_id.strip() else None
+        if task_id is None and sml_request_id is not None and '-step-' in sml_request_id:
+            task_id = sml_request_id.split('-step-', 1)[0].strip() or None
         body = self._read_body() if method == 'POST' else None
         entry = None
         if method == 'POST':
@@ -337,6 +352,8 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                          'completed': False, 'error': None}
                 if task_id is not None:
                     entry['task_id'] = task_id
+                if sml_request_id is not None:
+                    entry['sml_request_id'] = sml_request_id
                 self.server._dispatched.append(entry)
             if self.path.rstrip('/').endswith(('/chat/completions', '/responses')):
                 with self.server._lock:
@@ -375,6 +392,18 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                                                                'guardrail.triggered': True,
                                                                'guardrail.warnings': '; '.join(loop_warnings),
                                                                'harness.turn_index': turn_index})
+                if isinstance(messages, list):
+                    cot_warnings = check_cot_and_slop_integrity(messages)
+                    if cot_warnings:
+                        notices.append(' '.join(cot_warnings))
+                        with self.server._lock:
+                            self.server._cot_slop_warnings += len(cot_warnings)
+                        self.server.tracer.record_span('guard.cot_slop_integrity', kind='GUARDRAIL', status='ERROR',
+                                                       attributes={'guardrail.name': 'cot_slop_integrity',
+                                                                   'guardrail.type': 'cot_slop_integrity',
+                                                                   'guardrail.triggered': True,
+                                                                   'guardrail.warnings': '; '.join(cot_warnings),
+                                                                   'harness.turn_index': turn_index})
             # H-32: edit-oscillation / untested-edit plateau guard.
             if isinstance(messages, list):
                 osc = detect_edit_oscillation(messages)
