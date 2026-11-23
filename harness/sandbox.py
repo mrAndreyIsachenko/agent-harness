@@ -1522,20 +1522,58 @@ def should_auto_escalate(raw_task: dict) -> bool:
     return os.environ.get('HARNESS_AUTO_ESCALATE', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-_LESSON_ERROR_MARKERS = ('AssertionError', 'ImportError', 'SyntaxError', 'TypeError')
+_LESSON_ERROR_MARKERS = (
+    'AssertionError', 'ImportError', 'ModuleNotFoundError', 'SyntaxError',
+    'IndentationError', 'TypeError', 'ValueError', 'KeyError', 'AttributeError',
+    'NameError', 'RuntimeError', 'ValidationError', 'FileNotFoundError',
+    'PermissionError', 'ZeroDivisionError', 'IndexError', 'LookupError',
+    'OSError', 'FAILED ', 'ERROR:',
+)
+
+_LESSON_PROGRESS_RE = re.compile(r'^[.sFxXEs]+(?:\s+\[\s*\d+%\])?$')
+_LESSON_SUMMARY_RE = re.compile(r'\b\d+\s+(?:passed|deselected|skipped|warnings?)\b')
+_LESSON_EXCEPTION_RE = re.compile(
+    r'^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Failure):\s+.+')
+_LESSON_WORKTREE_PREFIX_RE = re.compile(
+    r'/[^\s"\x27]*?(?:\.tools/opencode-guard-state/worktrees|\.worktrees|worktrees)/[^/\s"\x27]+/')
 
 
 def _lesson_error_signature(failed_test_log: str) -> str:
-    """First concise error line from a failing test log, truncated to 160 chars."""
-    lines = [line.strip() for line in (failed_test_log or '').splitlines()]
-    for line in lines:
-        if not line:
+    """First concise error line from a failing test log, truncated to 160 chars.
+
+    Never returns noise from passing/progress output: pytest dot/progress
+    lines, ``N passed`` summary lines (without failures), banner lines,
+    tracebacks and warning lines are ignored. Returns ``''`` when no
+    actionable error/failure line is present.
+    """
+    def _normalize(line: str) -> str:
+        return _LESSON_WORKTREE_PREFIX_RE.sub('', line)
+
+    raw_lines = [line.strip() for line in (failed_test_log or '').splitlines()]
+    noise = {'', 'Traceback (most recent call last):'}
+    error_lines: list[str] = []
+    e_lines: list[str] = []
+    for line in raw_lines:
+        if not line or line in noise or line.startswith(('====', '----')):
             continue
-        if line.startswith('E   ') or any(marker in line for marker in _LESSON_ERROR_MARKERS):
-            return line[:160]
-    for line in lines:
-        if line:
-            return line[:160]
+        if 'ResourceWarning:' in line or 'DeprecationWarning:' in line or 'PytestWarning' in line:
+            continue
+        if _LESSON_PROGRESS_RE.match(line):
+            continue
+        if (_LESSON_SUMMARY_RE.search(line)
+                and 'failed' not in line.lower() and 'error' not in line.lower()):
+            continue
+        if line.startswith('E   '):
+            e_lines.append(line)
+        elif (any(marker in line for marker in _LESSON_ERROR_MARKERS)
+                or _LESSON_EXCEPTION_RE.match(line)):
+            error_lines.append(line)
+    if e_lines:
+        # Prefer a descriptive E   line over a bare 'E   AssertionError'.
+        descriptive = [ln for ln in e_lines if ln != 'E   AssertionError']
+        return _normalize((descriptive or e_lines)[0])[:160]
+    if error_lines:
+        return _normalize(error_lines[0])[:160]
     return ''
 
 
@@ -1543,18 +1581,65 @@ def _norm_lesson_path(value) -> str:
     text = str(value or '').strip()
     if not text:
         return ''
+    # Normalize ephemeral worktree paths back to the canonical repo root:
+    # /repo/.worktrees/<branch>[/sub] -> /repo[/sub]
+    marker = '/.worktrees/'
+    if marker in text:
+        head, _, tail = text.partition(marker)
+        _, sep, rest = tail.partition('/')
+        if sep:
+            text = head.rstrip('/') + '/' + rest
+        else:
+            text = head
+        if not text:
+            text = '/'
     try:
         return str(Path(text).resolve())
     except OSError:
         return text
 
 
-def record_repair_lesson(state_dir, task, failed_test_log, repaired_files) -> None:
+def _extract_patch_fix_summary(patch_text: str, max_chars: int = 120) -> str:
+    """Compact 1-line summary of a unified diff: enclosing symbol + added lines."""
+    if not patch_text:
+        return ''
+    symbol = ''
+    added: list[str] = []
+    for line in patch_text.splitlines():
+        if line.startswith('@@') and '@@' in line[2:]:
+            header = line.rsplit('@@', 1)[-1].strip()
+            match = re.search(r'\b(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)', header)
+            symbol = f'{header.split(" ")[0]} {match.group(1)}' if match else ''
+            continue
+        if not line.startswith('+') or line.startswith('+++'):
+            continue
+        candidate = line[1:].strip()
+        if (not candidate or candidate.startswith('#')
+                or candidate.startswith('import ') or candidate.startswith('from ')):
+            continue
+        added.append(candidate)
+        if len(added) >= 2:
+            break
+    parts: list[str] = []
+    if symbol:
+        parts.append(f'in {symbol}:')
+    parts.extend('+' + a for a in added)
+    if not parts:
+        return ''
+    return ' '.join(parts)[:max_chars]
+
+
+def record_repair_lesson(state_dir, task, failed_test_log, repaired_files,
+                         patch_text='') -> None:
     """H-76: append a compact repair lesson to ``lessons.jsonl`` (deduplicated).
 
     Skips writing when an identical ``(task_dir, error_signature)`` pair is
-    already recorded.
+    already recorded, or when the log carries no actionable error signature
+    (e.g. passing pytest output).
     """
+    signature = _lesson_error_signature(failed_test_log)
+    if not signature:
+        return
     state = Path(state_dir)
     task_dir = str(task.get('task_dir') or task.get('directory') or '')
     base = Path(task_dir) if task_dir else None
@@ -1569,6 +1654,8 @@ def record_repair_lesson(state_dir, task, failed_test_log, repaired_files) -> No
                 rel = str(item)
         files.append(rel)
     signature = _lesson_error_signature(failed_test_log)
+    if not signature:
+        return
     lessons_path = state / 'lessons.jsonl'
     if lessons_path.is_file():
         for line in lessons_path.read_text(encoding='utf-8', errors='replace').splitlines():
@@ -1590,6 +1677,10 @@ def record_repair_lesson(state_dir, task, failed_test_log, repaired_files) -> No
         'error_signature': signature,
         'model': task.get('model'),
     }
+    if patch_text:
+        fix_summary = _extract_patch_fix_summary(patch_text)
+        if fix_summary:
+            record['fix_summary'] = fix_summary
     with lessons_path.open('a', encoding='utf-8') as fh:
         fh.write(json.dumps(record) + '\n')
 
@@ -1618,13 +1709,25 @@ def load_workspace_lessons(state_dir, task_dir, files=None, max_items=3, max_cha
         if not isinstance(rec, dict):
             continue
         if _norm_lesson_path(rec.get('task_dir')) != want_dir:
-            continue
+            # H-83: lessons recorded in ephemeral worktrees of the same repo
+            # still match by relative file path (>=2 path components whose
+            # last two segments match a file in ``file_set``).
+            rec_paths = [str(f) for f in (rec.get('files') or []) if str(f).strip()]
+            if not (file_set and rec_paths
+                    and any(len(Path(f).parts) >= 2
+                            and any(wf.endswith('/' + '/'.join(Path(f).parts[-2:]))
+                                    for wf in file_set)
+                            for f in rec_paths)):
+                continue
+            matched_by_files = True
+        else:
+            matched_by_files = False
         rec_files = set()
         for f in (rec.get('files') or []):
             fp = Path(str(f))
             resolved_f = fp if fp.is_absolute() else (Path(want_dir) / fp)
             rec_files.add(_norm_lesson_path(resolved_f))
-        matched.append((bool(rec_files & file_set) if file_set else False, rec))
+        matched.append((matched_by_files or bool(rec_files & file_set) if file_set else False, rec))
     if not matched:
         return ''
     matched.sort(key=lambda item: 0 if item[0] else 1)  # stable: file matches first
@@ -1640,7 +1743,11 @@ def load_workspace_lessons(state_dir, task_dir, files=None, max_items=3, max_cha
             continue
         seen_signatures.add(signature)
         file_hint = ', '.join(str(f) for f in (rec.get('files') or []) if str(f).strip())
-        entry = '- ' + signature + (f' (files: {file_hint})' if file_hint else '')
+        fix_summary = str(rec.get('fix_summary') or '').strip()
+        entry = '- ' + signature
+        if fix_summary:
+            entry += f' -> Fix: {fix_summary}'
+        entry += (f' (files: {file_hint})' if file_hint else '')
         if total_chars + len(entry) + 1 > max_chars:
             break
         out_lines.append(entry)
@@ -1909,7 +2016,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                         rc_fast = execute(targeted_argv, task['directory'],
                                                           min(30, task['test_timeout_seconds']),
                                                           run_dir / 'test.log')
-                                        if rc_fast != 0:
+                                        if rc_fast not in (0, 4):
                                             result['test_return_code'] = rc_fast
                                             event(run_dir, 'micro_repair_fast_fail',
                                                   return_code=rc_fast)
@@ -1927,7 +2034,14 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 result['salvaged_from'] = f'micro_repair_{repair_salvage_reason}'
                             try:
                                 if result.get('test_return_code') == 0 and repaired_files:
-                                    record_repair_lesson(state, task, first_test_log_text, repaired_files)
+                                    record_repair_lesson(
+                                        state, task, first_test_log_text, repaired_files,
+                                        patch_text=(
+                                            (run_dir / 'changes.patch').read_text(
+                                                encoding='utf-8', errors='replace')
+                                            if (run_dir / 'changes.patch').is_file() else ''
+                                        ),
+                                    )
                             except Exception:
                                 pass
                         if ro_files and _fh(ro_files) != ro_hashes_before:

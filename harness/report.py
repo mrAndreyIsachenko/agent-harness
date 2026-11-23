@@ -1640,7 +1640,11 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
     Returns one record per processed run: ``run_id``, ``task_id``,
     ``task_dir``, ``error_signature``, ``files``.
     """
-    from harness.sandbox import _lesson_error_signature, record_repair_lesson
+    from harness.sandbox import (
+        _extract_patch_fix_summary,
+        _lesson_error_signature,
+        record_repair_lesson,
+    )
 
     state_path = Path(state_dir)
     runs_dir = state_path / "runs"
@@ -1763,16 +1767,16 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
                 failed_log = prior_failed_logs[task_id]
 
         sig = _lesson_error_signature(failed_log)
+        if not sig or sig == "test_failure":
+            # Passing pytest output (e.g. "312 passed in 48s" or
+            # "225 deselected in 0.04s") carries no actionable error
+            # signature; skip it instead of polluting lessons.
+            continue
         if not (run_dir / "test_before_repair.log").is_file():
-            if sig == "test_failure":
-                continue
             if task_id not in prior_failed_logs and not any(
                 marker in failed_log
                 for marker in ("E   ", "Traceback", "FAILED", "ERROR")
             ):
-                # Passing pytest output (e.g. "312 passed in 48s") carries no
-                # actionable error signature; skip it instead of polluting
-                # lessons with a generic signature.
                 continue
         if (task_dir, sig) in seen:
             continue
@@ -1809,6 +1813,10 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
             },
             failed_log,
             repaired_files,
+            patch_text=(
+                (run_dir / "changes.patch").read_text(encoding="utf-8", errors="replace")
+                if (run_dir / "changes.patch").is_file() else ""
+            ),
         )
 
     return results

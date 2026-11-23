@@ -184,11 +184,31 @@ class RepairLessonsTest(unittest.TestCase):
         self.assertEqual(entries[0]["model"], "test-model")
         self.assertIn("timestamp", entries[0])
 
-    def test_record_repair_lesson_falls_back_to_first_line(self) -> None:
+    def test_record_repair_lesson_skips_logs_without_signature(self) -> None:
+        # Noise-only logs (passing pytest output, random text) produce no
+        # lesson at all: no fallback to the first non-empty line anymore.
         record_repair_lesson(self.state_dir, self._task(), "\nrandom failure text\n", [])
-        path = self.state_dir / "lessons.jsonl"
-        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        self.assertEqual(entries[0]["error_signature"], "random failure text")
+        record_repair_lesson(self.state_dir, self._task(), "225 deselected in 0.04s\n", [])
+        record_repair_lesson(
+            self.state_dir,
+            self._task(),
+            ".... [100%]\n"
+            "/opt/homebrew/.../tempfile.py:484: ResourceWarning: Implicitly cleaning up\n"
+            "312 passed in 48s\n",
+            [],
+        )
+        self.assertFalse((self.state_dir / "lessons.jsonl").exists())
+
+    def test_lesson_signature_extracts_exception_after_traceback(self) -> None:
+        log = (
+            "Traceback (most recent call last):\n"
+            '  File "pkg/mod.py", line 3, in foo\n'
+            "    return val['k']\n"
+            "KeyError: 'k'\n"
+        )
+        self.assertEqual(sandbox._lesson_error_signature(log), "KeyError: 'k'")
+        self.assertEqual(sandbox._lesson_error_signature(".... [100%]\n"), "")
+        self.assertEqual(sandbox._lesson_error_signature("225 deselected in 0.04s\n"), "")
 
     def test_load_workspace_lessons_filters_by_task_dir(self) -> None:
         other_dir = Path(self._tmp.name) / "other"
@@ -332,6 +352,36 @@ class BackfillRepairLessonsTest(unittest.TestCase):
             ln for ln in lessons.read_text(encoding="utf-8").splitlines() if ln.strip()
         ]
         self.assertEqual(len(lines), 1)
+
+    def test_backfill_includes_fix_summary_from_changes_patch(self) -> None:
+        run_dir = self._repaired_run("t-fix")
+        (run_dir / "changes.patch").write_text(
+            "--- a/pkg/mod.py\n+++ b/pkg/mod.py\n"
+            "@@ -1,3 +1,4 @@ def foo():\n"
+            " import json\n"
+            "+return val.get('k')\n",
+            encoding="utf-8",
+        )
+        results = report.backfill_repair_lessons(self.state_dir)
+        self.assertEqual(len(results), 1)
+        path = self.state_dir / "lessons.jsonl"
+        entries = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+        self.assertEqual(len(entries), 1)
+        expected = sandbox._extract_patch_fix_summary(
+            (run_dir / "changes.patch").read_text(encoding="utf-8")
+        )
+        self.assertEqual(entries[0].get("fix_summary"), expected)
+        self.assertIn("in def foo", expected)
+
+    def test_backfill_skips_runs_without_error_signature(self) -> None:
+        run_dir = self._repaired_run(
+            "t-passing",
+            before_log=".... [100%]\n225 deselected in 0.04s\n",
+        )
+        del run_dir
+        results = report.backfill_repair_lessons(self.state_dir)
+        self.assertEqual(results, [])
+        self.assertFalse((self.state_dir / "lessons.jsonl").exists())
 
     def test_non_repaired_and_blocked_runs_are_skipped(self) -> None:
         self._repaired_run("t-ok")
