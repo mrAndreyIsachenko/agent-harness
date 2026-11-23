@@ -47,7 +47,7 @@ from harness.guards import (FORBIDDEN_EGRESS_KEYS, _EDIT_FAILURE_HINT,
                             check_readonly_sql_tool_calls, check_sql_syntax,
                             collect_python_top_symbols, compact_context_window,
                             compact_stale_reads, detect_duplicate_tool_calls,
-                            detect_edit_oscillation,
+                            detect_edit_oscillation, detect_zero_edit_read_stall,
                             estimate_messages_tokens, extract_compact_test_failure,
                             extract_failing_test_excerpts,
                             inject_edit_failure_hints,
@@ -8023,6 +8023,52 @@ class TestTenetRoutingAndCotIntegrity(unittest.TestCase):
         forwarded = captured[1]['messages'][-1]['content']
         self.assertIn('[SLOP GUARD WARNING', forwarded)
         self.assertEqual(proxy.summary()['cot_slop_warnings'], 1)
+
+    def test_detect_zero_edit_read_stall(self):
+        def read(path):
+            return {'role': 'assistant', 'tool_calls': [
+                {'function': {'name': 'read',
+                              'arguments': json.dumps({'filePath': path})}}]}
+
+        def edit(path, old, new):
+            return {'role': 'assistant', 'tool_calls': [
+                {'function': {'name': 'edit',
+                              'arguments': json.dumps({'filePath': path,
+                                                       'oldString': old,
+                                                       'newString': new})}}]}
+
+        self.assertEqual(detect_zero_edit_read_stall([read('a.py')] * 3),
+                         {'read_calls': 3, 'write_edit_calls': 0})
+        self.assertIsNone(detect_zero_edit_read_stall([read('a.py')] * 2))
+        self.assertIsNone(detect_zero_edit_read_stall(
+            [read('a.py')] * 3 + [edit('a.py', 'a', 'b')]))
+
+    def test_proxy_zero_edit_stall_nudge_and_reasoning_clamp(self):
+        upstream, captured = _scripted_upstream([{'status': 200}] * 3)
+        proxy = OpenRouterGuardProxy(lambda: None,
+                                     upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                                     reasoning_max_tokens=1024,
+                                     tracer=HarnessTracer())
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        read_call = {'role': 'assistant', 'tool_calls': [
+            {'function': {'name': 'read',
+                          'arguments': json.dumps({'filePath': 'a.py'})}}]}
+        msgs = [{'role': 'user', 'content': 'do it'}] + [read_call] * 3
+        body = json.dumps({'model': GLM, 'messages': msgs}).encode()
+        try:
+            for _ in range(3):
+                _post_chat(proxy.base_url, body)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
+        self.assertEqual(len(captured), 3)
+        forwarded = json.dumps(captured[-1]['messages'])
+        self.assertIn('[HARNESS FORCE-EDIT DEADLINE:', forwarded)
+        self.assertLessEqual(captured[-1]['reasoning']['max_tokens'], 256)
+        summary = proxy.summary()
+        stall_spans = [s for s in summary['spans']
+                       if s.get('name') == 'guard.zero_edit_stall_nudge']
+        self.assertEqual(len(stall_spans), 1)
 
 
 class TestGroupRollout(HarnessTestCase):

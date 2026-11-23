@@ -716,6 +716,40 @@ export default async function harnessGuardPlugin() {
             if (proc.exitCode !== 0) {
               const stderr = new TextDecoder().decode(proc.stderr || new Uint8Array());
               output.output += `\n[HARNESS IN-LOOP SYNTAX CHECK FAILED]\n${stderr}\nFix this syntax error immediately before finishing.`;
+            } else {
+              // H-86: in-loop undefined-name semantic lint (pure stdlib ast).
+              try {
+                const lintScript = [
+                  'import ast,sys,builtins',
+                  'tree=ast.parse(open(sys.argv[1]).read())',
+                  'for n in ast.walk(tree):',
+                  "    if isinstance(n,ast.ImportFrom) and any(a.name=='*' for a in n.names): sys.exit(0)",
+                  'names=set(dir(builtins))|{"__file__","__name__","__doc__","__package__","__all__","__spec__","__loader__","__cached__","__annotations__"}',
+                  'for n in ast.walk(tree):',
+                  '    if isinstance(n,ast.Name) and isinstance(n.ctx,(ast.Store,ast.Del)): names.add(n.id)',
+                  '    elif isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): names.add(n.name)',
+                  '    elif isinstance(n,(ast.Import,ast.ImportFrom)):',
+                  '        for a in n.names: names.add(a.asname or a.name.split(".")[0])',
+                  '    elif isinstance(n,ast.ExceptHandler) and n.name: names.add(n.name)',
+                  '    elif isinstance(n,ast.arg): names.add(n.arg)',
+                  '    elif isinstance(n,(ast.Global,ast.Nonlocal)): names.update(n.names)',
+                  '    elif isinstance(n,ast.MatchAs) and n.name: names.add(n.name)',
+                  '    elif isinstance(n,ast.MatchStar) and n.name: names.add(n.name)',
+                  '    elif isinstance(n,ast.MatchMapping) and n.rest: names.add(n.rest)',
+                  'undef=[]',
+                  'for n in ast.walk(tree):',
+                  '    if isinstance(n,ast.Name) and isinstance(n.ctx,ast.Load) and n.id not in names:',
+                  "        undef.append('L%d:%s'%(n.lineno,n.id))",
+                  'if undef: print(",".join(sorted(set(undef))))',
+                ].join("\n");
+                const lintProc = Bun.spawnSync(["python3", "-c", lintScript, filePath]);
+                const undefOut = new TextDecoder().decode(lintProc.stdout || new Uint8Array()).trim();
+                if (undefOut) {
+                    output.output += `\n[HARNESS IN-LOOP SEMANTIC LINT] Undefined name(s) detected: ${undefOut} — add the missing import or fix the identifier before finishing.`;
+                  }
+                } catch {
+                  // Lint must never break the tool result.
+                }
             }
           } else {
             try {
@@ -743,6 +777,7 @@ export default async function harnessGuardPlugin() {
                 const lines = text.split("\n");
                 // H-80: exact multi-match disambiguation via indexOf.
                 let exactShown = false;
+                let autoApplied = false;
                 if (multiMatch && oldString.length > 0) {
                   const spans: Array<[number, number]> = [];
                   let pos = 0;
@@ -770,7 +805,74 @@ export default async function harnessGuardPlugin() {
                     exactShown = true;
                   }
                 }
-                if (!exactShown) {
+                // H-85: normalized-indentation auto-apply for failed exact edits.
+                if (!exactShown && !multiMatch && oldString.length > 0) {
+                  const allowed: string[] = __HARNESS_ALLOWED_JSON__;
+                  if (allowed.length === 0 || allowed.includes(filePath)) {
+                    try {
+                      const rawOldLines = oldString.split("\n");
+                      while (rawOldLines.length > 0 && rawOldLines[0].trim().length === 0) rawOldLines.shift();
+                      while (rawOldLines.length > 0 && rawOldLines[rawOldLines.length - 1].trim().length === 0) rawOldLines.pop();
+                      let baseOldIndent = Infinity;
+                      for (const l of rawOldLines) {
+                        if (l.trim().length === 0) continue;
+                        const ind = l.match(/^[ ]*/)![0].length;
+                        if (ind < baseOldIndent) baseOldIndent = ind;
+                      }
+                      const relOldLines: string[] = rawOldLines.map((l: string) =>
+                        l.trim().length === 0 ? "" : l.slice(baseOldIndent).replace(/\s+$/, ""));
+                      if (relOldLines.length >= 1) {
+                        const matches: Array<{ start: number; deltaIndent: number }> = [];
+                        for (let start = 0; start + relOldLines.length <= lines.length; start++) {
+                          for (let deltaIndent = 0; deltaIndent <= 64; deltaIndent++) {
+                            let ok = true;
+                            for (let k = 0; k < relOldLines.length; k++) {
+                              const rel = relOldLines[k];
+                              const cur = lines[start + k];
+                              if (rel === "") {
+                                if (cur.trim().length !== 0) { ok = false; break; }
+                              } else if (cur.replace(/\s+$/, "") !== " ".repeat(deltaIndent) + rel) {
+                                ok = false; break;
+                              }
+                            }
+                            if (ok) { matches.push({ start, deltaIndent }); break; }
+                          }
+                        }
+                        if (matches.length === 1) {
+                          const { start, deltaIndent } = matches[0];
+                          const shift = deltaIndent - baseOldIndent;
+                          const newString = String(input?.args?.newString || input?.args?.new_string || "");
+                          const newLines = newString.split("\n").map((l: string) => {
+                            if (l.trim().length === 0) return "";
+                            if (shift >= 0) return " ".repeat(shift) + l;
+                            return l.slice(Math.min(-shift, l.match(/^[ ]*/)![0].length));
+                          });
+                          const updatedText = lines.slice(0, start)
+                            .concat(newLines, lines.slice(start + relOldLines.length)).join("\n");
+                          await Bun.write(filePath, updatedText);
+                          let valid = false;
+                          if (filePath.endsWith(".json")) {
+                            try { JSON.parse(updatedText); valid = true; } catch {}
+                          } else if (filePath.endsWith(".py")) {
+                            const chk = Bun.spawnSync(["python3", "-m", "py_compile", filePath]);
+                            valid = chk.exitCode === 0;
+                          } else {
+                            valid = true;
+                          }
+                          if (valid) {
+                            output.output = `\n[HARNESS AUTO-APPLIED NORMALIZED EDIT] Automatically aligned indentation and applied edit at lines ${start + 1}-${start + relOldLines.length} in ${filePath}. Do NOT re-issue this edit.`;
+                            autoApplied = true;
+                          } else {
+                            await Bun.write(filePath, text);
+                          }
+                        }
+                      }
+                    } catch {
+                      // Auto-apply must never break the edit-failure hint path.
+                    }
+                  }
+                }
+                if (!exactShown && !autoApplied) {
                   const candidates: number[] = [];
                   for (let i = 0; i < lines.length; i++) {
                     const line = lines[i];
@@ -1561,8 +1663,7 @@ def _lesson_error_signature(failed_test_log: str) -> str:
             continue
         if _LESSON_PROGRESS_RE.match(line):
             continue
-        if (_LESSON_SUMMARY_RE.search(line)
-                and 'failed' not in line.lower() and 'error' not in line.lower()):
+        if _LESSON_SUMMARY_RE.search(line):
             continue
         if line.startswith('E   '):
             e_lines.append(line)

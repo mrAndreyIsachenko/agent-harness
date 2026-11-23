@@ -859,7 +859,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_dataset.add_argument(
         "--mode",
-        choices=("sft", "dpo", "sft-chat", "grpo", "probes"),
+        choices=("sft", "dpo", "sft-chat", "grpo", "probes", "repair-sft"),
         default="sft",
         help="dataset export mode (default: %(default)s)",
     )

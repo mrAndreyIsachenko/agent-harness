@@ -22,6 +22,7 @@ API and are not re-exported.
 from __future__ import annotations
 
 import ast
+import builtins
 import difflib
 import json
 import keyword
@@ -38,6 +39,7 @@ __all__ = [
     "check_allowed_files_syntax",
     "check_cot_and_slop_integrity",
     "check_egress_payload",
+    "check_python_undefined_names",
     "check_readonly_sql_tool_calls",
     "check_sql_syntax",
     "collect_python_top_symbols",
@@ -45,6 +47,7 @@ __all__ = [
     "compact_stale_reads",
     "detect_duplicate_tool_calls",
     "detect_edit_oscillation",
+    "detect_zero_edit_read_stall",
     "extract_failing_test_excerpts",
     "estimate_messages_tokens",
     "extract_compact_test_failure",
@@ -302,6 +305,229 @@ def _sibling_defined_names(tree: ast.Module) -> set[str]:
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             known.add(node.target.id)
     return known
+
+
+#: Names always considered defined in :func:`check_python_undefined_names`.
+_BUILTIN_NAMES: frozenset[str] = frozenset(set(dir(builtins)) | {
+    "__file__", "__name__", "__doc__", "__package__", "__all__",
+    "__spec__", "__loader__", "__cached__", "__annotations__",
+})
+
+class _NameScope:
+    """One lexical scope for :func:`check_python_undefined_names`."""
+
+    __slots__ = ("kind", "names", "parent")
+
+    def __init__(self, kind: str, parent: "_NameScope | None") -> None:
+        self.kind = kind
+        self.parent = parent
+        self.names: set[str] = set()
+
+
+def _is_type_checking_test(test: ast.expr) -> bool:
+    """True for ``if TYPE_CHECKING:`` / ``if typing.TYPE_CHECKING:`` tests."""
+    if isinstance(test, ast.Name):
+        return test.id == "TYPE_CHECKING"
+    if isinstance(test, ast.Attribute):
+        return test.attr == "TYPE_CHECKING"
+    return False
+
+
+def _bind_target_names(target: ast.expr, scope: _NameScope) -> None:
+    """Add every ``Name`` bound by an assignment/for/with target to ``scope``."""
+    for node in ast.walk(target):
+        if isinstance(node, ast.Name):
+            scope.names.add(node.id)
+
+
+def _name_resolves(name: str, scope: _NameScope) -> bool:
+    """Resolve ``name`` against the scope chain, built-ins and module dunder vars.
+
+    Class scopes are not enclosing scopes for nested functions: their bindings
+    are visible only while the class body itself is the current scope.
+    """
+    current: _NameScope | None = scope
+    while current is not None:
+        if current.kind != "class" or current is scope:
+            if name in current.names:
+                return True
+        current = current.parent
+    return name in _BUILTIN_NAMES
+
+
+def check_python_undefined_names(source: str, filename: str = "<input>") -> list[str]:
+    """Pure-stdlib AST analyzer for undefined names (H-86).
+
+    Returns one message per ``ast.Name`` load that is not bound in the current
+    scope, any enclosing function/comprehension scope, the module scope, or
+    the built-ins. Returns ``[]`` on ``SyntaxError`` or when the module uses a
+    ``from ... import *`` import, and ignores ``if TYPE_CHECKING:`` blocks (and
+    all type annotations when ``from __future__ import annotations`` is used).
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(
+            alias.name == "*" for alias in node.names
+        ):
+            return []
+
+    future_annotations = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "__future__"
+        and any(alias.name == "annotations" for alias in node.names)
+        for node in tree.body
+    )
+
+    module_scope = _NameScope("module", None)
+    loads: list[tuple[_NameScope, ast.Name]] = []
+
+    def bind_arguments(args: ast.arguments, scope: _NameScope) -> None:
+        for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs):
+            scope.names.add(arg.arg)
+            if arg.annotation is not None and not future_annotations:
+                visit(arg.annotation, scope)
+        if args.vararg is not None:
+            scope.names.add(args.vararg.arg)
+        if args.kwarg is not None:
+            scope.names.add(args.kwarg.arg)
+
+    def visit(node: ast.AST | None, scope: _NameScope) -> None:
+        if node is None:
+            return
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                scope.names.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "*":
+                    scope.names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Assign):
+            visit(node.value, scope)
+            for target in node.targets:
+                _bind_target_names(target, scope)
+        elif isinstance(node, ast.AnnAssign):
+            visit(node.value, scope)
+            if node.annotation is not None and not future_annotations:
+                visit(node.annotation, scope)
+            _bind_target_names(node.target, scope)
+        elif isinstance(node, ast.AugAssign):
+            visit(node.value, scope)
+            _bind_target_names(node.target, scope)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            visit(node.iter, scope)
+            _bind_target_names(node.target, scope)
+            for stmt in node.body:
+                visit(stmt, scope)
+            for stmt in node.orelse:
+                visit(stmt, scope)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                visit(item.context_expr, scope)
+                if item.optional_vars is not None:
+                    _bind_target_names(item.optional_vars, scope)
+            for stmt in node.body:
+                visit(stmt, scope)
+        elif isinstance(node, ast.ExceptHandler):
+            if node.type is not None:
+                visit(node.type, scope)
+            if node.name:
+                scope.names.add(node.name)
+            for stmt in node.body:
+                visit(stmt, scope)
+        elif isinstance(node, ast.NamedExpr):
+            visit(node.value, scope)
+            scope.names.add(node.target.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            if isinstance(node, ast.Global):
+                module_scope.names.update(node.names)
+            else:
+                current = scope.parent
+                while current is not None and current.kind != "function":
+                    current = current.parent
+                if current is not None:
+                    current.names.update(node.names)
+        elif isinstance(node, ast.Lambda):
+            for default in node.args.defaults:
+                visit(default, scope)
+            for default in node.args.kw_defaults:
+                visit(default, scope)
+            child = _NameScope("function", scope)
+            bind_arguments(node.args, child)
+            visit(node.body, child)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scope.names.add(node.name)
+            for decorator in node.decorator_list:
+                visit(decorator, scope)
+            if node.returns is not None and not future_annotations:
+                visit(node.returns, scope)
+            for default in node.args.defaults:
+                visit(default, scope)
+            for default in node.args.kw_defaults:
+                visit(default, scope)
+            child = _NameScope("function", scope)
+            bind_arguments(node.args, child)
+            for stmt in node.body:
+                visit(stmt, child)
+        elif isinstance(node, ast.ClassDef):
+            scope.names.add(node.name)
+            for decorator in node.decorator_list:
+                visit(decorator, scope)
+            for base in node.bases:
+                visit(base, scope)
+            for kw in node.keywords:
+                visit(kw.value, scope)
+            child = _NameScope("class", scope)
+            for stmt in node.body:
+                visit(stmt, child)
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            child = _NameScope("comprehension", scope)
+            for gen in node.generators:
+                _bind_target_names(gen.target, child)
+                visit(gen.iter, child)
+                for cond in gen.ifs:
+                    visit(cond, child)
+            if isinstance(node, ast.DictComp):
+                visit(node.key, child)
+                visit(node.value, child)
+            else:
+                visit(node.elt, child)
+        elif isinstance(node, ast.If) and _is_type_checking_test(node.test):
+            visit(node.test, scope)
+        elif isinstance(node, ast.MatchAs):
+            visit(node.pattern, scope)
+            if node.name:
+                scope.names.add(node.name)
+        elif isinstance(node, ast.MatchStar):
+            if node.name:
+                scope.names.add(node.name)
+        elif isinstance(node, ast.MatchMapping):
+            for key in node.keys:
+                visit(key, scope)
+            for pattern in node.patterns:
+                visit(pattern, scope)
+            if node.rest:
+                scope.names.add(node.rest)
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load):
+                loads.append((scope, node))
+            else:
+                scope.names.add(node.id)
+        else:
+            for child in ast.iter_child_nodes(node):
+                visit(child, scope)
+
+    for stmt in tree.body:
+        visit(stmt, module_scope)
+
+    return [
+        f"{filename}:L{node.lineno}: undefined name '{node.id}' "
+        "(did you forget an import or mistype an identifier?)"
+        for scope, node in loads
+        if not _name_resolves(node.id, scope)
+    ]
 
 
 def _resolve_importfrom_target(
@@ -594,6 +820,56 @@ def check_sql_syntax(text: str, filename: str = "<sql>") -> list[str]:
         keyword = re.sub(r"\s+", " ", match.group(1).upper())
         errors.append(f"{filename}:{line_of(match.start())}: trailing comma before {keyword}")
     return errors
+
+
+#: Tool names counted as reads by :func:`detect_zero_edit_read_stall`.
+_READ_TOOL_NAMES: frozenset[str] = frozenset({"read", "read_file", "view", "cat"})
+
+#: Tool names counted as writes/edits by :func:`detect_zero_edit_read_stall`.
+_WRITE_EDIT_TOOL_NAMES: frozenset[str] = frozenset(
+    {"edit", "edit_file", "write", "write_file", "multiedit", "patch"}
+)
+
+
+def detect_zero_edit_read_stall(
+    messages: list[dict[str, Any]], *, min_read_turns: int = 3
+) -> dict[str, int] | None:
+    """Detect many read tool calls with zero write/edit tool calls.
+
+    Returns ``{"read_calls": N, "write_edit_calls": 0}`` when at least
+    ``min_read_turns`` read calls and no write/edit calls are present,
+    otherwise ``None``.
+    """
+    read_calls = 0
+    write_edit_calls = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        names: list[Any] = []
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            for call in tool_calls:
+                if isinstance(call, dict):
+                    fn = call.get("function")
+                    if isinstance(fn, dict):
+                        names.append(fn.get("name"))
+                    names.append(call.get("name"))
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    names.append(block.get("name"))
+        for name in names:
+            if not isinstance(name, str):
+                continue
+            normalized = name.strip().lower()
+            if normalized in _WRITE_EDIT_TOOL_NAMES:
+                write_edit_calls += 1
+            elif normalized in _READ_TOOL_NAMES:
+                read_calls += 1
+    if write_edit_calls == 0 and read_calls >= min_read_turns:
+        return {"read_calls": read_calls, "write_edit_calls": 0}
+    return None
 
 
 def _message_text(message: Mapping[str, Any]) -> str:

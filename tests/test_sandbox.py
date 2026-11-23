@@ -278,6 +278,11 @@ class GuardPluginFilesHintTests(unittest.TestCase):
             self.assertIn('[HARNESS READ GUARD]', staged)
             self.assertIn('plugin', cfg)
 
+    def test_render_includes_h85_h86_markers(self):
+        src = render_guard_plugin(allowed_files=[self.main_file])
+        self.assertIn('[HARNESS AUTO-APPLIED NORMALIZED EDIT]', src)
+        self.assertIn('[HARNESS IN-LOOP SEMANTIC LINT]', src)
+
     def test_stage_guard_plugin_forwards_files(self):
         import tempfile
         from pathlib import Path
@@ -285,6 +290,36 @@ class GuardPluginFilesHintTests(unittest.TestCase):
             stage_guard_plugin(td, allowed_files=[self.main_file])
             staged = Path(td) / '.opencode' / 'plugin' / 'harness_guard.ts'
             self.assertIn(self.main_file, staged.read_text())
+
+
+class CheckPythonUndefinedNamesTests(unittest.TestCase):
+    def test_catches_undefined_name_missing_import_and_typo(self):
+        from harness.guards import check_python_undefined_names
+        self.assertTrue(any('os' in msg for msg in check_python_undefined_names('os.path.join("a", "b")\n')))
+        src = 'def f():\n    return re.compile("x")\n'
+        self.assertTrue(any('re' in msg for msg in check_python_undefined_names(src)))
+        src = 'value = 1\nprint(valuee)\n'
+        self.assertTrue(any('valuee' in msg for msg in check_python_undefined_names(src)))
+
+    def test_allows_valid_names(self):
+        from harness.guards import check_python_undefined_names
+        valid = (
+            # local + builtins
+            'def f(x):\n    y = x + 1\n    return len(str(y))\n',
+            # enclosing scope
+            'def outer():\n    a = 1\n    def inner():\n        return a\n    return inner()\n',
+            # plain import + from import
+            'import json\nfrom pathlib import Path\nprint(json.dumps({}), Path("."))\n',
+        )
+        for src in valid:
+            self.assertEqual(check_python_undefined_names(src), [], src)
+
+    def test_ignores_type_checking_and_star_and_future_annotations(self):
+        from harness.guards import check_python_undefined_names
+        src = 'from __future__ import annotations\nfrom typing import TYPE_CHECKING\nif TYPE_CHECKING:\n    from collections import OrderedDict\n\ndef f(x: OrderedDict) -> None:\n    return None\n'
+        self.assertEqual(check_python_undefined_names(src), [])
+        src = 'from os import *\ndef f():\n    return getcwd()\n'
+        self.assertEqual(check_python_undefined_names(src), [])
 
 
 if __name__ == '__main__':

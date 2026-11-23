@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import statistics
 import tempfile
@@ -1235,6 +1236,58 @@ def _is_clean_sft_run(result: dict, messages: list[dict]) -> bool:
     return True
 
 
+def _two_session_evidence(run_dir: Path) -> bool:
+    """Return True when worker.log/requests.json shows two distinct sessions."""
+    for name in ("requests.json", "worker.log"):
+        path = run_dir / name
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        session_ids = set(
+            re.findall(r"session[\"']?\s*[:=]\s*[\"']([A-Za-z0-9_-]+)", text)
+        )
+        if len(session_ids) >= 2:
+            return True
+    return False
+
+
+def _lesson_error_signature(log_text: str) -> str:
+    """Extract an error signature line from a failed test log."""
+    if not log_text:
+        return ""
+    lines = [line.strip() for line in log_text.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        if line.lower().startswith("traceback (most recent call last)"):
+            for candidate in lines[index + 1:]:
+                if candidate.startswith(("E   ", "E:")):
+                    return candidate[4:].strip() or candidate
+            break
+    return lines[-1][:300] if lines else ""
+
+
+def _diff_before_after_files(before_path: Path, after_path: Path) -> str:
+    """Build a textual diff marker from files.before.json -> files.before_repair.json."""
+    try:
+        before = json.loads(before_path.read_text(encoding="utf-8", errors="replace"))
+        after = json.loads(after_path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return ""
+    lines = []
+    for path_key in sorted(set(before) | set(after)):
+        if before.get(path_key) != after.get(path_key):
+            lines.append(f"--- {path_key} (before)\n+++ {path_key} (after)")
+            if path_key in after:
+                lines.append(str(after[path_key]))
+            else:
+                lines.append("(file removed)")
+    return "\n".join(lines)
+
+
 def export_sml_dataset(
     state_dir: str | Path,
     output_path: str | Path | None = None,
@@ -1256,10 +1309,10 @@ def export_sml_dataset(
     guard-intervention marker are filtered out. With ``max_steps``, only runs
     with a positive step count at or below the cap are kept.
     """
-    if mode not in ("sft", "dpo", "sft-chat", "grpo", "probes"):
+    if mode not in ("sft", "dpo", "sft-chat", "grpo", "probes", "repair-sft"):
         raise ValueError(
             f"Unsupported mode: {mode!r}; expected one of "
-            "'sft', 'dpo', 'sft-chat', 'grpo', 'probes'"
+            "'sft', 'dpo', 'sft-chat', 'grpo', 'probes', 'repair-sft'"
         )
 
     records: list[dict] = []
@@ -1271,6 +1324,16 @@ def export_sml_dataset(
             status = str(summary.get("status") or "").lower()
             files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
             prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            if (not files or prompt_value is None) and (run_dir / "task.json").is_file():
+                try:
+                    t_meta = json.loads((run_dir / "task.json").read_text(encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    t_meta = {}
+                if isinstance(t_meta, dict):
+                    if not files:
+                        files = _to_str_list(_first(t_meta, ("origin_files", "files", "allowed_files", "target_files")))
+                    if prompt_value is None:
+                        prompt_value = _first(t_meta, ("prompt", "task_prompt", "instruction", "description"))
             prompt = str(prompt_value) if prompt_value is not None else ""
             patch_path = run_dir / "changes.patch"
             patch = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
@@ -1347,6 +1410,16 @@ def export_sml_dataset(
             status = str(summary.get("status") or "").lower()
             files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
             prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            if (not files or prompt_value is None) and (run_dir / "task.json").is_file():
+                try:
+                    t_meta = json.loads((run_dir / "task.json").read_text(encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    t_meta = {}
+                if isinstance(t_meta, dict):
+                    if not files:
+                        files = _to_str_list(_first(t_meta, ("origin_files", "files", "allowed_files", "target_files")))
+                    if prompt_value is None:
+                        prompt_value = _first(t_meta, ("prompt", "task_prompt", "instruction", "description"))
             prompt = str(prompt_value) if prompt_value is not None else ""
             patch_path = run_dir / "changes.patch"
             patch = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
@@ -1422,6 +1495,16 @@ def export_sml_dataset(
             status = str(summary.get("status") or "").lower()
             files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
             prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            if (not files or prompt_value is None) and (run_dir / "task.json").is_file():
+                try:
+                    t_meta = json.loads((run_dir / "task.json").read_text(encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    t_meta = {}
+                if isinstance(t_meta, dict):
+                    if not files:
+                        files = _to_str_list(_first(t_meta, ("origin_files", "files", "allowed_files", "target_files")))
+                    if prompt_value is None:
+                        prompt_value = _first(t_meta, ("prompt", "task_prompt", "instruction", "description"))
             prompt = str(prompt_value) if prompt_value is not None else ""
             task_id = summary.get("task_id")
             key = task_id if task_id else (tuple(sorted(files)), " ".join(prompt.split()).lower())
@@ -1492,6 +1575,16 @@ def export_sml_dataset(
             status = str(summary.get("status") or "").lower()
             files = _to_str_list(_first(result, ("files", "allowed_files", "target_files")))
             prompt_value = _first(result, ("prompt", "task_prompt", "instruction", "description"))
+            if (not files or prompt_value is None) and (run_dir / "task.json").is_file():
+                try:
+                    t_meta = json.loads((run_dir / "task.json").read_text(encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    t_meta = {}
+                if isinstance(t_meta, dict):
+                    if not files:
+                        files = _to_str_list(_first(t_meta, ("origin_files", "files", "allowed_files", "target_files")))
+                    if prompt_value is None:
+                        prompt_value = _first(t_meta, ("prompt", "task_prompt", "instruction", "description"))
             prompt = str(prompt_value) if prompt_value is not None else ""
             patch_path = run_dir / "changes.patch"
             patch = patch_path.read_text(encoding="utf-8", errors="replace") if patch_path.is_file() else ""
@@ -1538,6 +1631,57 @@ def export_sml_dataset(
                     messages = _load_run_messages(Path(entry["run_dir"]))
                     if not _is_clean_sft_run(entry["result"], messages):
                         is_chosen = False
+                if is_chosen and (
+                    entry["result"].get("micro_repair_attempted") is True
+                    or entry["result"].get("repaired") is True
+                ):
+                    run_dir_p = Path(entry["run_dir"])
+                    result_p = entry["result"]
+                    has_patch = bool(entry["patch"].strip())
+                    before_patch_path = run_dir_p / "before_repair.patch"
+                    pre_evidence = (
+                        (run_dir_p / "test_before_repair.log").is_file()
+                        or before_patch_path.is_file()
+                        or (run_dir_p / "files.before_repair.json").is_file()
+                        or (
+                            (run_dir_p / "files.before.json").is_file()
+                            and (run_dir_p / "files.latest.json").is_file()
+                        )
+                        or bool(result_p.get("micro_repair_session_id"))
+                        or _two_session_evidence(run_dir_p)
+                    )
+                    if has_patch and pre_evidence:
+                        rejected_patch = ""
+                        if before_patch_path.is_file():
+                            rejected_patch = before_patch_path.read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        elif (
+                            (run_dir_p / "files.before.json").is_file()
+                            and (run_dir_p / "files.before_repair.json").is_file()
+                        ):
+                            rejected_patch = _diff_before_after_files(
+                                run_dir_p / "files.before.json",
+                                run_dir_p / "files.before_repair.json",
+                            )
+                        failed_log = ""
+                        if (run_dir_p / "test_before_repair.log").is_file():
+                            failed_log = (run_dir_p / "test_before_repair.log").read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        records.append({
+                            "task_id": entry.get("task_id"),
+                            "prompt": entry["prompt"],
+                            "chosen_patch": entry["patch"],
+                            "rejected_patch": rejected_patch,
+                            "rejected_reason": entry["reason"] or "micro_repair_triggered",
+                            "failed_test_log": failed_log,
+                            "chosen_model": entry["model"],
+                            "rejected_model": entry["model"],
+                            "chosen_run_id": entry["run_id"],
+                            "rejected_run_id": entry["run_id"],
+                            "pair_source": "intra_run_micro_repair",
+                        })
                 if is_rejected:
                     pending_rejected = entry
                     continue
@@ -1553,7 +1697,124 @@ def export_sml_dataset(
                         "rejected_reason": rejected["reason"],
                         "chosen_run_id": entry["run_id"],
                         "rejected_run_id": rejected["run_id"],
+                        "pair_source": "cross_run_retry",
                     })
+        dataset = records
+    elif mode == "repair-sft":
+        if True:
+            run_records = list(_iter_run_records(state_dir))
+            prior_failed_logs: dict[str, str] = {}
+            for run_dir, result in run_records:
+                summary = summarize_run(
+                    result, _load_proxy_summary(run_dir / "requests.json")
+                )
+                status = str(summary.get("status") or "").lower()
+                if summary.get("passed") is True or status in PASS_STATUSES:
+                    continue
+                task_id_f = summary.get("task_id")
+                if task_id_f is None:
+                    continue
+                reason = str(
+                    _first(
+                        result,
+                        ("reason", "blocked_reason", "error_reason", "failure_reason"),
+                    )
+                    or ""
+                ).strip().lower()
+                log_text = ""
+                if (run_dir / "test.log").is_file():
+                    log_text = (run_dir / "test.log").read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                if log_text or reason == "validation_failed":
+                    prior_failed_logs.setdefault(str(task_id_f), log_text)
+
+            for run_dir, result in run_records:
+                summary = summarize_run(
+                    result, _load_proxy_summary(run_dir / "requests.json")
+                )
+                run_id = _first(result, ("run_id", "runId", "id")) or run_dir.name
+                task_id = summary.get("task_id")
+                status = str(summary.get("status") or "").lower()
+                passed = summary.get("passed") is True or status in PASS_STATUSES
+                if not passed:
+                    continue
+                steps = summary.get("steps", 0)
+                if max_steps is not None and (steps <= 0 or steps > max_steps):
+                    continue
+                if clean_only and not _is_clean_sft_run(
+                    result, _load_run_messages(run_dir)
+                ):
+                    continue
+                repaired = (
+                    result.get("micro_repair_attempted") is True
+                    or result.get("repaired") is True
+                    or (task_id is not None and str(task_id) in prior_failed_logs)
+                )
+                if not repaired:
+                    continue
+                patch_path = run_dir / "changes.patch"
+                patch = (
+                    patch_path.read_text(encoding="utf-8", errors="replace")
+                    if patch_path.is_file()
+                    else ""
+                )
+                if not patch.strip():
+                    continue
+                if (run_dir / "test_before_repair.log").is_file():
+                    failed_test_log = (run_dir / "test_before_repair.log").read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                else:
+                    failed_test_log = (
+                        prior_failed_logs.get(str(task_id), "")
+                        if task_id is not None
+                        else ""
+                    )
+                error_signature = (
+                    _lesson_error_signature(failed_test_log)
+                    if failed_test_log
+                    else ""
+                )
+                files = _to_str_list(
+                    _first(result, ("files", "allowed_files", "target_files"))
+                )
+                task_dir = _first(result, ("origin_directory", "task_dir", "directory"))
+                prompt_value = _first(
+                    result, ("prompt", "task_prompt", "instruction", "description")
+                )
+                if (not task_dir or not files or prompt_value is None) and (run_dir / "task.json").is_file():
+                    try:
+                        task_json = json.loads(
+                            (run_dir / "task.json").read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        )
+                    except (OSError, ValueError):
+                        task_json = {}
+                    if isinstance(task_json, dict):
+                        if not task_dir:
+                            task_dir = _first(task_json, ("origin_directory", "directory", "task_dir"))
+                        if not files:
+                            files = _to_str_list(_first(task_json, ("origin_files", "files", "allowed_files", "target_files")))
+                        if prompt_value is None:
+                            prompt_value = _first(task_json, ("prompt", "task_prompt", "instruction", "description"))
+                if not files and isinstance(result.get("hashes_after"), dict):
+                    files = [str(k) for k in result["hashes_after"].keys()]
+                prompt = str(prompt_value) if prompt_value is not None else ""
+                project_id, _ = resolve_project_identity(task_dir, files)
+                records.append({
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "project_id": project_id,
+                    "model": summary.get("model"),
+                    "prompt": prompt,
+                    "failed_test_log": failed_test_log,
+                    "error_signature": error_signature,
+                    "repair_patch": patch,
+                    "messages": _load_run_messages(run_dir),
+                })
+            dataset = records
         dataset = records
 
     if output_path is not None:

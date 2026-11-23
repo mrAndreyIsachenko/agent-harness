@@ -31,6 +31,7 @@ from .guards import (
     compact_stale_reads,
     detect_duplicate_tool_calls,
     detect_edit_oscillation,
+    detect_zero_edit_read_stall,
     enforce_context_budget,
     inject_edit_failure_hints,
     inject_read_guard_hints,
@@ -394,6 +395,7 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                                                                'guardrail.triggered': True,
                                                                'guardrail.errors': '; '.join(sql_errors),
                                                                'harness.turn_index': turn_index})
+            effective_reasoning_max_tokens = self.server.reasoning_max_tokens
             if turn_index >= 2:
                 syntax_errors = (check_allowed_files_syntax(self.server.allowed_files,
                                                             baseline_symbols=self.server.baseline_symbols)
@@ -440,6 +442,19 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                                                                'guardrail.file': osc['file'],
                                                                'guardrail.reason': osc['reason'],
                                                                'harness.turn_index': turn_index})
+            # H-87: zero-edit read-stall force-edit deadline nudge.
+            if turn_index >= 3 and isinstance(messages, list):
+                if stall := detect_zero_edit_read_stall(messages, min_read_turns=3):
+                    notices.append(
+                        f"[HARNESS FORCE-EDIT DEADLINE: {stall['read_calls']} reads completed "
+                        f"with 0 edits. Stop reading and apply your best edit NOW.]")
+                    self.server.tracer.record_span('guard.zero_edit_stall_nudge', kind='GUARDRAIL',
+                                                   attributes={'guardrail.name': 'zero_edit_stall_nudge',
+                                                               'guardrail.triggered': True,
+                                                               'harness.read_calls': stall['read_calls'],
+                                                               'harness.turn_index': turn_index})
+                    effective_reasoning_max_tokens = min(
+                        int(self.server.reasoning_max_tokens or 256), 256)
             if notices and messages:
                 last = messages[-1]
                 if isinstance(last, dict):
@@ -558,7 +573,7 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
                 sticky_snapshot = self.server.sticky_provider
             body = apply_provider_routing(body, self.path, default_model=self.server.default_model,
                                           turn_index=turn_index,
-                                          reasoning_max_tokens=self.server.reasoning_max_tokens,
+                                          reasoning_max_tokens=effective_reasoning_max_tokens,
                                           degraded_providers=degraded_snapshot,
                                           sticky_provider=sticky_snapshot,
                                           upstream_mode=self.server.upstream_mode,

@@ -425,13 +425,14 @@ $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
 $ harness trace --sync-state state/                 # backfill runs to Phoenix OTLP (H-20)
 $ harness rollout task.json --group-size 4          # group rollouts for GRPO / rejection sampling (H-73)
 $ harness export-dataset --state-dir state/ --mode sft --clean-only --max-steps 6 --output sft.jsonl
+$ harness export-dataset --state-dir state/ --mode repair-sft --output repair_sft.jsonl   # Tenet self-repair SFT (H-88)
 $ harness stats --state-dir state/ --insights --days 7   # 7-day rolling window & funnel (H-77)
 $ harness pod preflight --pods root@gpu-1:22             # cloud GPU pod SSH orchestration (H-78)
 $ harness herdr status --state-dir state/                # Herdr multiplexer dashboard & actions (H-78)
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-84
+## Capabilities H-15 .. H-88
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -490,6 +491,10 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-82** | Retroactive workspace lessons backfill (`backfill_repair_lessons`, `harness stats --backfill-lessons [--dry-run]`) scanning historical `micro_repair` runs | `report.py`, `cli.py`, `__init__.py` |
 | **H-83** | High-signal actionable workspace lessons: pytest noise/progress filter in `_lesson_error_signature`, `/.worktrees/` path normalization + relative-file matching, `changes.patch` `-> Fix:` summary (`_extract_patch_fix_summary`), and `rc=4` renamed-nodeid fallback in `micro_repair` | `sandbox.py`, `report.py` |
 | **H-84** | Project- & submodule-aware workspace identity (`resolve_project_identity`) isolating Work monorepos (`medvidi/analytics-gitops`, `medvidi/analytics-airflow-app` with `ai/serving`, `ai/local_copilot`, `airflow/dags` submodule tiers), Personal repos (`personal/harness`, `personal/herdr`), and `Small Model Lab` / `Tenet` (`personal/small-model-lab`) across `load_workspace_lessons` and `build_repo_memory_hint` | `sandbox.py`, `report.py` |
+| **H-85** | Cursor/Aider-style in-loop indentation-normalized auto-apply for `Could not find oldString` edit failures in `harness_guard.ts` with `py_compile`/`JSON.parse` validation and automatic rollback on syntax error (`render_guard_plugin`) | `sandbox.py` |
+| **H-86** | Claude Code / OpenHands-style in-loop stdlib `ast` undefined-name semantic linter (`check_python_undefined_names` + `[HARNESS IN-LOOP SEMANTIC LINT]` after `py_compile` in `harness_guard.ts`) | `guards.py`, `sandbox.py` |
+| **H-87** | OpenHands / SWE-RL mid-run zero-edit read-stall nudge (`detect_zero_edit_read_stall`, `[HARNESS FORCE-EDIT DEADLINE]`, `guard.zero_edit_stall_nudge` span, and `reasoning_max_tokens <= 256` clamp on `turn_index >= 3`) | `guards.py`, `proxy.py` |
+| **H-88** | Qwen3-Coder / SWE-Gym intra-run `micro_repair` DPO (`pair_source="intra_run_micro_repair"` vs `"cross_run_retry"`) and `repair-sft` dataset export (`harness export-dataset --mode repair-sft`) for `Tenet` self-repair training | `report.py`, `cli.py` |
 
 ## Quickstart
 

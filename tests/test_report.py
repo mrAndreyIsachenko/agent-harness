@@ -584,5 +584,112 @@ class ProjectIdentityTest(unittest.TestCase):
         self.assertIn("subprojects", results[0])
 
 
+class ExportDatasetModesTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name) / "state"
+        (self.state_dir / "runs").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run_dir(self, name: str) -> Path:
+        run_dir = self.state_dir / "runs" / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return run_dir
+
+    def test_dpo_intra_run_micro_repair_pair(self) -> None:
+        run_dir = self._run_dir("t1-pass")
+        (run_dir / "result.json").write_text(json.dumps({
+            "task_id": "t1",
+            "status": "validation_passed_review_required",
+            "micro_repair_attempted": True,
+            "model": "m1",
+            "prompt": "fix the bug",
+        }), encoding="utf-8")
+        (run_dir / "changes.patch").write_text("+fixed\n", encoding="utf-8")
+        (run_dir / "test_before_repair.log").write_text(
+            "E   TypeError: bad\n", encoding="utf-8")
+        records = report.export_sml_dataset(self.state_dir, mode="dpo")
+        intra = [r for r in records if r.get("pair_source") == "intra_run_micro_repair"]
+        self.assertEqual(len(intra), 1)
+        self.assertEqual(intra[0]["chosen_patch"], "+fixed\n")
+        self.assertEqual(intra[0]["rejected_reason"], "micro_repair_triggered")
+        self.assertIn("TypeError: bad", intra[0]["failed_test_log"])
+        self.assertEqual(intra[0]["chosen_run_id"], intra[0]["rejected_run_id"])
+
+    def test_dpo_cross_run_retry_pair(self) -> None:
+        blocked = self._run_dir("t2-blocked")
+        (blocked / "result.json").write_text(json.dumps({
+            "task_id": "t2", "status": "blocked",
+            "reason": "validation_failed", "model": "m0",
+        }), encoding="utf-8")
+        (blocked / "changes.patch").write_text("-wrong\n", encoding="utf-8")
+        chosen = self._run_dir("t2-chosen")
+        (chosen / "result.json").write_text(json.dumps({
+            "task_id": "t2", "status": "succeeded", "model": "m1",
+        }), encoding="utf-8")
+        (chosen / "changes.patch").write_text("+right\n", encoding="utf-8")
+        records = report.export_sml_dataset(self.state_dir, mode="dpo")
+        cross = [r for r in records if r.get("pair_source") == "cross_run_retry"]
+        self.assertEqual(len(cross), 1)
+        self.assertEqual(cross[0]["rejected_patch"], "-wrong\n")
+        self.assertEqual(cross[0]["chosen_patch"], "+right\n")
+        self.assertEqual(cross[0]["rejected_reason"], "validation_failed")
+
+    def test_repair_sft_records(self) -> None:
+        task_dir = Path(self._tmp.name) / "repo"
+        task_dir.mkdir()
+        run_dir = self._run_dir("t3-repaired")
+        (run_dir / "result.json").write_text(json.dumps({
+            "task_id": "t3",
+            "status": "validation_passed_review_required",
+            "repaired": True,
+            "model": "m1",
+            "prompt": "repair the test",
+            "task_dir": str(task_dir),
+            "files": [str(task_dir / "a.py")],
+        }), encoding="utf-8")
+        (run_dir / "changes.patch").write_text("+repair\n", encoding="utf-8")
+        (run_dir / "test_before_repair.log").write_text(
+            "E   ValueError: broken\n", encoding="utf-8")
+        records = report.export_sml_dataset(self.state_dir, mode="repair-sft")
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record["task_id"], "t3")
+        self.assertEqual(record["run_id"], "t3-repaired")
+        self.assertEqual(record["project_id"], str(task_dir.resolve()))
+        self.assertEqual(record["model"], "m1")
+        self.assertEqual(record["prompt"], "repair the test")
+        self.assertIn("ValueError: broken", record["failed_test_log"])
+        self.assertTrue(record["error_signature"])
+        self.assertEqual(record["repair_patch"], "+repair\n")
+        self.assertEqual(record["messages"], [])
+
+    def test_repair_sft_uses_prior_failed_log(self) -> None:
+        task_dir = Path(self._tmp.name) / "repo2"
+        task_dir.mkdir()
+        failed = self._run_dir("t4-failed")
+        (failed / "result.json").write_text(json.dumps({
+            "task_id": "t4", "status": "blocked", "reason": "validation_failed",
+        }), encoding="utf-8")
+        (failed / "test.log").write_text(
+            "E   KeyError: missing\n", encoding="utf-8")
+        chosen = self._run_dir("t4-chosen")
+        (chosen / "result.json").write_text(json.dumps({
+            "task_id": "t4", "status": "succeeded", "model": "m2",
+            "prompt": "fix it", "task_dir": str(task_dir),
+        }), encoding="utf-8")
+        (chosen / "changes.patch").write_text("+fix\n", encoding="utf-8")
+        records = report.export_sml_dataset(self.state_dir, mode="repair-sft")
+        self.assertEqual(len(records), 1)
+        self.assertIn("KeyError: missing", records[0]["failed_test_log"])
+        self.assertEqual(records[0]["repair_patch"], "+fix\n")
+
+    def test_unsupported_mode_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            report.export_sml_dataset(self.state_dir, mode="bogus")
+
+
 if __name__ == "__main__":
     unittest.main()
