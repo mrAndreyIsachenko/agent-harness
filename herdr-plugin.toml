@@ -1,0 +1,30 @@
+id = "harness.mission-control"
+name = "Agent Harness Mission Control"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Native Herdr integration for Agent Harness: live stats, task funnel insights, trace trees, and worker telemetry."
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "stats"
+title = "Harness Stats & Funnel"
+placement = "overlay"
+command = ["harness", "stats", "--insights"]
+
+[[panes]]
+id = "trace"
+title = "Harness Latest Trace"
+placement = "overlay"
+command = ["harness", "trace", "--no-sync"]
+
+[[actions]]
+id = "stats-insights"
+title = "Harness: Stats & Funnel Insights"
+contexts = ["workspace"]
+command = ["harness", "stats", "--insights"]
+
+[[actions]]
+id = "latest-trace"
+title = "Harness: Inspect Latest Trace Tree"
+contexts = ["workspace"]
+command = ["harness", "trace", "--no-sync"]

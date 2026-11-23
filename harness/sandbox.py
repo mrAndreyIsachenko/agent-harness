@@ -29,9 +29,12 @@ import urllib.request
 import uuid
 from collections import Counter
 from contextlib import ExitStack, contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .telemetry import sync_state_traces_to_phoenix, synthesize_spans_from_run_dir
+
+from .herdr import report_herdr_task
 
 from .finops import (
     DB,
@@ -661,9 +664,137 @@ def check_patch(task):
     if git('--check').returncode:
         raise GuardError('patch_does_not_apply_cleanly')
 
-def config_for(task, *, base_url=None):
+def render_guard_plugin() -> str:
+    """Render the in-loop TypeScript guard plugin injected into OpenCode runs."""
+    return r'''// Harness in-loop guard plugin (auto-generated; do not edit by hand).
+// Provides immediate syntax checks after write-like tools and targeted
+// recovery hints after failed edit calls.
+export default async function harnessGuardPlugin() {
+  return {
+    "tool.execute.after": async (input: any, output: any) => {
+      try {
+        const tool = String(input?.tool || "");
+        const filePath = String(input?.args?.filePath || input?.args?.file_path || input?.args?.path || "");
+
+        // (a) Immediate syntax check for .py and .json targets.
+        if (["edit", "write", "multiedit", "patch"].includes(tool)
+            && (filePath.endsWith(".py") || filePath.endsWith(".json"))) {
+          if (filePath.endsWith(".py")) {
+            const proc = Bun.spawnSync(["python3", "-m", "py_compile", filePath]);
+            if (proc.exitCode !== 0) {
+              const stderr = new TextDecoder().decode(proc.stderr || new Uint8Array());
+              output.output += `\n[HARNESS IN-LOOP SYNTAX CHECK FAILED]\n${stderr}\nFix this syntax error immediately before finishing.`;
+            }
+          } else {
+            try {
+              JSON.parse(await Bun.file(filePath).text());
+            } catch (err: any) {
+              const errMsg = String(err?.message || err);
+              output.output += `\n[HARNESS IN-LOOP JSON CHECK FAILED]\n${errMsg}\nFix this invalid JSON immediately.`;
+            }
+          }
+        }
+
+        // (b) Targeted context hint after a failed edit call.
+        if (tool === "edit") {
+          const out = String(output?.output || "");
+          const failed = out.includes("Could not find oldString")
+            || (out.includes("Found ") && out.includes(" matches"));
+          if (failed) {
+            const oldString = String(input?.args?.oldString || input?.args?.old_string || "");
+            const needle = oldString.split("\n").map((l: string) => l.trim())
+              .find((l: string) => l.length > 0) || "";
+            if (needle) {
+              try {
+                const text = await Bun.file(filePath).text();
+                const lines = text.split("\n");
+                const candidates: number[] = [];
+                for (let i = 0; i < lines.length; i++) {
+                  const line = lines[i];
+                  if (line.trim() === needle || line.includes(needle)) {
+                    candidates.push(i + 1);
+                    if (candidates.length >= 3) break;
+                  }
+                }
+                if (candidates.length > 0) {
+                  const parts: string[] = ["", `[HARNESS EDIT HINT] ${needle ? "near-matching lines" : "matches"} for: ${needle}`];
+                  for (const n of candidates) {
+                    const start = Math.max(1, n - 5);
+                    const end = Math.min(lines.length, n + 5);
+                    parts.push(`--- lines ${start}-${end} (match at line ${n}) ---`);
+                    for (let i = start; i <= end; i++) {
+                      parts.push(`${i}: ${lines[i - 1]}`);
+                    }
+                  }
+                  output.output += "\n" + parts.join("\n");
+                } else {
+                  output.output += `\n[HARNESS EDIT HINT] No matching or near-matching line found for: ${needle}\nCheck the target file path and exact whitespace/punctuation.`;
+                }
+              } catch {
+                // File unreadable; leave the failure message untouched.
+              }
+            }
+          }
+        }
+      } catch {
+        // Never let the guard plugin itself break a tool result.
+      }
+      return output;
+    },
+  };
+}
+'''
+
+
+def sandbox_root_for(run_dir) -> Path:
+    """Short per-run isolation root under /tmp (keeps AF_UNIX socket paths < 104 bytes)."""
+    return Path('/tmp') / f"hb-{hashlib.sha1(str(run_dir).encode('utf-8')).hexdigest()[:12]}"
+
+
+def stage_isolation_sandbox(run_dir) -> dict:
+    """Create tmp/python-user/npm-global dirs and return env overrides pointing at them."""
+    sb = sandbox_root_for(run_dir)
+    for sub in ('tmp', 'python-user', 'npm-global'):
+        (sb / sub).mkdir(parents=True, exist_ok=True)
+    return {'TMPDIR': str(sb / 'tmp'), 'PYTHONUSERBASE': str(sb / 'python-user'),
+            'NPM_CONFIG_PREFIX': str(sb / 'npm-global')}
+
+
+def cleanup_isolation_sandbox(run_dir) -> None:
+    shutil.rmtree(sandbox_root_for(run_dir), ignore_errors=True)
+
+
+def stage_guard_plugin(run_dir) -> Path:
+    """Stage the rendered guard plugin under run_dir and return its path."""
+    path = Path(run_dir) / '.opencode' / 'plugin' / 'harness_guard.ts'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_guard_plugin(), encoding='utf-8')
+    return path
+
+
+def config_for(task, *, base_url=None, run_dir=None):
     permissions = [{'action': '*', 'resource': '*', 'effect': 'deny'},
-                   {'action': 'external_directory', 'resource': '*', 'effect': 'allow'}]
+                   {'action': 'external_directory', 'resource': '*', 'effect': 'allow'},
+                   {'action': 'read', 'resource': '/tmp/hb-*/**', 'effect': 'allow'}]
+    task_dir = task['directory']
+    # Allow reads across the task directory (bounded by sensitive-path denies below).
+    permissions += [{'action': 'read', 'resource': task_dir, 'effect': 'allow'},
+                    {'action': 'read', 'resource': f'{task_dir}/**', 'effect': 'allow'}]
+    # Deny secrets and credentials under the task directory (last matching rule wins).
+    sensitive_patterns = ('.env', '.env.*', '*.pem', '*.key', '*credentials*', '*secret*')
+    permissions += [{'action': action,
+                     'resource': pattern,
+                     'effect': 'deny'}
+                    for p in sensitive_patterns
+                    for pattern in (f'{task_dir}/{p}', f'{task_dir}/**/{p}')
+                    for action in ('read', 'edit')]
+    # Re-allow safe env templates that would otherwise match the deny patterns.
+    safe_env_patterns = ('.env.example', '.env.sample', '.env.template')
+    permissions += [{'action': 'read',
+                     'resource': pattern,
+                     'effect': 'allow'}
+                    for p in safe_env_patterns
+                    for pattern in (f'{task_dir}/{p}', f'{task_dir}/**/{p}')]
     actions = ('read',) if task['mode'] == 'patch' else ('read', 'edit')
     permissions += [{'action': action, 'resource': path, 'effect': 'allow'}
                     for path in task['files'] for action in actions]
@@ -675,11 +806,14 @@ def config_for(task, *, base_url=None):
                     for path in task.get('read_only_file_aliases', ())]
     if task['mode'] == 'patch':
         permissions += [{'action': a, 'resource': task['patch_file'], 'effect': 'allow'} for a in ('read', 'edit')]
-    cfg = {'model': task['model'], 'small_model': task['model'],
+    cfg = {'model': task['model'], 'small_model': task['model'], 'snapshot': False,
            'agents': {'guarded_worker': {'description': 'Scoped bounded coding worker',
            'mode': 'primary', 'steps': task['max_steps'], 'permissions': permissions}}}
     if base_url:
         cfg['providers'] = {'openrouter': {'settings': {'baseURL': base_url}}}
+    if run_dir is not None:
+        plugin_path = stage_guard_plugin(Path(run_dir))
+        cfg['plugin'] = list(cfg.get('plugin', [])) + [plugin_path.resolve().as_uri()]
     return cfg
 
 def verify_permissions(payload, task):
@@ -723,10 +857,25 @@ def stop_group(proc):
                 pass
     proc.wait(timeout=5)
 
-@contextmanager
-def owned_process(argv, directory, log):
+def _count_guard_hits(proxy_summary):
+    """Count guard interventions from a proxy summary for herdr reporting."""
+    summary = proxy_summary or {}
+    return (int(summary.get('compacted_reads', 0))
+            + int(summary.get('edit_hints_injected', 0))
+            + int(summary.get('cot_slop_warnings', 0))
+            + int(summary.get('blocked_count', 0)))
+
+def worker_env(directory, *, env_overrides=None):
     # OpenCode run uses PWD for the session location, even when cwd is correct.
-    proc = subprocess.Popen(argv, cwd=directory, env=dict(os.environ, PWD=str(directory)),
+    env = dict(os.environ, PWD=str(directory))
+    env.setdefault('OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX', '64000')
+    if env_overrides:
+        env.update(env_overrides)
+    return env
+
+@contextmanager
+def owned_process(argv, directory, log, *, env_overrides=None):
+    proc = subprocess.Popen(argv, cwd=directory, env=worker_env(directory, env_overrides=env_overrides),
                             stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
     try:
         yield proc
@@ -755,7 +904,7 @@ def preflight(cli, task, run_dir, *, base_url=None):
     executable_argv([str(cli)])
     if task.get('mode', 'model') == 'model':
         task['test_argv'] = resolve_pytest_test_argv(task['test_argv'], task['directory'])
-    private_write(run_dir / 'opencode.jsonc', config_for(task, base_url=base_url))
+    private_write(run_dir / 'opencode.jsonc', config_for(task, base_url=base_url, run_dir=run_dir))
     path = run_dir / 'config-check.log'
     rc = execute([str(cli), 'api', '--standalone', 'GET', '/api/agent'], run_dir, 30, path)
     if rc:
@@ -823,8 +972,10 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
     if started_ref is not None:
         started_ref[0] = started
     naturally_exited = False
+    last_reported_step = -1
+    isolation_env = stage_isolation_sandbox(run_dir)
     try:
-        with private_log(run_dir / 'worker.log') as log, owned_process(argv, run_dir, log) as proc:
+        with private_log(run_dir / 'worker.log') as log, owned_process(argv, run_dir, log, env_overrides=isolation_env) as proc:
             while True:
                 elapsed = time.monotonic() - started
                 if elapsed >= task['timeout_seconds']:
@@ -838,6 +989,20 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
                     capture_requests(run_dir, sid, snap, proxy_summary)
                     m = metrics(snap)
                     result.update(steps=m['steps'], observed_cost=m['cost'])
+                    if m['steps'] != last_reported_step:
+                        last_reported_step = m['steps']
+                        try:
+                            private_write(run_dir / 'result.json', result)
+                        except Exception:
+                            pass
+                        try:
+                            report_herdr_task(task['task_id'], 'working', model=task.get('model'),
+                                              step=m['steps'], max_steps=task['max_steps'],
+                                              cost=m['cost'], budget=budget,
+                                              guard_hits=_count_guard_hits(proxy_summary),
+                                              session_id=sid)
+                        except Exception:
+                            pass
                     if proxy is not None and proxy.blocked_reason:
                         raise GuardError(proxy.blocked_reason)
                     reason = violation(m, budget, task['max_steps'])
@@ -890,6 +1055,7 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
             result['cost'] = None
         finally:
             clear_session_busy(db, sid, outcome='succeeded' if (naturally_exited and proc.returncode == 0) else 'failed')
+        cleanup_isolation_sandbox(run_dir)
 
 def file_hashes(files):
     return {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() if Path(p).exists() else None for p in files}
@@ -1276,6 +1442,134 @@ def should_auto_escalate(raw_task: dict) -> bool:
     return os.environ.get('HARNESS_AUTO_ESCALATE', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
+_LESSON_ERROR_MARKERS = ('AssertionError', 'ImportError', 'SyntaxError', 'TypeError')
+
+
+def _lesson_error_signature(failed_test_log: str) -> str:
+    """First concise error line from a failing test log, truncated to 160 chars."""
+    lines = [line.strip() for line in (failed_test_log or '').splitlines()]
+    for line in lines:
+        if not line:
+            continue
+        if line.startswith('E   ') or any(marker in line for marker in _LESSON_ERROR_MARKERS):
+            return line[:160]
+    for line in lines:
+        if line:
+            return line[:160]
+    return ''
+
+
+def _norm_lesson_path(value) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+    try:
+        return str(Path(text).resolve())
+    except OSError:
+        return text
+
+
+def record_repair_lesson(state_dir, task, failed_test_log, repaired_files) -> None:
+    """H-76: append a compact repair lesson to ``lessons.jsonl`` (deduplicated).
+
+    Skips writing when an identical ``(task_dir, error_signature)`` pair is
+    already recorded.
+    """
+    state = Path(state_dir)
+    task_dir = str(task.get('task_dir') or task.get('directory') or '')
+    base = Path(task_dir) if task_dir else None
+    files: list[str] = []
+    for item in (repaired_files or []):
+        p = Path(str(item))
+        rel = str(item)
+        if base is not None:
+            try:
+                rel = str(p.resolve().relative_to(Path(base).resolve()))
+            except (OSError, ValueError):
+                rel = str(item)
+        files.append(rel)
+    signature = _lesson_error_signature(failed_test_log)
+    lessons_path = state / 'lessons.jsonl'
+    if lessons_path.is_file():
+        for line in lessons_path.read_text(encoding='utf-8', errors='replace').splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(rec, dict)
+                    and str(rec.get('task_dir') or '') == task_dir
+                    and str(rec.get('error_signature') or '') == signature):
+                return
+    record = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'task_id': task.get('task_id', ''),
+        'task_dir': task_dir,
+        'files': files,
+        'error_signature': signature,
+        'model': task.get('model'),
+    }
+    with lessons_path.open('a', encoding='utf-8') as fh:
+        fh.write(json.dumps(record) + '\n')
+
+
+def load_workspace_lessons(state_dir, task_dir, files=None, max_items=3, max_chars=600) -> str:
+    """H-76: compact guardrail block from prior repair lessons for this workspace.
+
+    Filters lessons by ``task_dir`` (normalizing paths), prioritizes recent
+    lessons that share any file in ``files``, deduplicates by
+    ``error_signature``, and caps the block at ``max_items`` entries /
+    ``max_chars`` characters. Returns ``''`` when no lessons match.
+    """
+    lessons_path = Path(state_dir) / 'lessons.jsonl'
+    want_dir = _norm_lesson_path(task_dir)
+    if not lessons_path.is_file() or not want_dir:
+        return ''
+    file_set = {_norm_lesson_path(f) for f in (files or []) if str(f).strip()}
+    matched: list[tuple[bool, dict]] = []
+    lines = [line for line in lessons_path.read_text(encoding='utf-8', errors='replace').splitlines()
+             if line.strip()]
+    for line in reversed(lines):  # most recent first; file matches get priority below
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if _norm_lesson_path(rec.get('task_dir')) != want_dir:
+            continue
+        rec_files = set()
+        for f in (rec.get('files') or []):
+            fp = Path(str(f))
+            resolved_f = fp if fp.is_absolute() else (Path(want_dir) / fp)
+            rec_files.add(_norm_lesson_path(resolved_f))
+        matched.append((bool(rec_files & file_set) if file_set else False, rec))
+    if not matched:
+        return ''
+    matched.sort(key=lambda item: 0 if item[0] else 1)  # stable: file matches first
+    header = '### Workspace Guardrails (from prior repairs)'
+    out_lines: list[str] = []
+    seen_signatures: set[str] = set()
+    total_chars = len(header)
+    for _, rec in matched:
+        if len(out_lines) >= max_items:
+            break
+        signature = str(rec.get('error_signature') or '').strip()
+        if not signature or signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        file_hint = ', '.join(str(f) for f in (rec.get('files') or []) if str(f).strip())
+        entry = '- ' + signature + (f' (files: {file_hint})' if file_hint else '')
+        if total_chars + len(entry) + 1 > max_chars:
+            break
+        out_lines.append(entry)
+        total_chars += len(entry) + 1
+    if not out_lines:
+        return ''
+    return header + '\n' + '\n'.join(out_lines)
+
+
 def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None,
              _quiet=False, _return_result=False):
     if cli is None:
@@ -1327,6 +1621,13 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             capture_files(run_dir, tracked)
             _snapshot_files_for_feedback(run_dir, task['files'], 'before')
             event(run_dir, 'run_started', task_id=task['task_id'], mode=task['mode'])
+            try:
+                report_herdr_task(task['task_id'], 'working',
+                                  model=task.get('model') if task['mode'] != 'command' else None,
+                                  step=0, max_steps=task['max_steps'], cost=0.0,
+                                  budget=budget, phase='starting')
+            except Exception:
+                pass
             validation_attempted = False
             proxy = None
             is_real_cli = False
@@ -1399,6 +1700,15 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             if repo_hint:
                                 task['prompt'] += repo_hint
                                 event(run_dir, 'repo_memory_hint_injected')
+                        if task.get('include_workspace_lessons', True):
+                            try:
+                                lesson_hint = load_workspace_lessons(
+                                    state, task.get('directory'), files=task.get('files'))
+                            except Exception:
+                                lesson_hint = ''
+                            if lesson_hint:
+                                task['prompt'] += lesson_hint
+                                event(run_dir, 'workspace_lessons_injected')
                         try:
                             model_run(cli, db, task, run_dir, result, budget, proxy=proxy, started_ref=started_ref)
                         except GuardError as exc:
@@ -1454,10 +1764,22 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 result['micro_repair_session_id'] = sid2
                                 result['micro_repair_attempted'] = True
                                 hashes_before_repair = _fh(task['files'])
+                                first_test_log_text = ''
+                                repaired_files: list[str] = []
                                 if proxy is not None and hasattr(proxy, 'reset_session'):
                                     proxy.reset_session()
                                 try:
                                     event(run_dir, 'micro_repair_started', session_id=sid2)
+                                    try:
+                                        report_herdr_task(task['task_id'], 'working',
+                                                          model=task.get('model'),
+                                                          step=result.get('steps', 0),
+                                                          max_steps=task['max_steps'],
+                                                          cost=result.get('cost') if result.get('cost') is not None else result.get('observed_cost'),
+                                                          budget=budget, phase='micro_repair',
+                                                          session_id=sid2)
+                                    except Exception:
+                                        pass
                                     try:
                                         model_run(cli, db, repair_task, run_dir, result,
                                                   max(0.0, budget - primary_cost),
@@ -1485,6 +1807,8 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 if _fh(task['files']) == hashes_before_repair:
                                     event(run_dir, 'micro_repair_no_change')
                                 else:
+                                    repaired_files = [f for f in task['files']
+                                                      if _fh([f]).get(f) != hashes_before_repair.get(f)]
                                     # H-56: two-stage fast-fail verification. First
                                     # re-run only the previously failed nodeids; if
                                     # any still fail, skip the full suite.
@@ -1515,6 +1839,11 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 raise GuardError(repair_salvage_reason or 'validation_failed')
                             if repair_salvage_reason is not None:
                                 result['salvaged_from'] = f'micro_repair_{repair_salvage_reason}'
+                            try:
+                                if result.get('test_return_code') == 0 and repaired_files:
+                                    record_repair_lesson(state, task, first_test_log_text, repaired_files)
+                            except Exception:
+                                pass
                         if ro_files and _fh(ro_files) != ro_hashes_before:
                             raise GuardError('read_only_file_modified')
                         if task.get('origin_files'):
@@ -1580,6 +1909,23 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
         else:
             result['reason'] = error
         result['status'] = 'blocked'
+    try:
+        _herdr_state = 'done' if result.get('status') in (
+            'validation_passed_review_required', 'patch_ready_review_required',
+            'configuration_verified_no_model_call') else 'blocked'
+        _cost = (reconciled_cost if reconciled_cost is not None
+                 else (result.get('cost') if result.get('cost') is not None
+                       else result.get('observed_cost')))
+        report_herdr_task(result.get('task_id') or 'unknown', _herdr_state,
+                          model=result.get('model'), step=result.get('steps'),
+                          max_steps=(result.get('limits') or {}).get('max_steps'),
+                          cost=_cost,
+                          budget=(result.get('limits') or {}).get('available_cost_usd'),
+                          reason=result.get('reason') or result.get('salvaged_from') or None,
+                          session_id=result.get('session_id'),
+                          phase='salvaged' if result.get('salvaged_from') else None)
+    except Exception:
+        pass
     out = {k: result.get(k) for k in ('status', 'reason', 'artifact', 'cost', 'observed_cost', 'steps')}
     if reconciled_cost is not None:
         out['reconciled_cost'] = reconciled_cost
@@ -2168,6 +2514,12 @@ def execute_plan(raw_plan, *, runner=execute, state=None):
     actual_runner = _run_plan_node if runner is execute else runner
 
     for wave_idx, wave in enumerate(plan['waves']):
+        try:
+            report_herdr_task(f"{plan['plan_id']}/wave-{wave_idx}", 'working',
+                              step=wave_idx, max_steps=len(plan['waves']),
+                              phase=f"wave {wave_idx + 1}/{len(plan['waves'])} ({len(wave)} nodes)")
+        except Exception:
+            pass
         results = {}
         if len(wave) == 1:
             try:
@@ -2255,6 +2607,12 @@ def execute_plan(raw_plan, *, runner=execute, state=None):
 
     total_cost = round(sum((r.get('cost') or 0.0) for r in node_results), 8)
     total_steps = sum((r.get('steps') or 0) for r in node_results)
+    try:
+        report_herdr_task(plan['plan_id'], 'done' if status == 'succeeded' else 'blocked',
+                          step=len(plan['waves']), max_steps=len(plan['waves']),
+                          reason=reason)
+    except Exception:
+        pass
     return {
         'plan_id': plan['plan_id'],
         'status': status,

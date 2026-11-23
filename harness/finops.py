@@ -584,10 +584,32 @@ def clear_session_busy(db, sid, outcome='failed'):
     except sqlite3.Error:
         return False
 
+_EDIT_TOOL_NAMES = {'edit', 'write', 'multiedit', 'patch', 'apply_patch'}
+
+_RECOVERABLE_EDIT_ERROR_MARKERS = ('could not find oldstring', 'no changes to apply', 'identical')
+
+def _is_recoverable_edit_error(tool_name, error_text):
+    """Recoverable edit/write failures (mismatch, no-op, ambiguous match)."""
+    if tool_name not in {'edit', 'write', 'multiedit', 'patch'}:
+        return False
+    if not isinstance(error_text, str):
+        return False
+    low = error_text.lower()
+    if any(marker in low for marker in _RECOVERABLE_EDIT_ERROR_MARKERS):
+        return True
+    # "Found N matches" ambiguous-match pattern ('Found ' together with ' matches').
+    return 'found ' in low and ' matches' in low
+
 def metrics(snap):
     errors, reads = _Counter(), _Counter()
     file_reads = _Counter()
+    window_reads = _Counter()
+    recoverable_errors = _Counter()
     steps = 0
+    write_edit_calls = 0
+    steps_since_last_edit = 0
+    reasoning_only_streak = 0
+    seen_edit_or_read = False
     compact = model_error = unfinished = False
     for kind, data in snap['messages']:
         if kind == 'compaction':
@@ -598,27 +620,56 @@ def metrics(snap):
         model_error |= bool(data.get('error'))
         unfinished |= not bool(data.get('finish'))
         turn_input_errors = _Counter()
+        turn_recoverable_errors = _Counter()
         turn_file_read_inputs = _Counter()
+        turn_has_tool = False
+        turn_has_read = turn_has_edit = False
         for part in data.get('content', []):
             if part.get('type') != 'tool':
                 continue
+            turn_has_tool = True
             st = part.get('state', {})
             if st.get('status') == 'error':
-                key = (part.get('name'), json.dumps(st.get('error'), sort_keys=True))
-                inp = json.dumps(st.get('input'), sort_keys=True)
-                turn_input_errors[(key, inp)] += 1
+                error_text = st.get('error') if isinstance(st.get('error'), str) else json.dumps(st.get('error'))
+                if _is_recoverable_edit_error(part.get('name'), error_text):
+                    # Keyed by tool name only: distinct recoverable messages
+                    # (mismatch, ambiguous match, no-op) accumulate together.
+                    turn_recoverable_errors[part.get('name')] += 1
+                else:
+                    key = (part.get('name'), json.dumps(st.get('error'), sort_keys=True))
+                    inp = json.dumps(st.get('input'), sort_keys=True)
+                    turn_input_errors[(key, inp)] += 1
             if part.get('name') == 'read' and st.get('status') == 'completed':
+                turn_has_read = True
                 reads[(json.dumps(st.get('input'), sort_keys=True),
                        json.dumps(st.get('content'), sort_keys=True))] += 1
-                path = (st.get('input') or {}).get('path')
+                inp = st.get('input') or {}
+                path = inp.get('path') or inp.get('filePath') or inp.get('file_path')
                 if path:
-                    inp = json.dumps(st.get('input'), sort_keys=True)
-                    turn_file_read_inputs[(path, inp)] += 1
-            elif part.get('name') in {'edit', 'write', 'apply_patch'} and st.get('status') == 'completed':
-                file_reads.clear()
+                    inp_json = json.dumps(st.get('input'), sort_keys=True)
+                    turn_file_read_inputs[(path, inp_json)] += 1
+                    offset = inp.get('offset') if inp.get('offset') is not None else inp.get('start_line')
+                    limit = inp.get('limit') if inp.get('limit') is not None else inp.get('end_line')
+                    window_reads[(path, offset, limit)] += 1
+            elif part.get('name') in _EDIT_TOOL_NAMES and st.get('status') == 'completed':
+                turn_has_edit = True
+                write_edit_calls += 1
+                edit_inp = st.get('input') or {}
+                edit_path = edit_inp.get('path') or edit_inp.get('filePath') or edit_inp.get('file_path')
+                if edit_path:
+                    file_reads.pop(edit_path, None)
+                    for wkey in [k for k in window_reads if k[0] == edit_path]:
+                        window_reads.pop(wkey, None)
+                    for rkey in [k for k in turn_file_read_inputs if k[0] == edit_path]:
+                        turn_file_read_inputs.pop(rkey, None)
+                else:
+                    file_reads.clear()
+                    window_reads.clear()
                 reads.clear()
                 errors.clear()
+                recoverable_errors.clear()
                 turn_input_errors.clear()
+                turn_recoverable_errors.clear()
                 turn_file_read_inputs.clear()
         per_key_max = {}
         for (key, _inp), cnt in turn_input_errors.items():
@@ -626,15 +677,30 @@ def metrics(snap):
                 per_key_max[key] = cnt
         for key, inc in per_key_max.items():
             errors[key] += inc
+        for key, inc in turn_recoverable_errors.items():
+            recoverable_errors[key] += inc
         per_path_max = {}
         for (path, _inp), cnt in turn_file_read_inputs.items():
             if cnt > per_path_max.get(path, 0):
                 per_path_max[path] = cnt
         for path, inc in per_path_max.items():
             file_reads[path] += inc
+        if turn_has_edit:
+            steps_since_last_edit = 0
+            seen_edit_or_read = True
+        elif seen_edit_or_read:
+            steps_since_last_edit += 1
+        if turn_has_read:
+            seen_edit_or_read = True
+        reasoning_only_streak = 0 if turn_has_tool else reasoning_only_streak + 1
     return dict(cost=snap['cost'], steps=steps, compact=compact, model_error=model_error,
                 unfinished=unfinished, errors=max(errors.values(), default=0), reads=max(reads.values(), default=0),
-                file_reads=max(file_reads.values(), default=0))
+                file_reads=max(file_reads.values(), default=0),
+                window_reads=max(window_reads.values(), default=0),
+                recoverable_errors=max(recoverable_errors.values(), default=0),
+                write_edit_calls=write_edit_calls,
+                steps_since_last_edit=steps_since_last_edit,
+                reasoning_only_streak=reasoning_only_streak)
 
 def step_cost(model=None, *, upstream_mode='openrouter', cost=None):
     """Effective API step cost: local/SML models and vllm/llamacpp upstreams are $0."""
@@ -675,9 +741,11 @@ def violation(m, budget, max_steps, *, model=None, upstream_mode='openrouter'):
     for condition, reason in [(api_cost >= budget, 'cost_limit'), (unpriced, 'unpriced_model'),
                               (m.get('steps', 0) > max_steps, 'step_limit'),
                               (m.get('compact'), 'compaction'), (m.get('model_error'), 'model_error'),
-                              (m.get('errors', 0) >= 2, 'repeated_tool_error'),
+                              (m.get('errors', 0) >= 2 or m.get('recoverable_errors', 0) >= 3, 'repeated_tool_error'),
                               (m.get('reads', 0) >= 3, 'repeated_identical_read'),
-                              (m.get('file_reads', 0) >= 6, 'repeated_file_read_without_write')]:
+                              (m.get('window_reads', 0) >= 4 or m.get('file_reads', 0) >= 12,
+                               'repeated_file_read_without_write'),
+                              (m.get('reasoning_only_streak', 0) >= 4, 'reasoning_stall_no_tool_call')]:
         if condition:
             return reason
     return None

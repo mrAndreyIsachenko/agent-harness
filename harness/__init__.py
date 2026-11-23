@@ -49,6 +49,10 @@ from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HE
                       TENET_PROVIDER_ROUTING,
                       ProviderHealthStore, apply_provider_routing,
                       is_local_or_sml_model, select_escalated_model)
+from .herdr import (HERDR_AGENT, HERDR_PANE_STATES, HERDR_SOURCE,
+                    OSC_7501_STATES, emit_osc7501, format_osc7501, herdr_bin,
+                    is_herdr_active, release_herdr_agent, report_herdr_task,
+                    send_herdr_socket, spawn_herdr_pane)
 from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
                         HarnessTracer, format_trace_tree,
                         sync_state_traces_to_phoenix, synthesize_spans_from_run_dir)
@@ -94,6 +98,9 @@ __all__ = [
     'scan_state_runs', 'format_state_stats_markdown', 'purge_ephemeral_test_runs',
     'compute_state_insights', 'build_repo_memory_hint', 'format_state_insights_markdown',
     'DEFAULT_PHOENIX_ENDPOINT', 'OPENINFERENCE_SPAN_KINDS', 'HarnessTracer',
+    'HERDR_AGENT', 'HERDR_PANE_STATES', 'HERDR_SOURCE', 'OSC_7501_STATES',
+    'emit_osc7501', 'format_osc7501', 'herdr_bin', 'is_herdr_active',
+    'release_herdr_agent', 'report_herdr_task', 'send_herdr_socket', 'spawn_herdr_pane',
     'format_trace_tree', 'synthesize_spans_from_run_dir', 'sync_state_traces_to_phoenix',
     'DB', 'LIMITS', 'STATE', 'CLI', 'SALVAGEABLE_BLOCK_REASONS',
     '_reconcile_locked', 'auto_reconcile_from_proxy', 'build_unexposed_settlement_evidence',

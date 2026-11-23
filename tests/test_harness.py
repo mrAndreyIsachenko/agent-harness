@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import threading
@@ -28,6 +29,8 @@ import urllib.request
 
 from harness import OpenRouterGuardProxy, export_sml_dataset, openrouter_proxy
 from harness.cli import main as cli_main
+import harness.cli as harness_cli
+import harness.herdr as harness_herdr
 from harness.finops import (auto_reconcile_from_proxy,
                             budget_gate,
                             build_unexposed_settlement_evidence,
@@ -7350,9 +7353,9 @@ class TestH55H57Fixes(unittest.TestCase):
         self.assertEqual(metrics(snap)['file_reads'], 1)
         self.assertIsNone(violation(metrics(snap), 1e9, 25))
 
-        for idx in range(5):
+        for idx in range(11):
             snap['messages'].append(msg([read_at(600 + idx * 100)]))
-        self.assertEqual(metrics(snap)['file_reads'], 6)
+        self.assertEqual(metrics(snap)['file_reads'], 12)
         self.assertEqual(violation(metrics(snap), 1e9, 25), 'repeated_file_read_without_write')
 
     def test_h62_infer_read_only_companion_files_in_validate_task(self):
@@ -8189,6 +8192,958 @@ class TestGroupRollout(HarnessTestCase):
             written = json.loads(out_path.read_text(encoding='utf-8'))
             self.assertEqual(written['best_run_id'], 'run-0')
             self.assertEqual(written['group_size'], 3)
+
+
+class TestPodCLI(unittest.TestCase):
+    def setUp(self):
+        import harness.pod as pod_mod
+        self.pod = pod_mod
+
+    def _fake_ssh(self, free_mib='7000', hf='present'):
+        from types import SimpleNamespace
+
+        def fake(host, command, **kwargs):
+            if 'nvidia-smi' in command:
+                return SimpleNamespace(stdout=f'0, A100, 81920, {free_mib}, 0\n')
+            if 'df -BG' in command:
+                return SimpleNamespace(stdout='1G-blocks Used Avail\n100G 10G 90G')
+            return SimpleNamespace(stdout=hf + '\n')
+
+        return fake
+
+    def test_pod_preflight_pass_and_fail(self):
+        from unittest.mock import patch
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            with patch.object(self.pod, '_ssh', side_effect=self._fake_ssh('7000')):
+                rc = self.pod.preflight('u@h', '/w')
+        self.assertEqual(rc, 0)
+        self.assertIn('gpu[0] A100', out.getvalue())
+        self.assertIn('UV_NO_SYNC=1 SKIP_UV_SYNC=1', out.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            with patch.object(self.pod, '_ssh', side_effect=self._fake_ssh('1024')):
+                rc = self.pod.preflight('u@h', '/w')
+        self.assertEqual(rc, 1)
+        self.assertIn('BELOW_MIN(6144)', out.getvalue())
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(self.pod, '_ssh', side_effect=self._fake_ssh('7000', hf='missing')):
+                rc = self.pod.preflight('u@h', '/w')
+        self.assertEqual(rc, 1)
+
+    def test_pod_sync_daemon_idempotent_when_pid_alive(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_path = Path(tmp) / self.pod.PID_FILE
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_path.write_text('4242', encoding='utf-8')
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                with patch.object(self.pod, '_pid_alive', return_value=True), \
+                        patch.object(self.pod.subprocess, 'Popen') as popen:
+                    rc = self.pod.sync_pods('u@h', '/remote', tmp, daemon=True)
+            self.assertEqual(rc, 0)
+            popen.assert_not_called()
+            self.assertIn('already running', out.getvalue())
+
+    def test_pod_sync_stop_kills_pid_and_runs_final_rsync(self):
+        import signal
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pid_path = Path(tmp) / self.pod.PID_FILE
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            pid_path.write_text('4242', encoding='utf-8')
+            with contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(self.pod, '_pid_alive', return_value=True), \
+                        patch.object(self.pod.os, 'kill') as kill, \
+                        patch.object(self.pod, '_rsync_once', return_value=0) as rsync:
+                    rc = self.pod.sync_pods('u@h', '/remote', tmp, stop=True)
+            self.assertEqual(rc, 0)
+            kill.assert_called_once_with(4242, signal.SIGTERM)
+            rsync.assert_called_once_with('u@h', '/remote', tmp, ('results', 'releases'))
+            self.assertFalse(pid_path.exists())
+
+    def test_pod_launch_tmux_vram_markers_checkpoint_and_status(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        calls = []
+
+        def fake_ssh(host, command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(stdout='')
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(self.pod, '_ssh', side_effect=fake_ssh):
+                rc = self.pod.launch(
+                    'u@h', '/work', 'train-sess', ['python', 'train.py'],
+                    stagger_vram_mib=8000, on_checkpoint='echo checkpointed',
+                    max_retries=3,
+                )
+        self.assertEqual(rc, 0)
+        joined = '\n'.join(calls)
+        self.assertIn('tmux new-session -d -s', joined)
+        for needle in ('UV_NO_SYNC=1', 'SKIP_UV_SYNC=1', 'VLLM::EngineCore',
+                       'Available KV cache memory', '8000', 'echo checkpointed',
+                       'results/.pod_status.json', 'RUNNING', 'CHECKPOINT',
+                       'DONE', 'ERROR', 'retries'):
+            self.assertIn(needle, joined)
+
+    def test_pod_launch_rejects_empty_worker_cmd(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = self.pod.launch('u@h', '/work', 's', [])
+        self.assertEqual(rc, 1)
+
+    def test_pod_wait_done_and_checkpoint_trigger_single_sync(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        for status in ('DONE', 'CHECKPOINT'):
+            with contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(
+                    self.pod, '_ssh',
+                    return_value=SimpleNamespace(stdout=json.dumps({'status': status})),
+                ), patch.object(self.pod, 'sync_pods', return_value=0) as sync, \
+                        patch.object(self.pod.time, 'sleep'):
+                    rc = self.pod.wait('u@h', '/work', max_wait_sec=5, local_dir='/local')
+            self.assertEqual(rc, 0)
+            sync.assert_called_once_with(
+                'u@h', '/work', '/local', ('results', 'releases'), once=True,
+            )
+
+    def test_pod_wait_error_returns_one(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(
+                self.pod, '_ssh',
+                return_value=SimpleNamespace(stdout=json.dumps({'status': 'ERROR'})),
+            ), patch.object(self.pod, 'sync_pods', return_value=0) as sync, \
+                    patch.object(self.pod.time, 'sleep'):
+                rc = self.pod.wait('u@h', '/work', max_wait_sec=5, local_dir='/local')
+        self.assertEqual(rc, 1)
+        sync.assert_called_once()
+
+    def test_pod_wait_running_times_out_zero(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(
+                self.pod, '_ssh',
+                return_value=SimpleNamespace(stdout=json.dumps({'status': 'RUNNING'})),
+            ), patch.object(self.pod, 'sync_pods') as sync, \
+                    patch.object(self.pod.time, 'sleep'), \
+                    patch.object(self.pod.time, 'monotonic', side_effect=[0.0, 1.0, 10.0]):
+                rc = self.pod.wait('u@h', '/work', max_wait_sec=5, local_dir='/local')
+        self.assertEqual(rc, 0)
+        sync.assert_not_called()
+
+    def test_cli_pod_preflight_dispatch(self):
+        from unittest.mock import patch
+        from harness import cli as harness_cli
+
+        with patch.object(self.pod, 'preflight', return_value=0) as pf:
+            rc = harness_cli.main(['pod', 'preflight', '--host', 'u@h', '--workdir', '/w'])
+        self.assertEqual(rc, 0)
+        pf.assert_called_once_with('u@h', '/w', min_free_vram_mib=6144)
+
+    def test_cli_pod_sync_and_launch_dispatch(self):
+        from unittest.mock import patch
+        from harness import cli as harness_cli
+
+        with patch.object(self.pod, 'sync_pods', return_value=0) as sync:
+            rc = harness_cli.main([
+                'pod', 'sync', '--host', 'u@h', '--remote-dir', '/r',
+                '--local-dir', '/l', '--paths', 'results', '--once',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sync.call_args.args, ('u@h', '/r', '/l', ('results',)))
+        self.assertTrue(sync.call_args.kwargs['once'])
+
+        with patch.object(self.pod, 'launch', return_value=0) as launch:
+            rc = harness_cli.main([
+                'pod', 'launch', '--host', 'u@h', '--workdir', '/w',
+                '--session', 's', '--', 'python', 'run.py',
+            ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(launch.call_args.args, ('u@h', '/w', 's', ['python', 'run.py']))
+
+
+import base64
+import io
+import shlex
+import harness.herdr as harness_herdr
+
+
+class TestHerdrIntegration(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='harness-herdr-')
+        self._prev = {k: os.environ.get(k) for k in
+                      ('HERDR_ENV', 'HERDR_PANE_ID', 'HERDR_SOCKET_PATH',
+                       'HERDR_WORKSPACE_ID', 'HARNESS_OSC7501')}
+        for key in self._prev:
+            os.environ.pop(key, None)
+        self.addCleanup(self._restore_env)
+
+    def _restore_env(self):
+        for key, value in self._prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def _env(self, **overrides):
+        env = {'HERDR_ENV': '1', 'HERDR_PANE_ID': 'pane-1',
+               'HERDR_SOCKET_PATH': self.path('herdr.sock')}
+        env.update(overrides)
+        return env
+
+    def path(self, name):
+        return os.path.join(self.root, name)
+
+    # --- format_osc7501 -------------------------------------------------
+
+    def test_format_osc7501_wire_and_b64(self):
+        out = harness_herdr.format_osc7501(
+            'working', task_id='fix bug', progress=40,
+            title='T', msg='step 1/5')
+        self.assertTrue(out.startswith('\x1b]7501;state=working:'))
+        self.assertTrue(out.endswith('\x1b\\'))
+        self.assertIn('app=harness', out)
+        self.assertIn('id=fix_bug', out)
+        self.assertIn('progress=40', out)
+        self.assertIn('title=' + base64.b64encode(b'T').decode(), out)
+        self.assertIn('msg=' + base64.b64encode(b'step 1/5').decode(), out)
+
+    def test_format_osc7501_task_id_truncation_and_kind(self):
+        long_id = 'a/b/' + 'x' * 200
+        out = harness_herdr.format_osc7501('blocked', task_id=long_id, kind='validation')
+        self.assertIn('kind=validation', out)
+        sanitized = long_id[:128]
+        self.assertIn('id=%s' % sanitized, out)
+        # kind only allowed for blocked
+        plain = harness_herdr.format_osc7501('working', kind='validation')
+        self.assertNotIn('kind=', plain)
+
+    def test_format_osc7501_progress_clamp_and_invalid_state(self):
+        self.assertIn('progress=100', harness_herdr.format_osc7501('working', progress=250))
+        self.assertIn('progress=0', harness_herdr.format_osc7501('blocked', progress=-5))
+        self.assertNotIn('progress', harness_herdr.format_osc7501('done', progress=50))
+        with self.assertRaises(ValueError):
+            harness_herdr.format_osc7501('nope')
+
+    # --- emit_osc7501 / is_herdr_active ---------------------------------
+
+    def test_is_herdr_active_detection(self):
+        self.assertFalse(harness_herdr.is_herdr_active({}))
+        self.assertTrue(harness_herdr.is_herdr_active({'HERDR_ENV': '1'}))
+        self.assertTrue(harness_herdr.is_herdr_active(
+            {'HERDR_PANE_ID': 'p', 'HERDR_SOCKET_PATH': '/s'}))
+        self.assertFalse(harness_herdr.is_herdr_active({'HERDR_PANE_ID': 'p'}))
+
+    def test_emit_osc7501_stream_output_and_gating(self):
+        buf = io.StringIO()
+        self.assertFalse(harness_herdr.emit_osc7501('working', stream=buf))
+        os.environ['HERDR_ENV'] = '1'
+        self.assertTrue(harness_herdr.emit_osc7501('working', stream=buf))
+        self.assertIn('\x1b]7501;state=working', buf.getvalue())
+        buf2 = io.StringIO()
+        self.assertTrue(harness_herdr.emit_osc7501('done', stream=buf2, force=True))
+        self.assertIn('state=done', buf2.getvalue())
+        # HARNESS_OSC7501 opt-in
+        os.environ.pop('HERDR_ENV')
+        os.environ['HARNESS_OSC7501'] = '1'
+        buf3 = io.StringIO()
+        self.assertTrue(harness_herdr.emit_osc7501('idle', stream=buf3))
+        self.assertIn('state=idle', buf3.getvalue())
+
+    # --- socket round trip -----------------------------------------------
+
+    def _socket_server(self):
+        sock_path = self.path('herdr.sock')
+        received = []
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sock_path)
+        srv.listen(8)
+        srv.settimeout(5)
+        stop = threading.Event()
+
+        def serve():
+            srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    continue
+                with conn:
+                    conn.settimeout(2)
+                    data = bytearray()
+                    while b'\n' not in data:
+                        chunk = conn.recv(65536)
+                        if not chunk:
+                            break
+                        data.extend(chunk)
+                    if not data:
+                        continue
+                    received.append(json.loads(data.split(b'\n', 1)[0].decode()))
+                    conn.sendall(b'{"ok": true}\n')
+            srv.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(thread.join, 3)
+        return sock_path, received
+
+    def test_send_herdr_socket_round_trip(self):
+        sock_path, _ = self._socket_server()
+        resp = harness_herdr.send_herdr_socket(
+            'pane.report_agent', {'pane_id': 'p'}, env={'HERDR_SOCKET_PATH': sock_path})
+        self.assertEqual(resp, {'ok': True})
+        self.assertIsNone(harness_herdr.send_herdr_socket(
+            'pane.report_agent', {}, env={}))
+
+    def test_report_herdr_task_and_release_via_socket(self):
+        sock_path, received = self._socket_server()
+        env = self._env(HERDR_WORKSPACE_ID='ws-1')
+        summary = harness_herdr.report_herdr_task(
+            't1', 'working', model='openrouter/z-ai/glm', step=2, max_steps=8,
+            cost=0.05, budget=1.0, guard_hits=1, reason='slow', session_id='sess-9',
+            phase='coding', env=env, stream=io.StringIO(), force_osc=True)
+        self.assertTrue(summary['osc_emitted'])
+        self.assertTrue(summary['socket_reported'])
+        self.assertEqual(summary['progress'], 25)
+        self.assertIn('step 2/8', summary['message'])
+        self.assertIn('$0.0500/$1.00', summary['message'])
+        self.assertIn('guards:1', summary['message'])
+
+        methods = [r['method'] for r in received]
+        self.assertEqual(methods, ['pane.report_agent', 'pane.report_metadata',
+                                   'workspace.report_metadata'])
+        agent = received[0]['params']
+        self.assertEqual(agent['state'], 'working')
+        self.assertEqual(agent['agent_session_id'], 'sess-9')
+        self.assertEqual(agent['source'], 'harness')
+        meta = received[1]['params']
+        self.assertEqual(meta['tokens']['task'], 't1')
+        self.assertEqual(meta['tokens']['model'], 'glm')
+        self.assertEqual(meta['tokens']['steps'], '2/8')
+        self.assertEqual(meta['tokens']['cost'], '$0.0500')
+        self.assertEqual(meta['tokens']['guards'], '1')
+        self.assertEqual(meta['display_agent'], 'harness')
+        ws = received[2]['params']
+        self.assertEqual(ws['workspace_id'], 'ws-1')
+        self.assertEqual(ws['tokens'], {'last_task': 't1', 'state': 'working'})
+
+        received.clear()
+        self.assertTrue(harness_herdr.release_herdr_agent(env=env, stream=io.StringIO()))
+        self.assertEqual([r['method'] for r in received], ['pane.release_agent'])
+        self.assertEqual(received[0]['params']['agent'], 'harness')
+
+    def test_report_herdr_task_done_maps_to_idle_and_error_to_blocked(self):
+        sock_path, received = self._socket_server()
+        env = self._env()
+        harness_herdr.report_herdr_task('t2', 'done', env=env, stream=io.StringIO(),
+                                        force_osc=True)
+        self.assertEqual(received[0]['params']['state'], 'idle')
+        received.clear()
+        harness_herdr.report_herdr_task('t3', 'error', env=env, stream=io.StringIO(),
+                                        force_osc=True)
+        self.assertEqual(received[0]['params']['state'], 'blocked')
+
+    def test_report_herdr_task_without_socket_only_osc(self):
+        summary = harness_herdr.report_herdr_task(
+            't4', 'idle', env={'HERDR_ENV': '1'}, stream=io.StringIO(), force_osc=True)
+        self.assertTrue(summary['osc_emitted'])
+        self.assertFalse(summary['socket_reported'])
+        self.assertIsNone(summary['progress'])
+        self.assertEqual(summary['task_id'], 't4')
+
+    # --- spawn_herdr_pane -------------------------------------------------
+
+    def test_spawn_herdr_pane_calls(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            class P:
+                returncode = 0
+                stderr = ''
+                stdout = json.dumps({'result': {'pane': {'pane_id': 'p9'}}})
+            return P()
+
+        result = harness_herdr.spawn_herdr_pane(
+            ['python', 'worker.py'], title='worker', cwd='/w', focus=True,
+            env={'HERDR_BIN_PATH': '/bin/herdr'}, runner=runner)
+        self.assertEqual(result, {'status': 'spawned', 'pane_id': 'p9',
+                                  'title': 'worker', 'command': ['python', 'worker.py']})
+        self.assertEqual(calls[0],
+                         ['/bin/herdr', 'pane', 'split', '--current',
+                          '--direction', 'right', '--cwd', '/w', '--focus'])
+        self.assertEqual(calls[1], ['/bin/herdr', 'pane', 'rename', 'p9', 'worker'])
+        self.assertEqual(calls[2], ['/bin/herdr', 'pane', 'run', 'p9',
+                                    shlex.join(['python', 'worker.py'])])
+
+    def test_spawn_herdr_pane_error_paths(self):
+        def failing(argv, **kwargs):
+            class P:
+                returncode = 1
+                stderr = 'boom'
+                stdout = ''
+            return P()
+        result = harness_herdr.spawn_herdr_pane(
+            ['x'], env={'HERDR_BIN_PATH': '/bin/herdr'}, runner=failing)
+        self.assertEqual(result, {'status': 'error', 'reason': 'boom'})
+
+        def no_pane(argv, **kwargs):
+            class P:
+                returncode = 0
+                stderr = ''
+                stdout = '{}'
+            return P()
+        result = harness_herdr.spawn_herdr_pane(
+            ['x'], env={'HERDR_BIN_PATH': '/bin/herdr'}, runner=no_pane)
+        self.assertEqual(result, {'status': 'error', 'reason': 'pane_id_missing'})
+
+    # --- sandbox/pod herdr reporting integration ---------------------------
+
+    def test_pod_wait_reports_herdr_transitions(self):
+        import harness.pod as pod_mod
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        calls = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(
+                pod_mod, '_ssh',
+                return_value=SimpleNamespace(stdout=json.dumps({'status': 'DONE'})),
+            ), patch.object(pod_mod, 'sync_pods', return_value=0), \
+                    patch.object(pod_mod.time, 'sleep'), \
+                    patch.object(pod_mod, 'report_herdr_task',
+                                 side_effect=lambda *a, **k: calls.append((a, k))):
+                rc = pod_mod.wait('u@h', '/work', max_wait_sec=5)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertEqual(args[0], 'pod:u@h')
+        self.assertEqual(args[1], 'done')
+        self.assertEqual(kwargs.get('phase'), 'pod DONE')
+
+        calls.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with patch.object(
+                pod_mod, '_ssh',
+                return_value=SimpleNamespace(stdout=json.dumps({'status': 'ERROR'})),
+            ), patch.object(pod_mod, 'sync_pods', return_value=0), \
+                    patch.object(pod_mod.time, 'sleep'), \
+                    patch.object(pod_mod, 'report_herdr_task',
+                                 side_effect=lambda *a, **k: calls.append((a, k))):
+                rc = pod_mod.wait('u@h', '/work', max_wait_sec=5)
+        self.assertEqual(rc, 1)
+        self.assertEqual(len(calls), 1)
+        args, kwargs = calls[0]
+        self.assertEqual(args[1], 'error')
+        self.assertEqual(kwargs.get('reason'), 'pod_error')
+
+    def test_execute_plan_reports_herdr_waves_and_completion(self):
+        import harness.sandbox
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            n1 = {'task_id': 'n1', 'directory': tmp,
+                  'files': [str(Path(tmp) / 'a.py')],
+                  'test_argv': [sys.executable, '-c', 'import sys; sys.exit(0)'],
+                  'prompt': 'Fix it.', 'depends_on': []}
+            n2 = {'task_id': 'n2', 'directory': tmp,
+                  'files': [str(Path(tmp) / 'b.py')],
+                  'test_argv': [sys.executable, '-c', 'import sys; sys.exit(0)'],
+                  'prompt': 'Fix it.', 'depends_on': []}
+            for f in (n1['files'][0], n2['files'][0]):
+                Path(f).parent.mkdir(parents=True, exist_ok=True)
+                Path(f).write_text('# placeholder\n')
+            plan = {'plan_id': 'plan-herdr', 'directory': tmp,
+                    'nodes': [n1, n2], 'final_test_argv': None}
+
+            def runner(node):
+                return {'status': 'validation_passed_review_required',
+                        'cost': 0.1, 'steps': 2}
+
+            calls = []
+            with patch.object(harness.sandbox, 'report_herdr_task',
+                              side_effect=lambda *a, **k: calls.append((a, k))):
+                res = execute_plan(plan, runner=runner)
+            self.assertEqual(res['status'], 'succeeded')
+            wave_calls = [c for c in calls
+                          if c[0][0] == 'plan-herdr/wave-0']
+            self.assertEqual(len(wave_calls), 1)
+            self.assertEqual(wave_calls[0][0][1], 'working')
+            self.assertEqual(wave_calls[0][1].get('phase'),
+                             'wave 1/1 (2 nodes)')
+            final_calls = [c for c in calls if c[0][0] == 'plan-herdr']
+            self.assertEqual(len(final_calls), 1)
+            self.assertEqual(final_calls[0][0][1], 'done')
+
+            calls.clear()
+            with patch.object(harness.sandbox, 'report_herdr_task',
+                              side_effect=lambda *a, **k: calls.append((a, k))):
+                res = execute_plan(plan, runner=lambda node: {'status': 'blocked',
+                                                              'reason': 'boom'})
+            self.assertEqual(res['status'], 'blocked')
+            final_calls = [c for c in calls if c[0][0] == 'plan-herdr']
+            self.assertEqual(len(final_calls), 1)
+            self.assertEqual(final_calls[0][0][1], 'blocked')
+            self.assertEqual(final_calls[0][1].get('reason'), 'boom')
+
+    # --- CLI subcommand -----------------------------------------------------
+
+    def test_cli_herdr_status(self):
+        from unittest.mock import patch
+
+        os.environ.update(self._env())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            with patch.object(harness_herdr, 'is_herdr_active', return_value=True), \
+                    patch.object(harness_herdr, 'herdr_bin', return_value='/bin/herdr'):
+                rc = harness_cli.main(['herdr', 'status'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertTrue(payload['active'])
+        self.assertEqual(payload['herdr_bin'], '/bin/herdr')
+        self.assertEqual(payload['pane_id'], 'pane-1')
+        self.assertEqual(payload['socket_path'], self.path('herdr.sock'))
+        self.assertIsNone(payload['workspace_id'])
+        self.assertIsNone(payload['tab_id'])
+
+    def test_cli_herdr_report(self):
+        from unittest.mock import patch
+
+        calls = []
+        with patch.object(harness_herdr, 'report_herdr_task',
+                          side_effect=lambda *a, **k: calls.append((a, k)) or
+                          {'task_id': a[0], 'state': a[1]}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = harness_cli.main([
+                    'herdr', 'report', '--task-id', 't-cli', '--state', 'working',
+                    '--step', '3', '--max-steps', '10', '--force-osc',
+                ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())['task_id'], 't-cli')
+        args, kwargs = calls[0]
+        self.assertEqual(args, ('t-cli', 'working'))
+        self.assertTrue(kwargs['force_osc'])
+        self.assertEqual(kwargs['step'], 3)
+        self.assertEqual(kwargs['max_steps'], 10)
+        self.assertNotIn('model', kwargs)
+        self.assertNotIn('cost', kwargs)
+
+    def test_cli_herdr_release(self):
+        from unittest.mock import patch
+
+        calls = []
+        with patch.object(harness_herdr, 'release_herdr_agent',
+                          side_effect=lambda **k: calls.append(k) or True):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = harness_cli.main(['herdr', 'release', '--force-osc'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue()), {'released': True})
+        self.assertEqual(calls, [{'force_osc': True}])
+
+    def test_cli_herdr_spawn(self):
+        from unittest.mock import patch
+
+        calls = []
+        with patch.object(harness_herdr, 'spawn_herdr_pane',
+                          side_effect=lambda cmd, **k:
+                          calls.append((cmd, k)) or
+                          {'status': 'spawned', 'pane_id': 'p1'}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = harness_cli.main([
+                    'herdr', 'spawn', '--title', 'w1', '--', 'python', '-V'])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(buf.getvalue())['status'], 'spawned')
+        cmd, kwargs = calls[0]
+        self.assertEqual(cmd, ['python', '-V'])
+        self.assertEqual(kwargs['title'], 'w1')
+
+        calls.clear()
+        with patch.object(harness_herdr, 'spawn_herdr_pane',
+                          return_value={'status': 'error', 'reason': 'boom'}):
+            rc = harness_cli.main([
+                'herdr', 'spawn', '--title', 'w1', '--', 'python', '-V'])
+        self.assertEqual(rc, 1)
+
+    def test_build_herdr_dashboard_data_empty_and_populated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = harness_herdr.build_herdr_dashboard_data(tmp)
+            self.assertEqual(empty['totals']['runs'], 0)
+            self.assertEqual(empty['recent_runs'], [])
+            self.assertIsNone(empty['selected_run_id'])
+
+            runs_dir = Path(tmp) / 'runs'
+            r1 = runs_dir / 'run-001'
+            r2 = runs_dir / 'run-002'
+            r1.mkdir(parents=True)
+            r2.mkdir(parents=True)
+            (r1 / 'result.json').write_text(json.dumps({
+                'task_id': 't1',
+                'status': 'validation_passed_review_required',
+                'model': 'openrouter/z-ai/glm-5.3-flash',
+                'steps': 4,
+                'cost_usd': 0.012,
+                'duration_s': 2.5,
+                'blocked_count': 1,
+            }), encoding='utf-8')
+            (r1 / 'traces.jsonl').write_text(
+                json.dumps({
+                    'name': 'agent_run',
+                    'span_id': 's1',
+                    'start_time_ns': 1_000_000,
+                    'end_time_ns': 6_000_000,
+                    'status': 'OK',
+                    'attributes': {'openinference.span.kind': 'AGENT'},
+                }) + '\n' +
+                json.dumps({
+                    'name': 'read_file',
+                    'span_id': 's2',
+                    'parent_span_id': 's1',
+                    'start_time_ns': 2_000_000,
+                    'end_time_ns': 3_500_000,
+                    'status': 'ERROR',
+                    'attributes': {
+                        'openinference.span.kind': 'TOOL',
+                        'tool.name': 'read_file',
+                        'output.value': 'File not found',
+                    },
+                }) + '\n',
+                encoding='utf-8',
+            )
+            (r2 / 'result.json').write_text(json.dumps({
+                'task_id': 't2',
+                'status': 'blocked',
+                'model': 'openrouter/z-ai/glm-5.3-flash',
+                'steps': 2,
+                'cost_usd': 0.005,
+                'reason': 'budget_exceeded',
+                'blocked_count': 2,
+            }), encoding='utf-8')
+            os.utime(r1, (1000, 1000))
+            os.utime(r2, (2000, 2000))
+
+            data = harness_herdr.build_herdr_dashboard_data(tmp)
+            self.assertEqual(data['totals']['runs'], 2)
+            self.assertEqual(data['totals']['resolved'], 1)
+            self.assertEqual(data['totals']['success_rate'], 50.0)
+            self.assertAlmostEqual(data['totals']['total_cost'], 0.017, places=4)
+            self.assertEqual(data['totals']['blocked_calls'], 3)
+            self.assertEqual(data['funnel']['first_try_ok'], 1)
+            self.assertEqual(data['funnel']['unresolved_tasks'], 1)
+            self.assertEqual(len(data['by_model']), 1)
+            self.assertEqual(data['by_model'][0]['runs'], 2)
+            self.assertEqual(data['top_blocked_reasons'], [{'reason': 'budget_exceeded', 'count': 1}])
+            self.assertEqual(data['recent_runs'][0]['run_id'], 'run-002')
+            self.assertEqual(data['selected_run_id'], 'run-002')
+
+            selected = harness_herdr.build_herdr_dashboard_data(tmp, run_id='run-001')
+            self.assertEqual(selected['selected_run_id'], 'run-001')
+            self.assertEqual(len(selected['spans']), 2)
+            self.assertEqual(selected['spans'][0]['kind'], 'AGENT')
+            self.assertEqual(selected['spans'][1]['tool_name'], 'read_file')
+            self.assertIn('agent_run', selected['trace_tree'])
+
+    def test_open_herdr_ui_and_cli_subcommands(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        seen = []
+
+        def fake_runner(argv, **kwargs):
+            seen.append(argv)
+            return SimpleNamespace(returncode=0, stdout='{"ok":true}', stderr='')
+
+        res = harness_herdr.open_herdr_ui(direction='down', runner=fake_runner)
+        self.assertEqual(res['status'], 'opened')
+        self.assertEqual(res['direction'], 'down')
+        self.assertEqual(seen[0][1:3], ['do', 'pane.split'])
+        self.assertIn('"harness-dashboard"', seen[0][3])
+
+        bad = harness_herdr.open_herdr_ui(direction='left', runner=fake_runner)
+        self.assertEqual(bad['status'], 'error')
+
+        def missing_runner(argv, **kwargs):
+            raise FileNotFoundError('herdr-app not found')
+
+        err = harness_herdr.open_herdr_ui(runner=missing_runner)
+        self.assertEqual(err['status'], 'error')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = harness_cli.main(['herdr', 'dashboard-json', '--state-dir', tmp])
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf.getvalue())
+            self.assertIn('totals', payload)
+            self.assertIn('funnel', payload)
+
+        with patch.object(harness_herdr, 'open_herdr_ui',
+                          return_value={'status': 'opened', 'direction': 'right', 'mod': 'harness-dashboard'}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = harness_cli.main(['herdr', 'ui', '--direction', 'right'])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(buf.getvalue())['status'], 'opened')
+
+
+    # --- dashboard filters, worker steps, actions, pod/sml status ----------
+
+    def _write_run(self, runs_dir, name, result, *, task=None, worker_log=None, events=None):
+        run_dir = Path(runs_dir) / name
+        run_dir.mkdir(parents=True)
+        (run_dir / 'result.json').write_text(json.dumps(result), encoding='utf-8')
+        if task is not None:
+            (run_dir / 'task.json').write_text(json.dumps(task), encoding='utf-8')
+        if worker_log is not None:
+            (run_dir / 'worker.log').write_text(
+                ''.join(json.dumps(line) + '\n' for line in worker_log), encoding='utf-8')
+        if events is not None:
+            (run_dir / 'events.jsonl').write_text(
+                ''.join(json.dumps(line) + '\n' for line in events), encoding='utf-8')
+        return run_dir
+
+    def test_dashboard_days_and_project_filters(self):
+        import time
+        runs_dir = Path(self.root) / 'runs'
+        harness_dir = str(Path(self.root) / 'harness-work')
+        sml_dir = str(Path(self.root) / 'Small Model Lab')
+        self._write_run(runs_dir, 'run-h1', {
+            'task_id': 'harness_1', 'status': 'validation_passed_review_required',
+            'model': 'm', 'steps': 3, 'cost_usd': 0.01, 'directory': harness_dir,
+        })
+        self._write_run(runs_dir, 'run-s1', {
+            'task_id': 'sml_1', 'status': 'blocked', 'reason': 'step_limit',
+            'model': 'm', 'steps': 2, 'cost_usd': 0.02, 'directory': sml_dir,
+        })
+        # Old run that must drop out under days=1
+        old = self._write_run(runs_dir, 'run-old', {
+            'task_id': 'sml_2', 'status': 'validation_passed_review_required',
+            'model': 'm', 'steps': 1, 'cost_usd': 0.03, 'directory': sml_dir,
+        })
+        old_ts = time.time() - 5 * 86400
+        os.utime(old / 'result.json', (old_ts, old_ts))
+        os.utime(runs_dir / 'run-old', (old_ts, old_ts))
+
+        data = harness_herdr.build_herdr_dashboard_data(self.root, days=1)
+        self.assertEqual(data['projects'], ['all', 'Harness', 'Small Model Lab'])
+        self.assertEqual(data['filters'], {'days': 1, 'project': 'all'})
+        self.assertEqual(data['totals']['runs'], 2)
+        self.assertEqual(data['funnel']['total_tasks'], 2)
+        self.assertEqual(
+            {r['run_id'] for r in data['recent_runs']},
+            {'run-h1', 'run-s1'})
+
+        filtered = harness_herdr.build_herdr_dashboard_data(
+            self.root, days=1, project='Harness')
+        self.assertEqual(filtered['filters'], {'days': 1, 'project': 'Harness'})
+        self.assertEqual(
+            [r['run_id'] for r in filtered['recent_runs']], ['run-h1'])
+        self.assertEqual(filtered['totals']['runs'], 1)
+        self.assertEqual(filtered['funnel']['runs'], 1)
+        self.assertEqual(filtered['funnel']['passed'], 1)
+        self.assertEqual(filtered['top_blocked_reasons'], [])
+
+        # CLI passes --days / --project through
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = harness_cli.main(['herdr', 'dashboard-json', '--state-dir', self.root,
+                                   '--days', '1', '--project', 'Harness'])
+        self.assertEqual(rc, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload['filters'], {'days': 1, 'project': 'Harness'})
+        self.assertIn('all', payload['projects'])
+        self.assertEqual(
+            [r['run_id'] for r in payload['recent_runs']], ['run-h1'])
+
+    def test_parse_worker_log_steps_and_selected_detail(self):
+        run_dir = Path(self.root) / 'runs' / 'run-steps'
+        run_dir.mkdir(parents=True)
+        long_text = 'x' * 200
+        worker_log = [
+            {'type': 'tool_use', 'tool': 'edit',
+             'part': {'type': 'tool', 'state': {'input': {'filePath': '/a/b/very/deep/file.py'}}}},
+            {'type': 'text', 'part': {'type': 'text', 'text': long_text}},
+            {'type': 'tool_use', 'tool': 'read',
+             'part': {'type': 'tool',
+                      'state': {'input': {'filePath': '/a/c/other.py'},
+                                'status': 'error', 'error': 'file missing'}}},
+        ]
+        (run_dir / 'worker.log').write_text(
+            ''.join(json.dumps(line) + '\n' for line in worker_log), encoding='utf-8')
+        (run_dir / 'events.jsonl').write_text(
+            json.dumps({'time': 12.0, 'event': 'guard_hint',
+                        'hint': 'read only allowed paths'}) + '\n', encoding='utf-8')
+        steps = harness_herdr.parse_worker_log_steps(run_dir, limit=30)
+        self.assertEqual(len(steps), 4)
+        self.assertEqual([s['step'] for s in steps], [1, 2, 3, 4])
+        self.assertEqual(steps[0]['type'], 'tool_call')
+        self.assertEqual(steps[0]['tool'], 'edit')
+        self.assertEqual(steps[0]['target'], 'deep/file.py')
+        self.assertEqual(steps[1]['type'], 'assistant_text')
+        self.assertEqual(steps[1]['preview'], long_text[:160])
+        self.assertEqual(steps[2]['type'], 'error')
+        self.assertEqual(steps[2]['preview'], 'file missing')
+        self.assertEqual(steps[3]['type'], 'guard_hint')
+        self.assertIn('read only allowed paths', steps[3]['preview'])
+
+        # limit keeps only the tail
+        tail = harness_herdr.parse_worker_log_steps(run_dir, limit=2)
+        self.assertEqual([s['step'] for s in tail], [3, 4])
+
+        (run_dir / 'result.json').write_text(json.dumps({
+            'task_id': 'steps-task', 'status': 'blocked', 'model': 'm', 'steps': 2,
+        }), encoding='utf-8')
+        detail = harness_herdr.build_herdr_dashboard_data(
+            self.root, run_id='run-steps')['selected_run_detail']
+        self.assertEqual(detail['run_id'], 'run-steps')
+        self.assertEqual(len(detail['worker_steps']), 4)
+        self.assertEqual(detail['worker_steps'][0]['target'], 'deep/file.py')
+
+    def test_herdr_run_action_retry_escalate_abort(self):
+        from unittest.mock import patch
+
+        runs_dir = Path(self.root) / 'runs'
+        task = {'task_id': 'act-task', 'model': 'openrouter/z-ai/glm-5.3-flash',
+                'directory': self.root, 'files': [self.path('a.py')],
+                'test_argv': ['/bin/true'], 'prompt': 'fix'}
+        self._write_run(runs_dir, 'run-act', {
+            'task_id': 'act-task', 'status': 'blocked', 'reason': 'step_limit',
+        }, task=task)
+        launched = []
+        with patch.object(harness_herdr.subprocess, 'Popen',
+                          side_effect=lambda argv, **k: launched.append(argv)):
+            retry = harness_herdr.herdr_run_action(
+                'retry', 'run-act', state_dir=self.root)
+        self.assertEqual(retry['status'], 'ok')
+        self.assertEqual(retry['model'], 'openrouter/z-ai/glm-5.3-flash')
+        self.assertEqual(len(launched), 1)
+
+        with patch.object(harness_herdr.subprocess, 'Popen',
+                          side_effect=lambda argv, **k: launched.append(argv)):
+            escalated = harness_herdr.herdr_run_action(
+                'escalate', 'run-act', state_dir=self.root,
+                model='openrouter/custom/teacher-x')
+        self.assertEqual(escalated['status'], 'ok')
+        self.assertEqual(escalated['model'], 'openrouter/custom/teacher-x')
+
+        with patch.object(harness_herdr.subprocess, 'Popen',
+                          side_effect=lambda argv, **k: launched.append(argv)):
+            default_esc = harness_herdr.herdr_run_action(
+                'escalate', 'run-act', state_dir=self.root)
+        self.assertEqual(default_esc['status'], 'ok')
+        self.assertTrue(str(default_esc.get('model') or '').startswith('openrouter/'))
+        self.assertEqual(len(launched), 3)
+
+        # missing task.json -> error
+        missing = harness_herdr.herdr_run_action(
+            'retry', 'run-none', state_dir=self.root)
+        self.assertEqual(missing['status'], 'error')
+
+        # abort: kill matched opencode-cli processes, mark result blocked
+        (runs_dir / 'run-act' / 'result.json').write_text(json.dumps({
+            'task_id': 'act-task', 'status': 'running', 'session_id': 'sess-42',
+        }), encoding='utf-8')
+        ps_lines = '\n'.join([
+            '  PID TTY           TIME CMD',
+            '  101 ?  0:00 /usr/bin/opencode-cli run run-act something',
+            '  102 ?  0:00 /usr/bin/opencode-cli run unrelated',
+            '  103 ?  0:00 /bin/other',
+        ])
+        killed = []
+        with patch.object(harness_herdr.subprocess, 'run',
+                          return_value=type('P', (), {'stdout': ps_lines})()), \
+                patch.object(harness_herdr.os, 'kill',
+                             side_effect=lambda pid, sig: killed.append(pid)), \
+                patch('harness.finops.DB', Path(self.root) / 'no-finops.db'), \
+                patch.object(harness_herdr.time, 'time', return_value=1234.5):
+            abort = harness_herdr.herdr_run_action(
+                'abort', 'run-act', state_dir=self.root)
+        self.assertEqual(abort['status'], 'ok')
+        self.assertEqual(killed, [101])
+        result = json.loads(
+            (runs_dir / 'run-act' / 'result.json').read_text(encoding='utf-8'))
+        self.assertEqual(result['status'], 'blocked')
+        self.assertEqual(result['reason'], 'aborted_from_dashboard')
+
+        # abort with session_id -> clears busy state via finops
+        with patch.object(harness_herdr.subprocess, 'run',
+                          return_value=type('P', (), {'stdout': ''})()), \
+                patch.object(harness_herdr.os, 'kill'), \
+                patch('harness.finops.clear_session_busy') as clear_busy, \
+                patch('harness.finops.DB', Path(self.path('finops.db'))):
+            Path(self.path('finops.db')).write_text('', encoding='utf-8')
+            abort2 = harness_herdr.herdr_run_action(
+                'abort', 'run-act', state_dir=self.root)
+        self.assertEqual(abort2['status'], 'ok')
+        clear_busy.assert_called_once()
+
+        # CLI dispatch
+        cli_calls = []
+        with patch.object(harness_herdr, 'herdr_run_action',
+                          side_effect=lambda *a, **k: cli_calls.append((a, k)) or
+                          {'status': 'ok'}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = harness_cli.main([
+                    'herdr', 'action', 'escalate', '--run-id', 'run-act',
+                    '--state-dir', self.root, '--model', 'openrouter/custom/teacher-x'])
+        self.assertEqual(rc, 0)
+        args, kwargs = cli_calls[0]
+        self.assertEqual(args, ('escalate', 'run-act'))
+        self.assertEqual(kwargs.get('state_dir'), self.root)
+        self.assertEqual(kwargs.get('model'), 'openrouter/custom/teacher-x')
+
+    def test_collect_pod_and_sml_status_in_dashboard(self):
+        sml = Path(self.root) / 'sml'
+        (sml / '.harness').mkdir(parents=True)
+        my_pid = os.getpid()
+        (sml / '.harness' / 'pod_sync.pid').write_text(f'{my_pid}\n', encoding='utf-8')
+        (sml / '.harness' / 'pod_sync.log').write_text(
+            'sync line 1\nsync line 2\n', encoding='utf-8')
+        (sml / 'results').mkdir(parents=True)
+        (sml / 'results' / '.pod_status.json').write_text(json.dumps({
+            'gpu': 'A100', 'free_vram_mib': 4096,
+        }), encoding='utf-8')
+        evals_dir = sml / 'results' / 'external_evals'
+        evals_dir.mkdir(parents=True)
+        (evals_dir / 'Tenet-4B.json').write_text(json.dumps({
+            'model_id': 'tenet-4b',
+            'arms': ['baseline', 'grpo'],
+            'after': {'accuracy': 0.9123, 'f1': 0.8456},
+        }), encoding='utf-8')
+
+        status = harness_herdr.collect_pod_and_sml_status(sml_dir=str(sml))
+        self.assertEqual(status['sml_dir'], str(sml))
+        self.assertEqual(status['pod_sync']['sml']['pid'], my_pid)
+        self.assertTrue(status['pod_sync']['sml']['pid_alive'])
+        self.assertIn('sync line 2', status['pod_sync']['sml']['log_tail'])
+        self.assertEqual(status['pod_status'], {'gpu': 'A100', 'free_vram_mib': 4096})
+        self.assertEqual(len(status['external_evals']), 1)
+        eval_entry = status['external_evals'][0]
+        self.assertEqual(eval_entry['file'], 'Tenet-4B.json')
+        self.assertEqual(eval_entry['model_id'], 'tenet-4b')
+        self.assertEqual(eval_entry['arms'], ['baseline', 'grpo'])
+        self.assertEqual(eval_entry['metrics'],
+                         {'accuracy': 0.9123, 'f1': 0.8456})
+
+        data = harness_herdr.build_herdr_dashboard_data(self.root)
+        self.assertIn('pods_sml', data)
+        self.assertIn('pod_sync', data['pods_sml'])
+        self.assertIn('external_evals', data['pods_sml'])
 
 
 if __name__ == '__main__':

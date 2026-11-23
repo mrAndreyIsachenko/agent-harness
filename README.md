@@ -425,10 +425,13 @@ $ harness trace state/runs/<run>/traces.jsonl       # OpenInference trace tree
 $ harness trace --sync-state state/                 # backfill runs to Phoenix OTLP (H-20)
 $ harness rollout task.json --group-size 4          # group rollouts for GRPO / rejection sampling (H-73)
 $ harness export-dataset --state-dir state/ --mode sft --clean-only --max-steps 6 --output sft.jsonl
+$ harness stats --state-dir state/ --insights --days 7   # 7-day rolling window & funnel (H-77)
+$ harness pod preflight --pods root@gpu-1:22             # cloud GPU pod SSH orchestration (H-78)
+$ harness herdr status --state-dir state/                # Herdr multiplexer dashboard & actions (H-78)
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-73
+## Capabilities H-15 .. H-78
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -476,6 +479,11 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-71** | Native `Tenet` / `Small Model Lab` model routing (`TENET_PROVIDER_ROUTING`, `is_local_or_sml_model`, `upstream_mode="llamacpp"`) and `check_cot_and_slop_integrity` (`<think>...</think>` unclosed/collapse & slop prefix warnings) | `routing.py`, `guards.py` |
 | **H-72** | In-proxy `check_cot_and_slop_integrity` enforcement (`cot_slop_warnings`, OpenInference `GUARDRAIL` `cot_slop_integrity` spans) and `$0` API-cost billing gate for local/SML models (`vllm`, `llamacpp`, `tenet-*`, `sml-*`) | `finops.py`, `proxy.py` |
 | **H-73** | Group rollout runner (`run_group_rollout`, `harness rollout <task.json> --group-size G`) for On-Policy GRPO and Teacher Rejection Sampling with snapshot/worktree isolation, multiplicative rewards, group-normalized advantages, and best-patch restoration | `sandbox.py`, `cli.py`, `__init__.py` |
+| **H-74** | FinOps no-edit stall, windowed-read & recoverable edit-error guards (`window_reads`, `recoverable_errors`, `steps_since_last_edit`, `reasoning_only_streak` -> `reasoning_stall_no_tool_call`) | `finops.py` |
+| **H-75** | In-loop `.opencode/plugin/harness_guard.ts` TypeScript guard plugin (`py_compile`/JSON check + near-matching `oldString` line hints) and per-run `/tmp/hb-<hash12>` sandbox isolation (`render_guard_plugin`, `stage_isolation_sandbox`) | `sandbox.py` |
+| **H-76** | Contrastive Workspace Lessons Library (`record_repair_lesson`, `load_workspace_lessons`, `lessons.jsonl`) auto-capturing repair signatures and injecting `### Workspace Guardrails (from prior repairs)` into retries | `sandbox.py` |
+| **H-77** | Time-windowed `--days` stats filtering, 7-day rolling funnel (`_recent_7d_insights`), active vs. stale (`>7d`) unresolved task split, and `zero_edit_failed_runs` telemetry | `report.py`, `cli.py` |
+| **H-78** | Cloud Pod SSH orchestration (`harness pod {preflight,sync,launch,wait}`) and native Herdr terminal multiplexer integration (`harness herdr`, OSC 7501 sequences, JSON-lines Unix socket, `herdr-plugin.toml`) | `pod.py`, `herdr.py`, `cli.py` |
 
 ## Quickstart
 

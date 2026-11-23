@@ -14,6 +14,7 @@ import os
 import shutil
 import statistics
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -385,25 +386,38 @@ def _load_proxy_summary(path: Path) -> dict | None:
     return None
 
 
-def scan_state_runs(state_dir: str | Path) -> list[dict]:
+def scan_state_runs(
+    state_dir: str | Path,
+    *,
+    days: int | None = None,
+    now: float | None = None,
+) -> list[dict]:
     """Scan a live state directory for guard-runner run records.
 
     Walks ``<state_dir>/runs/<run>/result.json`` directories oldest-first by
     run-directory mtime, loading each run's optional sibling
     ``requests.json`` guard-proxy telemetry as ``proxy_summary``. A missing
     ``runs/`` directory yields ``[]``; run directories without a readable
-    ``result.json`` JSON object are skipped.
+    ``result.json`` JSON object are skipped. When ``days`` is given, only
+    runs whose directory mtime falls within the last ``days`` days are kept.
     """
     runs_dir = Path(state_dir) / "runs"
     if not runs_dir.is_dir():
         return []
+
+    cutoff = None
+    if days is not None:
+        cutoff = (time.time() if now is None else now) - days * 86400.0
 
     run_dirs: list[tuple[float, Path]] = []
     for child in runs_dir.iterdir():
         try:
             if not child.is_dir() or not (child / "result.json").is_file():
                 continue
-            run_dirs.append((child.stat().st_mtime, child))
+            mtime = child.stat().st_mtime
+            if cutoff is not None and mtime < cutoff:
+                continue
+            run_dirs.append((mtime, child))
         except OSError:
             continue
     run_dirs.sort(key=lambda entry: entry[0])
@@ -423,13 +437,19 @@ def scan_state_runs(state_dir: str | Path) -> list[dict]:
     return runs
 
 
-def format_state_stats_markdown(state_dir: str | Path) -> str:
+def format_state_stats_markdown(
+    state_dir: str | Path,
+    *,
+    days: int | None = None,
+    now: float | None = None,
+) -> str:
     """Render a Markdown stats table for runs in a live state directory.
 
     Runs are grouped by model (an unknown model shows as ``unknown``) with a
-    trailing ``ALL`` summary row covering every run.
+    trailing ``ALL`` summary row covering every run. ``days`` limits the
+    scan to runs from the last N days.
     """
-    runs = scan_state_runs(state_dir)
+    runs = scan_state_runs(state_dir, days=days, now=now)
     if not runs:
         return "No runs found."
 
@@ -467,17 +487,27 @@ _READ_TOOL_NAMES = frozenset({"read", "read_file"})
 _EDIT_TOOL_NAMES = frozenset({"edit", "write", "edit_file", "write_file", "apply_patch"})
 
 
-def _iter_run_records(state_dir: str | Path):
-    """Yield ``(run_dir, result_dict)`` for readable state runs, oldest-first by mtime."""
+def _iter_run_records(state_dir: str | Path, *, days: int | None = None, now: float | None = None):
+    """Yield ``(run_dir, result_dict)`` for readable state runs, oldest-first by mtime.
+
+    When ``days`` is given, only runs whose directory mtime falls within the
+    last ``days`` days are yielded.
+    """
     runs_dir = Path(state_dir) / "runs"
     if not runs_dir.is_dir():
         return
+    cutoff = None
+    if days is not None:
+        cutoff = (time.time() if now is None else now) - days * 86400.0
     run_dirs: list[tuple[float, Path]] = []
     for child in runs_dir.iterdir():
         try:
             if not child.is_dir() or not (child / "result.json").is_file():
                 continue
-            run_dirs.append((child.stat().st_mtime, child))
+            mtime = child.stat().st_mtime
+            if cutoff is not None and mtime < cutoff:
+                continue
+            run_dirs.append((mtime, child))
         except OSError:
             continue
     run_dirs.sort(key=lambda entry: entry[0])
@@ -526,21 +556,36 @@ def _load_tool_spans(run_dir: Path) -> list[dict]:
     return spans
 
 
-def compute_state_insights(state_dir: str | Path) -> dict:
+def compute_state_insights(
+    state_dir: str | Path,
+    *,
+    days: int | None = None,
+    now: float | None = None,
+    _include_recent: bool = True,
+) -> dict:
     """Compute task-funnel, blocked-reason and tool-error insights from a state directory."""
     task_order: list[str] = []
     task_runs: dict[str, list[dict]] = {}
+    task_max_mtime: dict[str, float] = {}
 
     blocked_counter: Counter[str] = Counter()
     tool_error_counter: Counter[tuple[str, str]] = Counter()
     reads_before_edit_samples: list[int] = []
+    zero_edit_failed_runs = 0
 
-    for run_dir, result in _iter_run_records(state_dir):
+    ref_now = time.time() if now is None else now
+
+    for run_dir, result in _iter_run_records(state_dir, days=days, now=now):
         task_id = str(result.get("task_id") or run_dir.name)
         if task_id not in task_runs:
             task_order.append(task_id)
             task_runs[task_id] = []
         task_runs[task_id].append(result)
+        try:
+            mtime = run_dir.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        task_max_mtime[task_id] = max(task_max_mtime.get(task_id, 0.0), mtime)
 
         status = str(result.get("status") or "")
         if status == "blocked":
@@ -580,7 +625,10 @@ def compute_state_insights(state_dir: str | Path) -> dict:
                 reads += 1
         if seen_edit:
             reads_before_edit_samples.append(reads)
+        elif status == "blocked":
+            zero_edit_failed_runs += 1
 
+    recent_cutoff = ref_now - 7 * 86400.0
     funnel = {
         "total_tasks": len(task_order),
         "resolved_tasks": 0,
@@ -589,6 +637,8 @@ def compute_state_insights(state_dir: str | Path) -> dict:
         "micro_repair_ok": 0,
         "salvaged_ok": 0,
         "unresolved_tasks": 0,
+        "unresolved_active_tasks": 0,
+        "unresolved_stale_single_shot_tasks": 0,
     }
     for task_id in task_order:
         runs = task_runs[task_id]
@@ -598,6 +648,10 @@ def compute_state_insights(state_dir: str | Path) -> dict:
         )
         if first_resolved_idx is None:
             funnel["unresolved_tasks"] += 1
+            if len(runs) >= 2 or task_max_mtime.get(task_id, 0.0) >= recent_cutoff:
+                funnel["unresolved_active_tasks"] += 1
+            else:
+                funnel["unresolved_stale_single_shot_tasks"] += 1
             continue
         funnel["resolved_tasks"] += 1
         if first_resolved_idx > 0:
@@ -621,32 +675,84 @@ def compute_state_insights(state_dir: str | Path) -> dict:
         else 0.0
     )
 
-    return {
+    insights = {
         "task_funnel": funnel,
         "top_blocked_reasons": blocked_counter.most_common(10),
         "top_tool_errors": tool_error_counter.most_common(10),
         "avg_reads_before_first_edit": float(avg_reads),
+        "zero_edit_failed_runs": zero_edit_failed_runs,
+    }
+    if days is None and _include_recent:
+        insights["recent_7d"] = _recent_7d_insights(state_dir, ref_now)
+    return insights
+
+
+def _recent_7d_insights(state_dir: str | Path, ref_now: float) -> dict:
+    """Compute the compact last-7-days snapshot embedded in the full insights report."""
+    recent_runs = scan_state_runs(state_dir, days=7, now=ref_now)
+    recent_insights = compute_state_insights(
+        state_dir, days=7, now=ref_now, _include_recent=False
+    )
+    return {
+        "runs": len(recent_runs),
+        "pass_rate": (
+            aggregate_benchmark_runs(recent_runs)["pass_rate"] if recent_runs else 0.0
+        ),
+        "resolved_tasks": recent_insights["task_funnel"]["resolved_tasks"],
+        "unresolved_tasks": recent_insights["task_funnel"]["unresolved_tasks"],
+        "top_blocked_reasons": recent_insights["top_blocked_reasons"][:5],
     }
 
 
-def format_state_insights_markdown(state_dir: str | Path) -> str:
+def format_state_insights_markdown(
+    state_dir: str | Path,
+    *,
+    days: int | None = None,
+    now: float | None = None,
+) -> str:
     """Render the state-directory insights report as Markdown."""
-    insights = compute_state_insights(state_dir)
+    insights = compute_state_insights(state_dir, days=days, now=now)
     funnel = insights["task_funnel"]
-    lines = [
-        "## Task Resolution Funnel",
-        "",
-        f"- Total tasks: {funnel['total_tasks']}",
-        f"- Resolved: {funnel['resolved_tasks']}",
-        f"  - First try: {funnel['first_try_ok']}",
-        f"  - Retry/escalation: {funnel['retry_or_escalation_ok']}",
-        f"  - Micro repair: {funnel['micro_repair_ok']}",
-        f"  - Salvaged: {funnel['salvaged_ok']}",
-        f"- Unresolved: {funnel['unresolved_tasks']}",
-        "",
-        "## Top Blocked Reasons",
-        "",
-    ]
+    lines: list[str] = []
+    if days is None and "recent_7d" in insights:
+        recent = insights["recent_7d"]
+        lines.extend(
+            [
+                "## Recent Window (Last 7 Days)",
+                "",
+                f"- Runs: {recent['runs']}",
+                f"- Pass@1: {recent['pass_rate'] * 100:.1f}%",
+                f"- Resolved: {recent['resolved_tasks']}",
+                f"- Unresolved: {recent['unresolved_tasks']}",
+                "- Top Blocked Reasons: "
+                + (
+                    ", ".join(
+                        f"{reason} ({count})" for reason, count in recent["top_blocked_reasons"]
+                    )
+                    if recent["top_blocked_reasons"]
+                    else "None"
+                ),
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "## Task Resolution Funnel",
+            "",
+            f"- Total tasks: {funnel['total_tasks']}",
+            f"- Resolved: {funnel['resolved_tasks']}",
+            f"  - First try: {funnel['first_try_ok']}",
+            f"  - Retry/escalation: {funnel['retry_or_escalation_ok']}",
+            f"  - Micro repair: {funnel['micro_repair_ok']}",
+            f"  - Salvaged: {funnel['salvaged_ok']}",
+            f"- Unresolved: {funnel['unresolved_tasks']}",
+            f"  - Active / multi-attempt: {funnel['unresolved_active_tasks']}",
+            f"  - Single-shot / probe / stale (>7d, 1 attempt): {funnel['unresolved_stale_single_shot_tasks']}",
+            "",
+            "## Top Blocked Reasons",
+            "",
+        ]
+    )
     if insights["top_blocked_reasons"]:
         for reason, count in insights["top_blocked_reasons"]:
             lines.append(f"- {reason}: {count}")
@@ -662,8 +768,18 @@ def format_state_insights_markdown(state_dir: str | Path) -> str:
         [
             "",
             f"Average reads before first edit: {insights['avg_reads_before_first_edit']:.2f}",
+            f"Zero-edit failed runs: {insights['zero_edit_failed_runs']}",
         ]
     )
+    lessons_path = Path(state_dir) / "lessons.jsonl"
+    if lessons_path.is_file():
+        lesson_count = sum(
+            1
+            for line in lessons_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        )
+        if lesson_count > 0:
+            lines.append(f"- Recorded repair lessons: {lesson_count}")
     return "\n".join(lines)
 
 

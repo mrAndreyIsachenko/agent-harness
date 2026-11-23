@@ -187,11 +187,12 @@ def _load_trace_spans(path: str) -> list:
 
 
 def _run_stats(args: argparse.Namespace) -> int:
+    days = getattr(args, "days", None)
     if getattr(args, "backfill_salvage", False):
         backfill_salvaged_runs(args.state_dir)
-    print(format_state_stats_markdown(args.state_dir))
+    print(format_state_stats_markdown(args.state_dir, days=days))
     if getattr(args, "insights", False):
-        print("\n" + format_state_insights_markdown(args.state_dir))
+        print("\n" + format_state_insights_markdown(args.state_dir, days=days))
     return 0
 
 
@@ -461,6 +462,145 @@ def _run_export_dataset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pod_module():
+    """Lazily import ``harness.pod`` so the CLI stays importable without it."""
+    return importlib.import_module("harness.pod")
+
+
+def _parse_paths(raw: str | None) -> tuple[str, ...]:
+    parts = tuple(part.strip() for part in (raw or "").split(",") if part.strip())
+    return parts or ("results", "releases")
+
+
+def _run_pod_preflight(args: argparse.Namespace) -> int:
+    pod = _pod_module()
+    return pod.preflight(args.host, args.workdir, min_free_vram_mib=args.min_free_vram_mib)
+
+
+def _run_pod_sync(args: argparse.Namespace) -> int:
+    pod = _pod_module()
+    return pod.sync_pods(
+        args.host,
+        args.remote_dir,
+        args.local_dir,
+        _parse_paths(args.paths),
+        daemon=args.daemon,
+        stop=args.stop,
+        once=args.once,
+        interval=args.interval,
+        _daemon_loop=args._daemon_loop,
+    )
+
+
+def _run_pod_launch(args: argparse.Namespace) -> int:
+    pod = _pod_module()
+    worker = list(args.worker_cmd or [])
+    if worker and worker[0] == "--":
+        worker = worker[1:]
+    return pod.launch(
+        args.host,
+        args.workdir,
+        args.session,
+        worker,
+        stagger_vram_mib=args.stagger_vram_mib,
+        on_checkpoint=args.on_checkpoint,
+        max_retries=args.max_retries,
+    )
+
+
+def _run_pod_wait(args: argparse.Namespace) -> int:
+    pod = _pod_module()
+    return pod.wait(
+        args.host,
+        args.workdir,
+        max_wait_sec=args.max_wait_sec,
+        poll_interval_sec=args.poll_interval_sec,
+        local_dir=args.local_dir,
+    )
+
+
+def _herdr_module():
+    """Lazily import ``harness.herdr`` so the CLI stays importable without it."""
+    return importlib.import_module("harness.herdr")
+
+
+def _run_herdr_status(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    payload = {
+        "active": herdr.is_herdr_active(),
+        "herdr_bin": herdr.herdr_bin(),
+        "pane_id": os.environ.get("HERDR_PANE_ID"),
+        "workspace_id": os.environ.get("HERDR_WORKSPACE_ID"),
+        "tab_id": os.environ.get("HERDR_TAB_ID"),
+        "socket_path": os.environ.get("HERDR_SOCKET_PATH"),
+    }
+    print(json.dumps(payload, sort_keys=True))
+    return 0
+
+
+def _run_herdr_report(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    optional = {
+        "model": args.model,
+        "step": args.step,
+        "max_steps": args.max_steps,
+        "cost": args.cost,
+        "budget": args.budget,
+        "guard_hits": args.guard_hits,
+        "reason": args.reason,
+        "phase": args.phase,
+    }
+    kwargs = {key: value for key, value in optional.items() if value is not None}
+    summary = herdr.report_herdr_task(
+        args.task_id, args.state, force_osc=args.force_osc, **kwargs)
+    print(json.dumps(summary, sort_keys=True, default=str))
+    return 0
+
+
+def _run_herdr_release(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    herdr.release_herdr_agent(force_osc=args.force_osc)
+    print(json.dumps({"released": True}))
+    return 0
+
+
+def _run_herdr_dashboard_json(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    payload = herdr.build_herdr_dashboard_data(
+        args.state_dir, run_id=args.run_id, limit=args.limit,
+        days=args.days, project=args.project)
+    print(json.dumps(payload, sort_keys=True, default=str))
+    return 0
+
+
+def _run_herdr_action(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    result = herdr.herdr_run_action(
+        args.herdr_action, args.run_id, state_dir=args.state_dir,
+        model=getattr(args, 'model', None))
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0 if result.get('status') == 'ok' else 1
+
+
+def _run_herdr_ui(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    summary = herdr.open_herdr_ui(direction=args.direction)
+    print(json.dumps(summary, sort_keys=True))
+    return 0 if summary.get("status") == "opened" else 1
+
+
+def _run_herdr_spawn(args: argparse.Namespace) -> int:
+    herdr = _herdr_module()
+    cmd = list(args.command_argv or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    result = herdr.spawn_herdr_pane(
+        cmd, title=args.title, direction=args.direction, cwd=args.cwd,
+        focus=args.focus)
+    print(json.dumps(result, sort_keys=True, default=str))
+    return 0 if result.get("status") == "spawned" else 1
+
+
 def _build_parser() -> argparse.ArgumentParser:
     default_state_dir = os.environ.get(
         "HARNESS_STATE_DIR",
@@ -496,6 +636,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--state-dir",
         default=default_state_dir,
         help="state directory containing runs/ (default: %(default)s)",
+    )
+    stats.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="only include runs from the last N days",
     )
     stats.add_argument(
         "--insights",
@@ -718,6 +864,180 @@ def _build_parser() -> argparse.ArgumentParser:
         help="keep only runs with a positive step count at or below this cap",
     )
     export_dataset.set_defaults(handler=_run_export_dataset)
+
+    pod = subparsers.add_parser("pod", help="cloud GPU pod orchestration over SSH")
+    pod_sub = pod.add_subparsers(dest="pod_command", metavar="pod_command")
+
+    pod_preflight = pod_sub.add_parser("preflight", help="check GPU/VRAM/disk/HF_TOKEN on a pod")
+    pod_preflight.add_argument("--host", required=True, help="ssh target (user@host)")
+    pod_preflight.add_argument("--workdir", required=True, help="remote working directory")
+    pod_preflight.add_argument(
+        "--min-free-vram-mib", type=int, default=6144,
+        help="minimum free VRAM per GPU in MiB (default: %(default)s)",
+    )
+    pod_preflight.set_defaults(handler=_run_pod_preflight)
+
+    pod_sync = pod_sub.add_parser("sync", help="rsync results/releases from the pod")
+    pod_sync.add_argument("--host", required=True, help="ssh target (user@host)")
+    pod_sync.add_argument("--remote-dir", required=True, help="remote source directory")
+    pod_sync.add_argument("--local-dir", required=True, help="local destination directory")
+    pod_sync.add_argument(
+        "--paths", default="results,releases",
+        help="comma-separated subdirectories to pull (default: %(default)s)",
+    )
+    sync_mode = pod_sync.add_mutually_exclusive_group()
+    sync_mode.add_argument("--daemon", action="store_true", help="run a detached sync daemon")
+    sync_mode.add_argument("--stop", action="store_true", help="stop the daemon and sync once")
+    sync_mode.add_argument("--once", action="store_true", help="run a single sync pass")
+    pod_sync.add_argument(
+        "--interval", type=int, default=60,
+        help="daemon poll interval in seconds (default: %(default)s)",
+    )
+    pod_sync.add_argument("--_daemon-loop", dest="_daemon_loop", action="store_true",
+                          help=argparse.SUPPRESS)
+    pod_sync.set_defaults(handler=_run_pod_sync)
+
+    pod_launch = pod_sub.add_parser("launch", help="start a supervised worker in tmux")
+    pod_launch.add_argument("--host", required=True, help="ssh target (user@host)")
+    pod_launch.add_argument("--workdir", required=True, help="remote working directory")
+    pod_launch.add_argument("--session", required=True, help="tmux session name")
+    pod_launch.add_argument(
+        "--stagger-vram-mib", type=int, default=6144,
+        help="free VRAM required before starting (default: %(default)s)",
+    )
+    pod_launch.add_argument(
+        "--on-checkpoint", default=None, help="hook command run at each retry checkpoint",
+    )
+    pod_launch.add_argument(
+        "--max-retries", type=int, default=2,
+        help="worker retries before marking ERROR (default: %(default)s)",
+    )
+    pod_launch.add_argument(
+        "worker_cmd", nargs="*", metavar="worker_cmd",
+        help="worker command to run on the pod (after --)",
+    )
+    pod_launch.set_defaults(handler=_run_pod_launch)
+
+    pod_wait = pod_sub.add_parser("wait", help="blocking zero-token status monitor")
+    pod_wait.add_argument("--host", required=True, help="ssh target (user@host)")
+    pod_wait.add_argument("--workdir", required=True, help="remote working directory")
+    pod_wait.add_argument(
+        "--max-wait-sec", type=int, default=180,
+        help="maximum blocking wait in seconds (default: %(default)s)",
+    )
+    pod_wait.add_argument(
+        "--poll-interval-sec", type=int, default=15,
+        help="status poll interval in seconds (default: %(default)s)",
+    )
+    pod_wait.add_argument(
+        "--local-dir", default=None,
+        help="sync destination triggered on CHECKPOINT/DONE/ERROR",
+    )
+    pod_wait.set_defaults(handler=_run_pod_wait)
+
+    herdr_cmd = subparsers.add_parser(
+        "herdr", help="report agent progress to a herdr pane")
+    herdr_sub = herdr_cmd.add_subparsers(dest="herdr_command", metavar="herdr_command")
+
+    herdr_status = herdr_sub.add_parser(
+        "status", help="print herdr environment status as JSON")
+    herdr_status.set_defaults(handler=_run_herdr_status)
+
+    herdr_report = herdr_sub.add_parser("report", help="report agent task state to herdr")
+    herdr_report.add_argument("--task-id", required=True, help="task identifier")
+    herdr_report.add_argument(
+        "--state", required=True,
+        choices=("working", "blocked", "done", "error", "idle", "clear"),
+        help="agent state to report")
+    herdr_report.add_argument("--model", default=None, help="model ID token")
+    herdr_report.add_argument("--step", type=int, default=None, help="current step number")
+    herdr_report.add_argument("--max-steps", type=int, default=None, help="step budget")
+    herdr_report.add_argument("--cost", type=float, default=None, help="cost so far in USD")
+    herdr_report.add_argument("--budget", type=float, default=None, help="cost budget in USD")
+    herdr_report.add_argument("--guard-hits", type=int, default=None, help="guard hit count")
+    herdr_report.add_argument("--reason", default=None, help="block reason")
+    herdr_report.add_argument("--phase", default=None, help="free-form phase label")
+    herdr_report.add_argument(
+        "--force-osc", action="store_true", help="emit OSC 7501 even without HERDR_ENV")
+    herdr_report.set_defaults(handler=_run_herdr_report)
+
+    herdr_release = herdr_sub.add_parser(
+        "release", help="release the herdr pane from this agent")
+    herdr_release.add_argument(
+        "--force-osc", action="store_true", help="emit OSC 7501 even without HERDR_ENV")
+    herdr_release.set_defaults(handler=_run_herdr_release)
+
+    herdr_spawn = herdr_sub.add_parser("spawn", help="spawn a worker pane via herdr")
+    herdr_spawn.add_argument("--title", default=None, help="pane title")
+    herdr_spawn.add_argument(
+        "--direction", choices=("right", "down"), default="right",
+        help="split direction (default: %(default)s)")
+    herdr_spawn.add_argument("--cwd", default=None, help="working directory for the pane")
+    herdr_spawn.add_argument("--focus", action="store_true", help="focus the new pane")
+    herdr_spawn.add_argument(
+        "command_argv", nargs=argparse.REMAINDER, metavar="-- <cmd...>",
+        help="worker command to run in the pane (after --)")
+    herdr_spawn.set_defaults(handler=_run_herdr_spawn)
+
+    herdr_dashboard = herdr_sub.add_parser(
+        "dashboard-json", help="print Herdr dashboard data as JSON")
+    herdr_dashboard.add_argument(
+        "--state-dir",
+        default=default_state_dir,
+        help="state directory containing runs/ (default: %(default)s)",
+    )
+    herdr_dashboard.add_argument(
+        "--run-id", default=None,
+        help="run id to select for the trace view (default: newest run)")
+    herdr_dashboard.add_argument(
+        "--limit", type=int, default=10,
+        help="number of recent runs to include (default: %(default)s)")
+    herdr_dashboard.add_argument(
+        "--days", type=int, default=None,
+        help="filter runs to last N days")
+    herdr_dashboard.add_argument(
+        "--project", type=str, default=None,
+        help="filter runs by project")
+    herdr_dashboard.set_defaults(handler=_run_herdr_dashboard_json)
+
+    herdr_action = herdr_sub.add_parser(
+        "action", help="run dashboard actions (retry, escalate, abort)")
+    herdr_action_sub = herdr_action.add_subparsers(
+        dest="herdr_action", metavar="action")
+
+    herdr_action_retry = herdr_action_sub.add_parser(
+        "retry", help="retry a run")
+    herdr_action_retry.add_argument("--run-id", required=True, help="run id")
+    herdr_action_retry.add_argument(
+        "--state-dir",
+        default=default_state_dir,
+        help="state directory containing runs/ (default: %(default)s)")
+    herdr_action_retry.set_defaults(handler=_run_herdr_action)
+
+    herdr_action_escalate = herdr_action_sub.add_parser(
+        "escalate", help="escalate a run with a model override")
+    herdr_action_escalate.add_argument("--run-id", required=True, help="run id")
+    herdr_action_escalate.add_argument("--model", default=None, help="model ID token")
+    herdr_action_escalate.add_argument(
+        "--state-dir",
+        default=default_state_dir,
+        help="state directory containing runs/ (default: %(default)s)")
+    herdr_action_escalate.set_defaults(handler=_run_herdr_action)
+
+    herdr_action_abort = herdr_action_sub.add_parser(
+        "abort", help="abort a run")
+    herdr_action_abort.add_argument("--run-id", required=True, help="run id")
+    herdr_action_abort.add_argument(
+        "--state-dir",
+        default=default_state_dir,
+        help="state directory containing runs/ (default: %(default)s)")
+    herdr_action_abort.set_defaults(handler=_run_herdr_action)
+
+    herdr_ui = herdr_sub.add_parser("ui", help="open the dashboard pane via herdr-app")
+    herdr_ui.add_argument(
+        "--direction", choices=("right", "down"), default="right",
+        help="split direction (default: %(default)s)")
+    herdr_ui.set_defaults(handler=_run_herdr_ui)
 
     return parser
 
