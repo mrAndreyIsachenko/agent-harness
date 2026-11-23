@@ -398,6 +398,36 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                 continue
             seen.add(str(resolved))
             result.append(str(resolved))
+    # H-79: add existing conftest.py ancestors for test-file targets.
+    if len(result) < max_files:
+        for f in files:
+            if len(result) >= max_files:
+                break
+            p = Path(f).resolve()
+            if not (p.name.startswith('test_') or p.name.endswith('_test.py')
+                    or 'tests' in p.parts):
+                continue
+            visited = 0
+            for anc in [p.parent, *list(p.parent.parents)]:
+                if dir_path is not None:
+                    if not anc.is_relative_to(dir_path):
+                        break
+                elif visited >= 2:
+                    break
+                visited += 1
+                cand = anc / 'conftest.py'
+                try:
+                    resolved = cand.resolve()
+                except OSError:
+                    continue
+                if str(resolved) in seen or not resolved.is_file():
+                    continue
+                if dir_path is not None and not resolved.is_relative_to(dir_path):
+                    continue
+                seen.add(str(resolved))
+                result.append(str(resolved))
+                if len(result) >= max_files:
+                    break
     # H-65: second pass — infer companions from local imports of editable .py files.
     if len(result) < max_files:
         for f in files:
@@ -664,9 +694,11 @@ def check_patch(task):
     if git('--check').returncode:
         raise GuardError('patch_does_not_apply_cleanly')
 
-def render_guard_plugin() -> str:
+def render_guard_plugin(allowed_files=(), read_only_files=()) -> str:
     """Render the in-loop TypeScript guard plugin injected into OpenCode runs."""
-    return r'''// Harness in-loop guard plugin (auto-generated; do not edit by hand).
+    allowed_json = json.dumps([str(a) for a in allowed_files])
+    read_only_json = json.dumps([str(r) for r in read_only_files])
+    body = r'''// Harness in-loop guard plugin (auto-generated; do not edit by hand).
 // Provides immediate syntax checks after write-like tools and targeted
 // recovery hints after failed edit calls.
 export default async function harnessGuardPlugin() {
@@ -700,6 +732,7 @@ export default async function harnessGuardPlugin() {
           const out = String(output?.output || "");
           const failed = out.includes("Could not find oldString")
             || (out.includes("Found ") && out.includes(" matches"));
+          const multiMatch = out.includes("Found ") && out.includes(" matches");
           if (failed) {
             const oldString = String(input?.args?.oldString || input?.args?.old_string || "");
             const needle = oldString.split("\n").map((l: string) => l.trim())
@@ -708,32 +741,74 @@ export default async function harnessGuardPlugin() {
               try {
                 const text = await Bun.file(filePath).text();
                 const lines = text.split("\n");
-                const candidates: number[] = [];
-                for (let i = 0; i < lines.length; i++) {
-                  const line = lines[i];
-                  if (line.trim() === needle || line.includes(needle)) {
-                    candidates.push(i + 1);
-                    if (candidates.length >= 3) break;
+                // H-80: exact multi-match disambiguation via indexOf.
+                let exactShown = false;
+                if (multiMatch && oldString.length > 0) {
+                  const spans: Array<[number, number]> = [];
+                  let pos = 0;
+                  while (spans.length < 4) {
+                    const idx = text.indexOf(oldString, pos);
+                    if (idx < 0) break;
+                    const startLine = text.slice(0, idx).split("\n").length;
+                    const endLine = startLine + oldString.split("\n").length - 1;
+                    spans.push([startLine, endLine]);
+                    pos = idx + oldString.length;
+                  }
+                  if (spans.length > 0) {
+                    const parts: string[] = ["", "[HARNESS EDIT HINT] Exact multi-match locations for oldString (include surrounding context lines to disambiguate):"];
+                    let k = 0;
+                    for (const [startLine, endLine] of spans) {
+                      k++;
+                      const ctxStart = Math.max(1, startLine - 3);
+                      const ctxEnd = Math.min(lines.length, endLine + 3);
+                      parts.push(`--- match #${k} at lines ${startLine}-${endLine} (context ${ctxStart}-${ctxEnd}) ---`);
+                      for (let i = ctxStart; i <= ctxEnd; i++) {
+                        parts.push(`${i}: ${lines[i - 1]}`);
+                      }
+                    }
+                    output.output += "\n" + parts.join("\n");
+                    exactShown = true;
                   }
                 }
-                if (candidates.length > 0) {
-                  const parts: string[] = ["", `[HARNESS EDIT HINT] ${needle ? "near-matching lines" : "matches"} for: ${needle}`];
-                  for (const n of candidates) {
-                    const start = Math.max(1, n - 5);
-                    const end = Math.min(lines.length, n + 5);
-                    parts.push(`--- lines ${start}-${end} (match at line ${n}) ---`);
-                    for (let i = start; i <= end; i++) {
-                      parts.push(`${i}: ${lines[i - 1]}`);
+                if (!exactShown) {
+                  const candidates: number[] = [];
+                  for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (line.trim() === needle || line.includes(needle)) {
+                      candidates.push(i + 1);
+                      if (candidates.length >= 3) break;
                     }
                   }
-                  output.output += "\n" + parts.join("\n");
-                } else {
-                  output.output += `\n[HARNESS EDIT HINT] No matching or near-matching line found for: ${needle}\nCheck the target file path and exact whitespace/punctuation.`;
+                  if (candidates.length > 0) {
+                    const parts: string[] = ["", `[HARNESS EDIT HINT] ${needle ? "near-matching lines" : "matches"} for: ${needle}`];
+                    for (const n of candidates) {
+                      const start = Math.max(1, n - 5);
+                      const end = Math.min(lines.length, n + 5);
+                      parts.push(`--- lines ${start}-${end} (match at line ${n}) ---`);
+                      for (let i = start; i <= end; i++) {
+                        parts.push(`${i}: ${lines[i - 1]}`);
+                      }
+                    }
+                    output.output += "\n" + parts.join("\n");
+                  } else {
+                    output.output += `\n[HARNESS EDIT HINT] No matching or near-matching line found for: ${needle}\nCheck the target file path and exact whitespace/punctuation.`;
+                  }
                 }
               } catch {
                 // File unreadable; leave the failure message untouched.
               }
             }
+          }
+        }
+
+        // (c) H-79: read-guard hint after a denied read.
+        if (tool === "read" && String(output?.output || "").includes("Permission denied")) {
+          const allowed: string[] = __HARNESS_ALLOWED_JSON__;
+          const readOnly: string[] = __HARNESS_READ_ONLY_JSON__;
+          if (allowed.length > 0 || readOnly.length > 0) {
+            output.output += `\n[HARNESS READ GUARD] Do NOT retry reading denied paths. Editable files: ${allowed.join(", ")}. Read-only files: ${readOnly.join(", ")}.`;
+          } else {
+            output.output += `\n[HARNESS READ GUARD] Do NOT retry reading denied paths. Use only the allowed files specified in the prompt.`;
           }
         }
       } catch {
@@ -744,6 +819,8 @@ export default async function harnessGuardPlugin() {
   };
 }
 '''
+    return body.replace('__HARNESS_ALLOWED_JSON__', allowed_json).replace(
+        '__HARNESS_READ_ONLY_JSON__', read_only_json)
 
 
 def sandbox_root_for(run_dir) -> Path:
@@ -764,11 +841,12 @@ def cleanup_isolation_sandbox(run_dir) -> None:
     shutil.rmtree(sandbox_root_for(run_dir), ignore_errors=True)
 
 
-def stage_guard_plugin(run_dir) -> Path:
+def stage_guard_plugin(run_dir, *, allowed_files=(), read_only_files=()) -> Path:
     """Stage the rendered guard plugin under run_dir and return its path."""
     path = Path(run_dir) / '.opencode' / 'plugin' / 'harness_guard.ts'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(render_guard_plugin(), encoding='utf-8')
+    path.write_text(render_guard_plugin(allowed_files=allowed_files,
+                                        read_only_files=read_only_files), encoding='utf-8')
     return path
 
 
@@ -812,7 +890,9 @@ def config_for(task, *, base_url=None, run_dir=None):
     if base_url:
         cfg['providers'] = {'openrouter': {'settings': {'baseURL': base_url}}}
     if run_dir is not None:
-        plugin_path = stage_guard_plugin(Path(run_dir))
+        plugin_path = stage_guard_plugin(
+            Path(run_dir), allowed_files=task.get('files', ()),
+            read_only_files=task.get('read_only_files', ()))
         cfg['plugin'] = list(cfg.get('plugin', [])) + [plugin_path.resolve().as_uri()]
     return cfg
 
@@ -1763,6 +1843,12 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 result['session_id'] = sid2
                                 result['micro_repair_session_id'] = sid2
                                 result['micro_repair_attempted'] = True
+                                try:
+                                    if (run_dir / 'test.log').is_file():
+                                        shutil.copy2(run_dir / 'test.log',
+                                                     run_dir / 'test_before_repair.log')
+                                except OSError:
+                                    pass
                                 hashes_before_repair = _fh(task['files'])
                                 first_test_log_text = ''
                                 repaired_files: list[str] = []

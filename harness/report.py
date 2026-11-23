@@ -40,6 +40,7 @@ __all__ = [
     "export_sml_dataset",
     "purge_ephemeral_test_runs",
     "backfill_salvaged_runs",
+    "backfill_repair_lessons",
 ]
 
 # Blocked reasons considered salvageable when the test actually passed and a
@@ -1625,3 +1626,189 @@ def backfill_salvaged_runs(state_dir: str | Path, *, dry_run: bool = False) -> l
         os.replace(tmp_name, result_path)
 
     return salvaged
+
+
+def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> list[dict]:
+    """Retroactively backfill repair lessons from micro_repair runs (H-82).
+
+    Scans ``<state_dir>/runs/*/result.json`` in chronological order and, for
+    every successful run that was repaired (``repaired`` flag or a
+    ``micro_repair`` ``salvaged_from`` marker), extracts the failed-test log,
+    derives an error signature, and records a repair lesson (deduplicated by
+    ``(task_dir, error_signature)``) unless ``dry_run=True``.
+
+    Returns one record per processed run: ``run_id``, ``task_id``,
+    ``task_dir``, ``error_signature``, ``files``.
+    """
+    from harness.sandbox import _lesson_error_signature, record_repair_lesson
+
+    state_path = Path(state_dir)
+    runs_dir = state_path / "runs"
+    if not runs_dir.is_dir():
+        return []
+
+    run_dirs = sorted(
+        (d for d in runs_dir.iterdir() if d.is_dir()),
+        key=lambda d: (d.stat().st_mtime, d.name),
+    )
+
+    lessons_path = state_path / "lessons.jsonl"
+    seen: set[tuple[str, str]] = set()
+    if lessons_path.is_file():
+        try:
+            for line in lessons_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict):
+                    seen.add((
+                        str(record.get("task_dir") or ""),
+                        str(record.get("error_signature") or ""),
+                    ))
+        except OSError:
+            pass
+
+    results: list[dict] = []
+    prior_failed_logs: dict[str, str] = {}
+    for run_dir in run_dirs:
+        result_path = run_dir / "result.json"
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(result, dict):
+            continue
+
+        if result.get("status") != "validation_passed_review_required":
+            log_text = ""
+            if (run_dir / "test.log").is_file():
+                try:
+                    log_text = (run_dir / "test.log").read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    log_text = ""
+                if _lesson_error_signature(log_text) != "test_failure":
+                    prior_failed_logs[str(result.get("task_id") or "")] = log_text
+            continue
+
+        task_id = str(result.get("task_id") or "")
+        eligible = (
+            result.get("repaired") is True
+            or result.get("micro_repair_attempted") is True
+            or str(result.get("salvaged_from") or "").startswith("micro_repair")
+            or task_id in prior_failed_logs
+        )
+        if not eligible:
+            continue
+
+        hashes_before = result.get("hashes_before") or {}
+        hashes_after = result.get("hashes_after") or {}
+        if not isinstance(hashes_before, dict):
+            hashes_before = {}
+        if not isinstance(hashes_after, dict):
+            hashes_after = {}
+
+        repaired_files = [k for k in hashes_after if hashes_before.get(k) != hashes_after.get(k)]
+        if not repaired_files:
+            repaired_files = [k for k in hashes_before]
+
+        task_dir = str(result.get("task_dir") or result.get("directory") or "")
+        if not task_dir:
+            manifest_path = run_dir / "escalate.manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if isinstance(manifest, dict):
+                    task_dir = str(manifest.get("task_dir") or manifest.get("directory") or "")
+            except (OSError, ValueError):
+                pass
+        if not task_dir:
+            try:
+                task = json.loads((run_dir / "task.json").read_text(encoding="utf-8"))
+                if isinstance(task, dict):
+                    task_dir = str(task.get("task_dir") or task.get("directory") or "")
+            except (OSError, ValueError):
+                pass
+        if not task_dir and hashes_before:
+            try:
+                cp = os.path.commonpath(list(hashes_before.keys()))
+                task_dir = cp if os.path.isdir(cp) else str(Path(cp).parent)
+            except ValueError:
+                pass
+
+        if (run_dir / "test_before_repair.log").is_file():
+            try:
+                failed_log = (run_dir / "test_before_repair.log").read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                failed_log = ""
+        else:
+            failed_log = ""
+            if (run_dir / "test.log").is_file():
+                try:
+                    failed_log = (run_dir / "test.log").read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                except OSError:
+                    failed_log = ""
+            if task_id in prior_failed_logs:
+                # The run's own test.log is post-repair output (often a plain
+                # "N passed" summary); the earlier failed attempt's log carries
+                # the actionable error signature.
+                failed_log = prior_failed_logs[task_id]
+
+        sig = _lesson_error_signature(failed_log)
+        if not (run_dir / "test_before_repair.log").is_file():
+            if sig == "test_failure":
+                continue
+            if task_id not in prior_failed_logs and not any(
+                marker in failed_log
+                for marker in ("E   ", "Traceback", "FAILED", "ERROR")
+            ):
+                # Passing pytest output (e.g. "312 passed in 48s") carries no
+                # actionable error signature; skip it instead of polluting
+                # lessons with a generic signature.
+                continue
+        if (task_dir, sig) in seen:
+            continue
+
+        rel_files: list[str] = []
+        if task_dir:
+            task_path = Path(task_dir)
+            for f in repaired_files:
+                try:
+                    rel_files.append(str(Path(f).relative_to(task_path)))
+                except ValueError:
+                    rel_files.append(str(f))
+        else:
+            rel_files = [str(f) for f in repaired_files]
+
+        seen.add((task_dir, sig))
+        results.append({
+            "run_id": run_dir.name,
+            "task_id": result.get("task_id"),
+            "task_dir": task_dir,
+            "error_signature": sig,
+            "files": rel_files,
+        })
+
+        if dry_run:
+            continue
+
+        record_repair_lesson(
+            state_path,
+            {
+                "task_id": result.get("task_id", ""),
+                "task_dir": task_dir,
+                "model": result.get("model"),
+            },
+            failed_log,
+            repaired_files,
+        )
+
+    return results

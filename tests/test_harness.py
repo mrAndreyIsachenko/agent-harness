@@ -2167,7 +2167,7 @@ class TestEgressAndSqlGuards(HarnessTestCase):
             'model': GLM,
             'messages': [
                 {'role': 'user', 'content': 'token is sk-or-v1-abcdef123456'},
-                {'role': 'assistant', 'content': [{'type': 'text', 'text': '-----BEGIN RSA PRIVATE KEY-----'}]},
+                {'role': 'assistant', 'content': [{'type': 'text', 'text': '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7'}]},
             ],
         }
         secret_violations = check_egress_payload(secret_payload)
@@ -7301,9 +7301,9 @@ class TestH55H57Fixes(unittest.TestCase):
         )
 
         for header in (
-            '-----BEGIN RSA PRIVATE KEY-----',
-            '-----BEGIN OPENSSH PRIVATE KEY-----',
-            '-----BEGIN PRIVATE KEY-----',
+            '-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7',
+            '-----BEGIN OPENSSH PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7',
+            '-----BEGIN PRIVATE KEY-----\nMIIEowIBAAKCAQEA0Z3VS5JJcds3xfn/ygWyF8PbnGy0AHB7',
         ):
             violations = check_egress_payload({'messages': [{'role': 'user', 'content': header}]})
             self.assertTrue(
@@ -9144,6 +9144,103 @@ class TestHerdrIntegration(unittest.TestCase):
         self.assertIn('pods_sml', data)
         self.assertIn('pod_sync', data['pods_sml'])
         self.assertIn('external_evals', data['pods_sml'])
+
+
+class H81EgressTests(unittest.TestCase):
+    """H81: PEM fixture false positives and oversized payload pre-compaction."""
+
+    def test_h81_pem_fixture_does_not_false_positive(self):
+        from harness.guards import check_egress_payload
+
+        # A quoted PEM fixture line (single header + a few chars) must not trip.
+        payload = {'messages': [{'role': 'user',
+                                 'content': '"-----BEGIN RSA PRIVATE KEY-----\nfake"'}]}
+        self.assertEqual(check_egress_payload(payload), [])
+
+        # A bare header line alone is not a key.
+        self.assertEqual(
+            check_egress_payload({'messages': [{'role': 'user',
+                                                'content': '-----BEGIN RSA PRIVATE KEY-----'}]}),
+            [])
+
+        # A real multiline PEM body (header + base64 line) is still flagged.
+        b64 = ('QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5eg=='
+               'MDM0NTY3ODk=')
+        body = '-----BEGIN RSA PRIVATE KEY-----\n' + b64
+        real = {'messages': [{'role': 'user', 'content': body}]}
+        violations = check_egress_payload(real)
+        self.assertTrue(any('PRIVATE KEY-----' in str(v) for v in violations))
+
+    def test_h81_proxy_pre_compacts_oversized_payload_before_egress(self):
+        import http.server
+        import threading
+        import urllib.request
+
+        from harness.proxy import OpenRouterGuardProxy
+
+        received = {}
+        max_upstream_bytes = [None]
+
+        class _Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or '0')
+                body = self.rfile.read(length)
+                received['body'] = body
+                max_upstream_bytes[0] = len(body)
+                payload = json.dumps({'choices': [{'message': {
+                    'role': 'assistant', 'content': 'ok'}}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        upstream = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _Upstream)
+        threading.Thread(target=upstream.serve_forever, daemon=True).start()
+        proxy = OpenRouterGuardProxy(lambda: None,
+                                     upstream_url='http://127.0.0.1:%d' % upstream.server_port,
+                                     enforce_egress_guard=True)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        try:
+            # Build a payload whose serialized JSON exceeds 262_144 bytes using
+            # assistant/tool messages with large read outputs (no forbidden keys).
+            big = '\n'.join('line %03d: %s' % (j, 'x' * 80) for j in range(60))
+            messages = []
+            for i in range(65):
+                messages.append({
+                    'role': 'assistant',
+                    'content': '',
+                    'tool_calls': [{'id': f'call_{i}', 'type': 'function',
+                                    'function': {'name': 'read', 'arguments': '{"filePath": "/tmp/a.py"}'}}],
+                })
+                messages.append({
+                    'role': 'tool',
+                    'tool_call_id': f'call_{i}',
+                    'content': big,
+                })
+            body = json.dumps({'model': GLM, 'messages': messages}).encode()
+            self.assertGreater(len(body), 262_144)
+
+            request = urllib.request.Request(
+                proxy.base_url + '/chat/completions', data=body,
+                headers={'Content-Type': 'application/json'}, method='POST')
+            try:
+                with urllib.request.urlopen(request, timeout=30) as resp:
+                    status = resp.status
+                    resp.read()
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                exc.read()
+
+            self.assertEqual(status, 200)
+            self.assertIsNotNone(max_upstream_bytes[0])
+            self.assertLessEqual(max_upstream_bytes[0], 262_144)
+        finally:
+            proxy.shutdown(); proxy.server_close()
+            upstream.shutdown(); upstream.server_close()
 
 
 if __name__ == '__main__':

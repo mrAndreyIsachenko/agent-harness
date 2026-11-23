@@ -116,7 +116,9 @@ _CREDENTIAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sk-or-v1-...", re.compile(r"sk-or-v1-[A-Za-z0-9_-]+")),
     (
         "PRIVATE KEY-----",
-        re.compile(r"(?<![\"'])-----BEGIN(?: [A-Z0-9]+){0,3} PRIVATE KEY-----(?![\"'])"),
+        re.compile(
+            r"-----BEGIN(?: [A-Z0-9]+){0,3} PRIVATE KEY-----(?:\\n|\r?\n)[A-Za-z0-9+/=]{32,}"
+        ),
     ),
 )
 
@@ -3159,6 +3161,41 @@ def compact_context_window(
         "tokens_after": current_tokens,
         "truncated_messages": truncated_messages,
     }
+
+
+def enforce_context_budget(
+    payload: dict[str, Any],
+    max_tokens: int = 16_000,
+    *,
+    keep_recent_turns: int = 1,
+) -> dict[str, Any]:
+    """H-81(b): shrink an oversized outbound payload's context before egress.
+
+    Operates on the request ``payload`` dict in place. When the estimated token
+    count of ``payload["messages"]`` exceeds ``max_tokens``, stale read outputs
+    are compacted first (preserving the trailing ``keep_recent_turns`` window)
+    and, if still over budget, older tool outputs are truncated via
+    :func:`compact_context_window`. Returns the payload dict.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or estimate_messages_tokens(messages) <= max_tokens:
+        return payload
+    compacted, _ = compact_stale_reads(
+        messages,
+        turn_index=len(messages),
+        keep_recent_turns=keep_recent_turns,
+        min_chars=256,
+        min_total_saved_chars=256,
+    )
+    if compacted is not messages:
+        payload["messages"] = compacted
+        messages = compacted
+    if estimate_messages_tokens(messages) > max_tokens:
+        compacted, _stats = compact_context_window(messages, max_context_tokens=max_tokens)
+        payload["messages"] = compacted
+    return payload
 
 
 def check_cot_and_slop_integrity(messages: list[dict[str, Any]]) -> list[str]:

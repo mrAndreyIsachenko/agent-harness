@@ -1,7 +1,8 @@
 import os
 import unittest
 
-from harness.sandbox import config_for, render_guard_plugin, stage_guard_plugin, verify_permissions, worker_env
+from harness.sandbox import (config_for, infer_read_only_companion_files, render_guard_plugin,
+                             stage_guard_plugin, verify_permissions, worker_env)
 
 
 def make_task(directory, files):
@@ -179,6 +180,111 @@ class GuardPluginTests(unittest.TestCase):
             cfg = config_for(task)
             self.assertNotIn('plugin', cfg)
             self.assertIn('agents', cfg)
+
+
+class InferReadOnlyCompanionTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.task_dir = os.path.realpath(self._td.name)
+
+    def _write(self, rel):
+        path = os.path.join(self.task_dir, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as fh:
+            fh.write('\n')
+        return path
+
+    def test_conftest_ancestors_included_for_test_targets(self):
+        test_file = self._write('tests/test_mod.py')
+        conftest = self._write('tests/conftest.py')
+        conftest_top = self._write('conftest.py')
+        mod = self._write('mod.py')
+        result = infer_read_only_companion_files([test_file], directory=self.task_dir)
+        self.assertIn(conftest, result)
+        self.assertIn(conftest_top, result)
+        self.assertIn(mod, result)
+
+    def test_conftest_respects_max_files_and_seen(self):
+        test_file = self._write('tests/test_mod.py')
+        conftest = self._write('tests/conftest.py')
+        self._write('conftest.py')
+        result = infer_read_only_companion_files([test_file], directory=self.task_dir, max_files=1)
+        self.assertEqual(result, [conftest])
+
+    def test_non_test_files_get_no_conftest(self):
+        src = self._write('src.py')
+        self._write('conftest.py')
+        result = infer_read_only_companion_files([src], directory=self.task_dir)
+        self.assertEqual(result, [])
+
+    def test_conftest_outside_directory_excluded(self):
+        import tempfile
+        outer = os.path.realpath(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(outer, ignore_errors=True))
+        inner = os.path.join(outer, 'proj')
+        os.makedirs(os.path.join(inner, 'tests'), exist_ok=True)
+        test_file = os.path.join(inner, 'tests', 'test_mod.py')
+        with open(test_file, 'w') as fh:
+            fh.write('\n')
+        with open(os.path.join(inner, 'tests', 'conftest.py'), 'w') as fh:
+            fh.write('\n')
+        with open(os.path.join(outer, 'conftest.py'), 'w') as fh:
+            fh.write('\n')
+        result = infer_read_only_companion_files([test_file], directory=inner)
+        self.assertIn(os.path.join(inner, 'tests', 'conftest.py'), result)
+        self.assertNotIn(os.path.join(outer, 'conftest.py'), result)
+
+
+class GuardPluginFilesHintTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.task_dir = os.path.realpath(self._td.name)
+        self.main_file = os.path.join(self.task_dir, 'src.py')
+        with open(self.main_file, 'w') as fh:
+            fh.write('x = 1\n')
+
+    def test_render_with_files_lists_editable_and_read_only(self):
+        ro = os.path.join(self.task_dir, 'ro.py')
+        src = render_guard_plugin(allowed_files=[self.main_file], read_only_files=[ro])
+        self.assertIn('[HARNESS READ GUARD]', src)
+        self.assertIn(self.main_file, src)
+        self.assertIn(ro, src)
+        self.assertIn('[HARNESS EDIT HINT]', src)
+        self.assertIn('indexOf', src)
+
+    def test_render_without_files_has_generic_hint(self):
+        src = render_guard_plugin()
+        self.assertIn('[HARNESS READ GUARD]', src)
+        self.assertIn('Use only the allowed files specified in the prompt', src)
+        self.assertIn('[HARNESS EDIT HINT]', src)
+
+    def test_config_for_forwards_files_to_staged_plugin(self):
+        ro = os.path.join(self.task_dir, 'ro.py')
+        with open(ro, 'w') as fh:
+            fh.write('\n')
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            task = make_task(self.task_dir, [self.main_file])
+            task['read_only_files'] = [ro]
+            cfg = config_for(task, run_dir=Path(td))
+            staged = (Path(td) / '.opencode' / 'plugin' / 'harness_guard.ts').read_text()
+            self.assertIn(self.main_file, staged)
+            self.assertIn(ro, staged)
+            self.assertIn('[HARNESS READ GUARD]', staged)
+            self.assertIn('plugin', cfg)
+
+    def test_stage_guard_plugin_forwards_files(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as td:
+            stage_guard_plugin(td, allowed_files=[self.main_file])
+            staged = Path(td) / '.opencode' / 'plugin' / 'harness_guard.ts'
+            self.assertIn(self.main_file, staged.read_text())
 
 
 if __name__ == '__main__':

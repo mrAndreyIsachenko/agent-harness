@@ -31,6 +31,7 @@ from .guards import (
     compact_stale_reads,
     detect_duplicate_tool_calls,
     detect_edit_oscillation,
+    enforce_context_budget,
     inject_edit_failure_hints,
     inject_read_guard_hints,
     prune_noisy_tool_outputs,
@@ -316,6 +317,27 @@ class _OpenRouterProxyHandler(http.server.BaseHTTPRequestHandler):
             except (UnicodeDecodeError, ValueError):
                 payload = None
             if self.server.enforce_egress_guard and isinstance(payload, dict):
+                # H-81(b): automatic pre-compaction pass for oversized payloads
+                # so the egress guard can reject genuine policy violations
+                # instead of raw context-window size.
+                def _serialized_size() -> int:
+                    try:
+                        return len(json.dumps(payload, separators=(',', ':')).encode('utf-8'))
+                    except (TypeError, ValueError):
+                        return 0
+
+                if _serialized_size() > 262_144:
+                    if isinstance(payload.get('messages'), list):
+                        payload['messages'], _ = compact_stale_reads(
+                            payload['messages'],
+                            turn_index=len(payload['messages']),
+                            keep_recent_turns=1,
+                            min_total_saved_chars=256,
+                        )
+                    enforce_context_budget(payload, max_tokens=16_000)
+                    if _serialized_size() > 262_144:
+                        enforce_context_budget(payload, max_tokens=8_000)
+                    body = json.dumps(payload).encode('utf-8')
                 egress_violations = check_egress_payload(payload, allowed_models=self.server.allowed_models)
                 if egress_violations:
                     with self.server._lock:

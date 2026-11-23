@@ -39,7 +39,8 @@ from .report import (aggregate_benchmark_runs, backfill_salvaged_runs,
                      format_benchmark_markdown,
                      format_replay_markdown, format_state_insights_markdown,
                      format_state_stats_markdown, purge_ephemeral_test_runs,
-                     scan_state_runs, simulate_replay, summarize_run)
+                     scan_state_runs, simulate_replay, summarize_run,
+                     backfill_repair_lessons)
 from .routing import (DEFAULT_MAX_TOKENS_CAP, DEFAULT_MODEL, DEFAULT_PROVIDER_HEALTH_TTL_SECONDS,
                       DEFAULT_REASONING_MAX_TOKENS, ERROR_RECOVERY_REASONING_MAX_TOKENS,
                       ERROR_SIGNAL_SUBSTRINGS, FP8_PROVIDER_ROUTING, GLM_51_PROVIDER_ROUTING,
@@ -81,6 +82,7 @@ __all__ = [
     'build_preloaded_file_excerpts', 'extract_compact_test_failure',
     'extract_failing_test_excerpts',
     'backfill_salvaged_runs',
+    'backfill_repair_lessons',
     'build_micro_repair_prompt', 'heal_directory', 'synthesize_heal_task',
     'prune_noisy_tool_outputs', 'compact_stale_reads', 'build_prior_attempt_feedback',
     'build_targeted_pytest_argv', 'should_auto_escalate',

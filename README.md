@@ -431,7 +431,7 @@ $ harness herdr status --state-dir state/                # Herdr multiplexer das
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-78
+## Capabilities H-15 .. H-82
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -484,6 +484,10 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-76** | Contrastive Workspace Lessons Library (`record_repair_lesson`, `load_workspace_lessons`, `lessons.jsonl`) auto-capturing repair signatures and injecting `### Workspace Guardrails (from prior repairs)` into retries | `sandbox.py` |
 | **H-77** | Time-windowed `--days` stats filtering, 7-day rolling funnel (`_recent_7d_insights`), active vs. stale (`>7d`) unresolved task split, and `zero_edit_failed_runs` telemetry | `report.py`, `cli.py` |
 | **H-78** | Cloud Pod SSH orchestration (`harness pod {preflight,sync,launch,wait}`) and native Herdr terminal multiplexer integration (`harness herdr`, OSC 7501 sequences, JSON-lines Unix socket, `herdr-plugin.toml`) | `pod.py`, `herdr.py`, `cli.py` |
+| **H-79** | Auto-include ancestor `conftest.py` files for test targets (`infer_read_only_companion_files`) and emit in-loop `[HARNESS READ GUARD]` allowed-files hints on `Permission denied` in `harness_guard.ts` | `sandbox.py` |
+| **H-80** | Exact multi-match line-range disambiguation (`L<start>-L<end>` + ±3 context lines) for `Found N matches` edit failures in `render_guard_plugin` | `sandbox.py` |
+| **H-81** | Egress guard false-positive prevention: multiline base64 PEM key matching in `_CREDENTIAL_PATTERNS` and automatic `262_144`-byte pre-compaction (`enforce_context_budget`) in `OpenRouterGuardProxy` | `guards.py`, `proxy.py` |
+| **H-82** | Retroactive workspace lessons backfill (`backfill_repair_lessons`, `harness stats --backfill-lessons [--dry-run]`) scanning historical `micro_repair` runs | `report.py`, `cli.py`, `__init__.py` |
 
 ## Quickstart
 

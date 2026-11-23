@@ -117,7 +117,7 @@ def _rsync_once(host: str, remote_dir: str, local_dir: str,
     rc = 0
     for rel in paths:
         result = subprocess.run(
-            ["rsync", "-az", "--partial", "--append-verify",
+            ["rsync", "-az", "--partial",
              f"{host}:{remote_dir.rstrip('/')}/{rel}/", os.path.join(local_dir, rel) + "/"],
             capture_output=True, text=True,
         )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -254,6 +256,165 @@ class LessonsMarkdownTest(unittest.TestCase):
         (self.state_dir / "lessons.jsonl").write_text("", encoding="utf-8")
         text = report.format_state_insights_markdown(self.state_dir)
         self.assertNotIn("Recorded repair lessons", text)
+
+
+class BackfillRepairLessonsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name) / "state"
+        (self.state_dir / "runs").mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _repaired_run(
+        self,
+        task_id: str,
+        *,
+        status: str = "validation_passed_review_required",
+        repaired: bool = True,
+        salvaged_from: str | None = None,
+        before_log: str = "E   TypeError: boom\n",
+        after_log: str = "E   ValueError: other\n",
+    ) -> Path:
+        run_dir = self.state_dir / "runs" / f"{task_id}-{status}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        hashes_before = {"/tmp/proj/pkg/mod.py": "aaa"}
+        hashes_after = {"/tmp/proj/pkg/mod.py": "bbb"}
+        record: dict = {
+            "task_id": task_id,
+            "status": status,
+            "model": "test-model",
+            "repaired": repaired,
+            "task_dir": "/tmp/proj",
+            "hashes_before": hashes_before,
+            "hashes_after": hashes_after if repaired else dict(hashes_before),
+        }
+        if salvaged_from is not None:
+            record["salvaged_from"] = salvaged_from
+        (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+        (run_dir / "test.log").write_text(after_log, encoding="utf-8")
+        (run_dir / "test_before_repair.log").write_text(before_log, encoding="utf-8")
+        return run_dir
+
+    def test_dry_run_finds_eligible_runs_without_writing_lessons(self) -> None:
+        self._repaired_run("t1")
+        found = report.backfill_repair_lessons(self.state_dir, dry_run=True)
+        self.assertEqual(len(found), 1)
+        rec = found[0]
+        self.assertEqual(rec["task_id"], "t1")
+        self.assertEqual(rec["task_dir"], "/tmp/proj")
+        self.assertEqual(rec["files"], ["pkg/mod.py"])
+        self.assertEqual(
+            rec["error_signature"],
+            sandbox._lesson_error_signature("E   TypeError: boom\n"),
+        )
+        self.assertNotEqual(
+            rec["error_signature"],
+            sandbox._lesson_error_signature("E   ValueError: other\n"),
+        )
+        self.assertFalse((self.state_dir / "lessons.jsonl").exists())
+
+    def test_backfill_writes_deduplicated_lessons(self) -> None:
+        self._repaired_run("t1")
+        first = report.backfill_repair_lessons(self.state_dir, dry_run=False)
+        self.assertEqual(len(first), 1)
+        lessons = self.state_dir / "lessons.jsonl"
+        self.assertTrue(lessons.is_file())
+        lines = [
+            ln for ln in lessons.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+        self.assertEqual(len(lines), 1)
+        # Second pass: everything already recorded, nothing new.
+        second = report.backfill_repair_lessons(self.state_dir, dry_run=False)
+        self.assertEqual(second, [])
+        lines = [
+            ln for ln in lessons.read_text(encoding="utf-8").splitlines() if ln.strip()
+        ]
+        self.assertEqual(len(lines), 1)
+
+    def test_non_repaired_and_blocked_runs_are_skipped(self) -> None:
+        self._repaired_run("t-ok")
+        self._repaired_run("t-norepair", repaired=False)
+        self._repaired_run("t-blocked", status="validation_failed", repaired=False)
+        found = report.backfill_repair_lessons(self.state_dir, dry_run=True)
+        self.assertEqual([rec["task_id"] for rec in found], ["t-ok"])
+
+    def test_backfill_micro_repair_attempted_and_prior_failed_attempt(self) -> None:
+        # (a) micro_repair_attempted run (no `repaired` flag) with a preserved
+        # pre-repair log is backfilled using that log's signature.
+        run_dir = self.state_dir / "runs" / "t-mra-validation_passed_review_required"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "result.json").write_text(
+            json.dumps({
+                "task_id": "t-mra",
+                "status": "validation_passed_review_required",
+                "model": "test-model",
+                "micro_repair_attempted": True,
+                "task_dir": "/tmp/proj",
+                "hashes_before": {"/tmp/proj/pkg/mod.py": "aaa"},
+                "hashes_after": {"/tmp/proj/pkg/mod.py": "bbb"},
+            }),
+            encoding="utf-8",
+        )
+        (run_dir / "test.log").write_text("1 passed in 0.01s\n", encoding="utf-8")
+        (run_dir / "test_before_repair.log").write_text(
+            "E   TypeError: boom\n", encoding="utf-8"
+        )
+
+        # (b) blocked attempt followed by a passing run: the lesson comes from
+        # the earlier failed test.log signature.
+        blocked_dir = self.state_dir / "runs" / "t-prior-validation_failed"
+        blocked_dir.mkdir(parents=True, exist_ok=True)
+        (blocked_dir / "result.json").write_text(
+            json.dumps({
+                "task_id": "t-prior",
+                "status": "validation_failed",
+                "model": "test-model",
+            }),
+            encoding="utf-8",
+        )
+        (blocked_dir / "test.log").write_text(
+            "E   AssertionError: bad value\n", encoding="utf-8"
+        )
+        passed_dir = self.state_dir / "runs" / "t-prior-validation_passed_review_required"
+        passed_dir.mkdir(parents=True, exist_ok=True)
+        (passed_dir / "result.json").write_text(
+            json.dumps({
+                "task_id": "t-prior",
+                "status": "validation_passed_review_required",
+                "model": "test-model",
+                "task_dir": "/tmp/proj-b",
+                "hashes_before": {"/tmp/proj-b/other.py": "aaa"},
+                "hashes_after": {"/tmp/proj-b/other.py": "bbb"},
+            }),
+            encoding="utf-8",
+        )
+        (passed_dir / "test.log").write_text("1 passed in 0.01s\n", encoding="utf-8")
+
+        found = report.backfill_repair_lessons(self.state_dir, dry_run=True)
+        self.assertEqual(
+            [rec["task_id"] for rec in found], ["t-mra", "t-prior"]
+        )
+        self.assertEqual(
+            found[0]["error_signature"],
+            sandbox._lesson_error_signature("E   TypeError: boom\n"),
+        )
+        self.assertEqual(
+            found[1]["error_signature"],
+            sandbox._lesson_error_signature("E   AssertionError: bad value\n"),
+        )
+
+    def test_cli_backfill_lessons(self) -> None:
+        self._repaired_run("t1")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli_main([
+                "stats", "--state-dir", str(self.state_dir), "--backfill-lessons",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertIn("Backfilled repair lessons:", buf.getvalue())
+        self.assertTrue((self.state_dir / "lessons.jsonl").is_file())
 
 
 if __name__ == "__main__":

@@ -39,7 +39,7 @@ from harness.report import (
     format_state_stats_markdown,
     simulate_replay,
 )
-from harness.report import backfill_salvaged_runs
+from harness.report import backfill_repair_lessons, backfill_salvaged_runs
 from harness.telemetry import (
     DEFAULT_PHOENIX_ENDPOINT,
     HarnessTracer,
@@ -190,6 +190,12 @@ def _run_stats(args: argparse.Namespace) -> int:
     days = getattr(args, "days", None)
     if getattr(args, "backfill_salvage", False):
         backfill_salvaged_runs(args.state_dir)
+    if getattr(args, "backfill_lessons", False):
+        added = backfill_repair_lessons(args.state_dir, dry_run=getattr(args, "dry_run", False))
+        print(
+            f"Backfilled repair lessons: {len(added)}"
+            + (" (dry-run)" if getattr(args, "dry_run", False) else "")
+        )
     print(format_state_stats_markdown(args.state_dir, days=days))
     if getattr(args, "insights", False):
         print("\n" + format_state_insights_markdown(args.state_dir, days=days))
@@ -652,6 +658,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--backfill-salvage",
         action="store_true",
         help="retroactively salvage blocked runs whose test passed (H-57) before reporting",
+    )
+    stats.add_argument(
+        "--backfill-lessons",
+        action="store_true",
+        help="retroactively backfill repair lessons from micro_repair runs (H-82) before reporting",
+    )
+    stats.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview backfill without modifying state files",
     )
     stats.set_defaults(handler=_run_stats)
 
