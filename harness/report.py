@@ -784,6 +784,12 @@ def format_state_insights_markdown(
     return "\n".join(lines)
 
 
+def resolve_project_identity(task_dir, files=()):
+    """H-84: re-export canonical project/submodule identity resolver."""
+    from harness.sandbox import resolve_project_identity as _resolve
+    return _resolve(task_dir, files=files)
+
+
 def build_repo_memory_hint(
     state_dir: str | Path,
     directory: str | Path | None = None,
@@ -802,8 +808,11 @@ def build_repo_memory_hint(
         return ""
 
     selected: list[tuple[Path, dict]] = []
+    want_project: str | None = None
     if directory is not None:
-        target = str(Path(directory).resolve())
+        from harness.sandbox import resolve_project_identity
+        want_project, _ = resolve_project_identity(directory)
+        saw_any_task_dir = False
         for run_dir, result in records:
             try:
                 task_path = run_dir / "task.json"
@@ -813,10 +822,24 @@ def build_repo_memory_hint(
                     task = json.load(handle)
             except (OSError, ValueError):
                 continue
-            if isinstance(task, dict) and task.get("directory") == target:
+            if not isinstance(task, dict):
+                continue
+            task_dir = str(task.get("origin_directory") or task.get("directory") or task.get("task_dir") or "")
+            if not task_dir:
+                continue
+            saw_any_task_dir = True
+            run_project, _ = resolve_project_identity(
+                task_dir, files=task.get("origin_files") or task.get("files") or ()
+            )
+            if run_project == want_project:
                 selected.append((run_dir, result))
         if len(selected) < min_occurrences:
-            selected = records
+            if not saw_any_task_dir:
+                selected = records
+            else:
+                # H-84: never fall back to unrelated workspace runs — a new
+                # project (e.g. Small Model Lab) must not inherit global stats.
+                return ""
     else:
         selected = records
 
@@ -1644,6 +1667,7 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
         _extract_patch_fix_summary,
         _lesson_error_signature,
         record_repair_lesson,
+        resolve_project_identity,
     )
 
     state_path = Path(state_dir)
@@ -1669,8 +1693,12 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
                 except ValueError:
                     continue
                 if isinstance(record, dict):
-                    seen.add((
+                    rec_project, _ = resolve_project_identity(
                         str(record.get("task_dir") or ""),
+                        [str(f) for f in (record.get("files") or [])],
+                    )
+                    seen.add((
+                        str(record.get("project_id") or "") or rec_project,
                         str(record.get("error_signature") or ""),
                     ))
         except OSError:
@@ -1778,7 +1806,8 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
                 for marker in ("E   ", "Traceback", "FAILED", "ERROR")
             ):
                 continue
-        if (task_dir, sig) in seen:
+        project_id, subprojects = resolve_project_identity(task_dir, repaired_files)
+        if (project_id, sig) in seen:
             continue
 
         rel_files: list[str] = []
@@ -1792,11 +1821,13 @@ def backfill_repair_lessons(state_dir: str | Path, *, dry_run: bool = False) -> 
         else:
             rel_files = [str(f) for f in repaired_files]
 
-        seen.add((task_dir, sig))
+        seen.add((project_id, sig))
         results.append({
             "run_id": run_dir.name,
             "task_id": result.get("task_id"),
             "task_dir": task_dir,
+            "project_id": project_id,
+            "subprojects": sorted(subprojects),
             "error_signature": sig,
             "files": rel_files,
         })

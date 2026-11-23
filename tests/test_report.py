@@ -467,5 +467,122 @@ class BackfillRepairLessonsTest(unittest.TestCase):
         self.assertTrue((self.state_dir / "lessons.jsonl").is_file())
 
 
+class ProjectIdentityTest(unittest.TestCase):
+    """H-84: project/subproject identity for lessons and repo memory."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+
+    def test_resolve_project_identity_mappings(self) -> None:
+        # analytics-gitops worktrees share one project id
+        pid, subs = report.resolve_project_identity(
+            "/work/medvidi/worktrees/gitops-abc/ai/serving")
+        self.assertEqual(pid, "medvidi/analytics-gitops")
+        self.assertIn("ai/serving", subs)
+        pid2, subs2 = report.resolve_project_identity(
+            "/work/medvidi/analytics-gitops", files=["ai/local_copilot/x.py"])
+        self.assertEqual(pid2, "medvidi/analytics-gitops")
+        self.assertIn("ai/local_copilot", subs2)
+        # Small Model Lab
+        pid3, subs3 = report.resolve_project_identity(
+            str(self.base / "Small Model Lab"), files=["sml/tools/foo.py"])
+        self.assertEqual(pid3, "personal/small-model-lab")
+        self.assertIn("sml", subs3)
+        # Symlinked Harness worktree resolves to personal/harness
+        real = self.base / "Harness"
+        (real / "harness").mkdir(parents=True)
+        link = self.base / "work" / "medvidi" / "Harness"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(real)
+        pid4, subs4 = report.resolve_project_identity(str(link / "harness"),
+                                                      files=["harness/report.py"])
+        self.assertEqual(pid4, "personal/harness")
+        self.assertIn("harness", subs4)
+
+    def test_load_workspace_lessons_project_isolation(self) -> None:
+        from harness.sandbox import resolve_project_identity  # noqa: F401
+        state_dir = self.base / "state"
+        state_dir.mkdir()
+        dir_a = "/work/medvidi/worktrees/gitops-a"
+        dir_b = "/work/medvidi/worktrees/gitops-b"
+
+        def lesson(directory, sig, files):
+            record_repair_lesson(
+                state_dir,
+                {"task_id": "t", "directory": directory, "model": "m"},
+                f"E   {sig}\n", files,
+            )
+
+        lesson(dir_a, "ImportError: serving", ["ai/serving/x.py"])
+        lesson(dir_a, "ValueError: copilot", ["ai/local_copilot/z.py"])
+        lesson(dir_a, "TypeError: airflow", ["airflow/dags/w.py"])
+
+        # Same subproject across different worktrees matches (tier 1).
+        text = sandbox.load_workspace_lessons(
+            state_dir, dir_b, files=["ai/serving/y.py"])
+        self.assertIn("ImportError: serving", text)
+        self.assertNotIn("ValueError: copilot", text)
+        self.assertNotIn("TypeError: airflow", text)
+
+        # medvidi lessons never leak into other projects.
+        sml_dir = self.base / "Small Model Lab"
+        sml_dir.mkdir()
+        self.assertEqual(
+            sandbox.load_workspace_lessons(
+                state_dir, str(sml_dir), files=["sml/main.py"]), "")
+
+    def test_build_repo_memory_hint_no_cross_project_fallback(self) -> None:
+        state_dir = self.base / "state"
+        run_dir = state_dir / "runs" / "run1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "result.json").write_text(json.dumps(
+            {"task_id": "t1", "status": "blocked", "reason": "step_limit"}),
+            encoding="utf-8")
+        (run_dir / "task.json").write_text(json.dumps(
+            {"task_id": "t1", "directory": "/work/medvidi/analytics-gitops"}),
+            encoding="utf-8")
+
+        # Fewer than min_occurrences runs for the queried project: no hint,
+        # and never a fallback to unrelated workspace runs.
+        self.assertEqual(report.build_repo_memory_hint(
+            state_dir, directory="/work/medvidi/analytics-gitops",
+            min_occurrences=2), "")
+
+        # A second run for the same project produces the hint.
+        run_dir2 = state_dir / "runs" / "run2"
+        run_dir2.mkdir(parents=True)
+        (run_dir2 / "result.json").write_text(json.dumps(
+            {"task_id": "t2", "status": "blocked", "reason": "step_limit"}),
+            encoding="utf-8")
+        (run_dir2 / "task.json").write_text(json.dumps(
+            {"task_id": "t2", "directory": "/work/medvidi/worktrees/gitops-x"}),
+            encoding="utf-8")
+        hint = report.build_repo_memory_hint(
+            state_dir, directory="/work/medvidi/analytics-gitops",
+            min_occurrences=2)
+        self.assertIn("step_limit", hint)
+
+    def test_backfill_repair_lessons_includes_project_id(self) -> None:
+        state_dir = self.base / "state"
+        task_dir = self.base / "repo"
+        task_dir.mkdir()
+        run_dir = state_dir / "runs" / "r1"
+        run_dir.mkdir(parents=True)
+        (run_dir / "result.json").write_text(json.dumps({
+            "task_id": "t1", "status": "validation_passed_review_required",
+            "repaired": True, "task_dir": str(task_dir),
+            "hashes_before": {str(task_dir / "a.py"): "x"},
+            "hashes_after": {str(task_dir / "a.py"): "y"},
+        }), encoding="utf-8")
+        (run_dir / "test_before_repair.log").write_text(
+            "E   TypeError: bad\n", encoding="utf-8")
+        results = report.backfill_repair_lessons(state_dir)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["project_id"], str(task_dir.resolve()))
+        self.assertIn("subprojects", results[0])
+
+
 if __name__ == "__main__":
     unittest.main()

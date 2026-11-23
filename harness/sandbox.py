@@ -1477,6 +1477,7 @@ def isolated_worktree(task, run_dir):
         def remap(argv):
             return [x.replace(prefix, str(wt_root)) for x in argv]
         wt_task = dict(task, directory=str(wt_dir), files=wt_files,
+                       origin_directory=task.get('directory'),
                        prompt=task.get('prompt', '').replace(prefix, str(wt_root)),
                        origin_files=list(task['files']), origin_hashes=_fh(task['files']),
                        read_only_files=wt_ro_files,
@@ -1583,20 +1584,107 @@ def _norm_lesson_path(value) -> str:
         return ''
     # Normalize ephemeral worktree paths back to the canonical repo root:
     # /repo/.worktrees/<branch>[/sub] -> /repo[/sub]
-    marker = '/.worktrees/'
-    if marker in text:
-        head, _, tail = text.partition(marker)
-        _, sep, rest = tail.partition('/')
-        if sep:
-            text = head.rstrip('/') + '/' + rest
-        else:
-            text = head
-        if not text:
-            text = '/'
+    for marker in ('/.tools/opencode-guard-state/worktrees/', '/.worktrees/', '/worktrees/'):
+        if marker in text:
+            head, _, tail = text.partition(marker)
+            _, sep, rest = tail.partition('/')
+            if sep:
+                text = head.rstrip('/') + '/' + rest
+            else:
+                text = head
+            if not text:
+                text = '/'
+            break
     try:
         return str(Path(text).resolve())
     except OSError:
         return text
+
+
+_SUBPROJECT_TOP2_ROOTS = frozenset({'ai', 'airflow', 'tools', 'scripts', 'dbt'})
+_SUBPROJECT_TOP1_ROOTS = frozenset({'sml', 'harness', 'tests', 'tenet'})
+_SUBPROJECT_STRIP_ROOTS = ('sml', 'harness', 'tenet', 'ai', 'airflow', 'dbt', 'tools', 'scripts', 'tests')
+_MONOREPO_PROJECTS = frozenset({'medvidi/analytics-gitops', 'medvidi/analytics-airflow-app'})
+
+
+def resolve_project_identity(task_dir, files=()) -> tuple[str, set[str]]:
+    """H-84: map a task directory (plus files) to ``(project_id, subprojects)``.
+
+    Worktrees of the same repo share one canonical ``project_id`` while
+    different projects never collide; ``subprojects`` carries the top path
+    segments (e.g. ``'ai/serving'``, ``'harness'``) so lessons can be scoped
+    inside multi-package monorepos.
+    """
+    raw = str(task_dir or '').strip()
+    norm_dir = _norm_lesson_path(raw)
+    norm_lower = norm_dir.lower()
+    raw_lower = raw.lower()
+    file_strs = [str(f) for f in (files or ()) if str(f).strip()]
+    file_lowers = [f.lower().replace('\\', '/') for f in file_strs]
+
+    if ('small model lab' in raw_lower or 'small model lab' in norm_lower
+            or any(f.startswith('sml/') or f.startswith('tenet')
+                   or '/sml/' in f or '/tenet/' in f for f in file_lowers)):
+        project_id = 'personal/small-model-lab'
+    elif norm_lower.endswith('/harness') or '/harness/' in norm_lower:
+        project_id = 'personal/harness'
+    elif norm_lower.endswith('/herdr') or '/herdr/' in norm_lower:
+        project_id = 'personal/herdr'
+    elif ('analytics-airflow-app' in norm_lower
+          or '/wt-' in raw_lower
+          or any(f.startswith(('airflow/dags', 'tools/metric_spec'))
+                 or '/airflow/dags/' in f or '/tools/metric_spec/' in f for f in file_lowers)):
+        project_id = 'medvidi/analytics-airflow-app'
+    elif ('analytics-gitops' in norm_lower
+          or '/worktrees/gitops-' in raw_lower
+          or '/.worktrees/' in raw_lower
+          or '/.tools/opencode-guard-state/worktrees/' in raw_lower
+          or any(f.startswith(('ai/serving', 'ai/mcp', 'ai/local_copilot', 'ai/graphiti',
+                               'ai/security', 'ai/web', 'ai/dbt_authoring', 'ai/coding_worker',
+                               'ai/tools', 'ai/sql', 'ai/openspec'))
+                 or '/ai/' in f or '/context/' in f for f in file_lowers)):
+        project_id = 'medvidi/analytics-gitops'
+    else:
+        project_id = norm_dir
+
+    subprojects: set[str] = set()
+    # A task_dir nested inside a subproject (e.g. .../ai/web/capri/src) itself
+    # identifies that subproject.
+    dir_parts = [p for p in Path(norm_dir).parts if p not in ('/',)]
+    for i, seg in enumerate(dir_parts):
+        if seg in _SUBPROJECT_TOP2_ROOTS and i + 1 < len(dir_parts):
+            subprojects.add(f'{seg}/{dir_parts[i + 1]}')
+            break
+        if seg in _SUBPROJECT_TOP1_ROOTS:
+            subprojects.add(seg)
+            break
+
+    for f in file_strs:
+        text = str(f).replace('\\', '/')
+        if not Path(text).is_absolute():
+            rel = text
+        else:
+            norm_f = _norm_lesson_path(text).replace('\\', '/')
+            try:
+                rel = str(Path(norm_f).resolve().relative_to(norm_dir)) if norm_dir else norm_f
+            except (OSError, ValueError):
+                rel = norm_f
+                for root in _SUBPROJECT_STRIP_ROOTS:
+                    idx = norm_f.find('/' + root + '/')
+                    if idx != -1:
+                        rel = norm_f[idx + 1:]
+                        break
+        parts = [p for p in Path(rel).parts if p not in ('/', '.')]
+        if not parts:
+            continue
+        top = parts[0]
+        if top in _SUBPROJECT_TOP1_ROOTS:
+            subprojects.add(top)
+        elif top in _SUBPROJECT_TOP2_ROOTS and len(parts) >= 2:
+            subprojects.add(f'{top}/{parts[1]}')
+        elif len(parts) >= 2:
+            subprojects.add(top)
+    return project_id, subprojects
 
 
 def _extract_patch_fix_summary(patch_text: str, max_chars: int = 120) -> str:
@@ -1642,6 +1730,9 @@ def record_repair_lesson(state_dir, task, failed_test_log, repaired_files,
         return
     state = Path(state_dir)
     task_dir = str(task.get('task_dir') or task.get('directory') or '')
+    identity_files = [str(f) for f in (repaired_files or [])] or [
+        str(f) for f in (task.get('files') or [])]
+    project_id, subprojects = resolve_project_identity(task_dir, identity_files)
     base = Path(task_dir) if task_dir else None
     files: list[str] = []
     for item in (repaired_files or []):
@@ -1653,9 +1744,6 @@ def record_repair_lesson(state_dir, task, failed_test_log, repaired_files,
             except (OSError, ValueError):
                 rel = str(item)
         files.append(rel)
-    signature = _lesson_error_signature(failed_test_log)
-    if not signature:
-        return
     lessons_path = state / 'lessons.jsonl'
     if lessons_path.is_file():
         for line in lessons_path.read_text(encoding='utf-8', errors='replace').splitlines():
@@ -1665,14 +1753,24 @@ def record_repair_lesson(state_dir, task, failed_test_log, repaired_files,
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if (isinstance(rec, dict)
-                    and str(rec.get('task_dir') or '') == task_dir
-                    and str(rec.get('error_signature') or '') == signature):
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get('error_signature') or '') != signature:
+                continue
+            # H-84: dedupe by (project_id, signature); fall back to
+            # (task_dir, signature) for records written before project_id.
+            rec_project = str(rec.get('project_id') or '')
+            if rec_project:
+                if rec_project == project_id:
+                    return
+            elif str(rec.get('task_dir') or '') == task_dir:
                 return
     record = {
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'task_id': task.get('task_id', ''),
         'task_dir': task_dir,
+        'project_id': project_id,
+        'subprojects': sorted(subprojects),
         'files': files,
         'error_signature': signature,
         'model': task.get('model'),
@@ -1698,39 +1796,53 @@ def load_workspace_lessons(state_dir, task_dir, files=None, max_items=3, max_cha
     if not lessons_path.is_file() or not want_dir:
         return ''
     file_set = {_norm_lesson_path(f) for f in (files or []) if str(f).strip()}
-    matched: list[tuple[bool, dict]] = []
+    want_project, want_subprojects = resolve_project_identity(task_dir, files or ())
+    matched: list[tuple[int, dict]] = []
     lines = [line for line in lessons_path.read_text(encoding='utf-8', errors='replace').splitlines()
              if line.strip()]
-    for line in reversed(lines):  # most recent first; file matches get priority below
+    for line in reversed(lines):  # most recent first; tier sorting below
         try:
             rec = json.loads(line)
         except ValueError:
             continue
         if not isinstance(rec, dict):
             continue
-        if _norm_lesson_path(rec.get('task_dir')) != want_dir:
-            # H-83: lessons recorded in ephemeral worktrees of the same repo
-            # still match by relative file path (>=2 path components whose
-            # last two segments match a file in ``file_set``).
-            rec_paths = [str(f) for f in (rec.get('files') or []) if str(f).strip()]
-            if not (file_set and rec_paths
-                    and any(len(Path(f).parts) >= 2
-                            and any(wf.endswith('/' + '/'.join(Path(f).parts[-2:]))
-                                    for wf in file_set)
-                            for f in rec_paths)):
-                continue
-            matched_by_files = True
-        else:
-            matched_by_files = False
+        rec_files_raw = [str(f) for f in (rec.get('files') or []) if str(f).strip()]
+        rec_project_id, rec_subprojects_raw = resolve_project_identity(
+            rec.get('task_dir'), rec_files_raw)
+        rec_project = str(rec.get('project_id') or '') or rec_project_id
+        rec_subprojects = set(rec.get('subprojects') or []) or rec_subprojects_raw
+        # H-84: strict project isolation — lessons from another project NEVER
+        # match, even when file paths happen to overlap.
+        if rec_project != want_project:
+            continue
         rec_files = set()
-        for f in (rec.get('files') or []):
-            fp = Path(str(f))
+        for f in rec_files_raw:
+            fp = Path(f)
             resolved_f = fp if fp.is_absolute() else (Path(want_dir) / fp)
             rec_files.add(_norm_lesson_path(resolved_f))
-        matched.append((matched_by_files or bool(rec_files & file_set) if file_set else False, rec))
+        # Match tiers: 0 = exact file, 1 = same subproject, 2 = same project.
+        tier = 2
+        if file_set and rec_files:
+            exact = bool(rec_files & file_set) or any(
+                len(Path(f).parts) >= 2
+                and any(wf.endswith('/' + '/'.join(Path(f).parts[-2:]))
+                        for wf in file_set)
+                for f in rec_files)
+            if exact:
+                tier = 0
+        if tier != 0 and want_subprojects and (rec_subprojects & want_subprojects):
+            tier = 1
+        if tier == 2 and file_set:
+            # For multi-subproject monorepos with an explicit file scope,
+            # require a file or subproject match — do not inject lessons from
+            # unrelated subprojects (e.g. ai/local_copilot into ai/serving).
+            if want_project in _MONOREPO_PROJECTS and want_subprojects:
+                continue
+        matched.append((tier, rec))
     if not matched:
         return ''
-    matched.sort(key=lambda item: 0 if item[0] else 1)  # stable: file matches first
+    matched.sort(key=lambda item: item[0])  # stable: lower tier first, recent within tier
     header = '### Workspace Guardrails (from prior repairs)'
     out_lines: list[str] = []
     seen_signatures: set[str] = set()
@@ -1883,14 +1995,17 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 task['prompt'] += prior_feedback
                                 event(run_dir, 'prior_attempt_feedback_injected')
                         if task.get('include_repo_memory', True):
-                            repo_hint = build_repo_memory_hint(state, task.get('directory'))
+                            repo_hint = build_repo_memory_hint(
+                                state, task.get('origin_directory') or task.get('directory'))
                             if repo_hint:
                                 task['prompt'] += repo_hint
                                 event(run_dir, 'repo_memory_hint_injected')
                         if task.get('include_workspace_lessons', True):
                             try:
                                 lesson_hint = load_workspace_lessons(
-                                    state, task.get('directory'), files=task.get('files'))
+                                    state,
+                                    task.get('origin_directory') or task.get('directory'),
+                                    files=task.get('origin_files') or task.get('files'))
                             except Exception:
                                 lesson_hint = ''
                             if lesson_hint:

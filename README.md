@@ -431,7 +431,7 @@ $ harness herdr status --state-dir state/                # Herdr multiplexer das
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-83
+## Capabilities H-15 .. H-84
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -489,6 +489,7 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-81** | Egress guard false-positive prevention: multiline base64 PEM key matching in `_CREDENTIAL_PATTERNS` and automatic `262_144`-byte pre-compaction (`enforce_context_budget`) in `OpenRouterGuardProxy` | `guards.py`, `proxy.py` |
 | **H-82** | Retroactive workspace lessons backfill (`backfill_repair_lessons`, `harness stats --backfill-lessons [--dry-run]`) scanning historical `micro_repair` runs | `report.py`, `cli.py`, `__init__.py` |
 | **H-83** | High-signal actionable workspace lessons: pytest noise/progress filter in `_lesson_error_signature`, `/.worktrees/` path normalization + relative-file matching, `changes.patch` `-> Fix:` summary (`_extract_patch_fix_summary`), and `rc=4` renamed-nodeid fallback in `micro_repair` | `sandbox.py`, `report.py` |
+| **H-84** | Project- & submodule-aware workspace identity (`resolve_project_identity`) isolating Work monorepos (`medvidi/analytics-gitops`, `medvidi/analytics-airflow-app` with `ai/serving`, `ai/local_copilot`, `airflow/dags` submodule tiers), Personal repos (`personal/harness`, `personal/herdr`), and `Small Model Lab` / `Tenet` (`personal/small-model-lab`) across `load_workspace_lessons` and `build_repo_memory_hint` | `sandbox.py`, `report.py` |
 
 ## Quickstart
 
