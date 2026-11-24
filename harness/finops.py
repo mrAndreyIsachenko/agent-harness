@@ -584,13 +584,14 @@ def clear_session_busy(db, sid, outcome='failed'):
     except sqlite3.Error:
         return False
 
-_EDIT_TOOL_NAMES = {'edit', 'write', 'multiedit', 'patch', 'apply_patch'}
+_EDIT_TOOL_NAMES = {'edit', 'write', 'multiedit', 'patch', 'apply_patch',
+                    'harness_multiedit', 'harness_apply_patch'}
 
 _RECOVERABLE_EDIT_ERROR_MARKERS = ('could not find oldstring', 'no changes to apply', 'identical')
 
 def _is_recoverable_edit_error(tool_name, error_text):
     """Recoverable edit/write failures (mismatch, no-op, ambiguous match)."""
-    if tool_name not in {'edit', 'write', 'multiedit', 'patch'}:
+    if tool_name not in _EDIT_TOOL_NAMES:
         return False
     if not isinstance(error_text, str):
         return False

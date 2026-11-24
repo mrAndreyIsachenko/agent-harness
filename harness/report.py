@@ -486,7 +486,8 @@ _RESOLVED_STATUSES = frozenset(
 )
 
 _READ_TOOL_NAMES = frozenset({"read", "read_file"})
-_EDIT_TOOL_NAMES = frozenset({"edit", "write", "edit_file", "write_file", "apply_patch"})
+_EDIT_TOOL_NAMES = frozenset({"edit", "write", "edit_file", "write_file", "apply_patch",
+                              "multiedit", "patch", "harness_multiedit", "harness_apply_patch"})
 
 
 def _iter_run_records(state_dir: str | Path, *, days: int | None = None, now: float | None = None):
@@ -558,6 +559,28 @@ def _load_tool_spans(run_dir: Path) -> list[dict]:
     return spans
 
 
+_DOC_EXTENSIONS = frozenset({".md", ".markdown", ".rst", ".txt", ".adoc"})
+_TASK_DATE_SUFFIX_RE = re.compile(r"[-_]20\d{6}$")
+_TASK_VERSION_SUFFIX_RE = re.compile(r"[-_]v\d+$")
+_TASK_STAGE_SUFFIX_RE = re.compile(
+    r"-(?:fix|retry|align|repair|tests|test|status|state|followup|part\d+|batch\d+)(?:-[a-z0-9]+)*$"
+)
+
+
+def _normalize_task_stem(task_id: str) -> str:
+    """Strip trailing date, version, and retry/stage suffixes to get a comparable task stem."""
+    stem = (task_id or "").strip().lower()
+    while stem:
+        updated = _TASK_DATE_SUFFIX_RE.sub("", stem)
+        updated = _TASK_VERSION_SUFFIX_RE.sub("", updated)
+        updated = _TASK_STAGE_SUFFIX_RE.sub("", updated)
+        if updated == stem:
+            break
+        stem = updated
+    segments = [seg for seg in re.split(r"[-_]+", stem) if seg]
+    return stem if len(segments) >= 2 else ""
+
+
 def compute_state_insights(
     state_dir: str | Path,
     *,
@@ -566,9 +589,14 @@ def compute_state_insights(
     _include_recent: bool = True,
 ) -> dict:
     """Compute task-funnel, blocked-reason and tool-error insights from a state directory."""
+    from harness.sandbox import _norm_lesson_path
+
     task_order: list[str] = []
     task_runs: dict[str, list[dict]] = {}
     task_max_mtime: dict[str, float] = {}
+    task_resolved_mtime: dict[str, float] = {}
+    task_files: dict[str, set[str]] = {}
+    task_modified_files: dict[str, set[str]] = {}
 
     blocked_counter: Counter[str] = Counter()
     tool_error_counter: Counter[tuple[str, str]] = Counter()
@@ -589,7 +617,50 @@ def compute_state_insights(
             mtime = 0.0
         task_max_mtime[task_id] = max(task_max_mtime.get(task_id, 0.0), mtime)
 
+        hashes_before = result.get("hashes_before")
+        raw_run_files = (
+            [str(k) for k in hashes_before.keys() if k]
+            if isinstance(hashes_before, dict)
+            else []
+        )
+        if not raw_run_files:
+            task_json_path = run_dir / "task.json"
+            if task_json_path.is_file():
+                try:
+                    with task_json_path.open("r", encoding="utf-8") as handle:
+                        task_meta = json.load(handle)
+                    if isinstance(task_meta, dict):
+                        raw_files = task_meta.get("files") or []
+                        if isinstance(raw_files, list):
+                            raw_run_files = [str(f) for f in raw_files if f]
+                except (OSError, ValueError):
+                    pass
+        run_files = {
+            norm
+            for f in raw_run_files
+            if f and (norm := _norm_lesson_path(f))
+        }
+        if run_files:
+            task_files.setdefault(task_id, set()).update(run_files)
+
         status = str(result.get("status") or "")
+        if status in _RESOLVED_STATUSES:
+            task_resolved_mtime[task_id] = max(mtime, task_resolved_mtime.get(task_id, 0.0))
+            hashes_after = result.get("hashes_after")
+            if isinstance(hashes_before, dict) and isinstance(hashes_after, dict):
+                modified = {
+                    norm
+                    for k in (set(hashes_before) | set(hashes_after))
+                    if k
+                    and hashes_before.get(k) != hashes_after.get(k)
+                    and (norm := _norm_lesson_path(k))
+                }
+            elif hashes_before is None and hashes_after is None:
+                modified = set(task_files.get(task_id, ()))
+            else:
+                modified = set()
+            if modified:
+                task_modified_files.setdefault(task_id, set()).update(modified)
         if status == "blocked":
             blocked_counter[str(result.get("reason") or "unknown")] += 1
 
@@ -638,6 +709,7 @@ def compute_state_insights(
         "retry_or_escalation_ok": 0,
         "micro_repair_ok": 0,
         "salvaged_ok": 0,
+        "superseded_ok": 0,
         "unresolved_tasks": 0,
         "unresolved_active_tasks": 0,
         "unresolved_stale_single_shot_tasks": 0,
@@ -649,8 +721,42 @@ def compute_state_insights(
             None,
         )
         if first_resolved_idx is None:
+            files = task_files.get(task_id, set())
+            last_mtime = task_max_mtime.get(task_id, 0.0)
+            stem = _normalize_task_stem(task_id)
+            superseded = False
+            if files:
+                superseded = all(
+                    any(
+                        f in task_files.get(other_id, ())
+                        for other_id, resolved_mtime in task_resolved_mtime.items()
+                        if other_id != task_id and resolved_mtime >= last_mtime
+                    )
+                    for f in files
+                )
+                if not superseded:
+                    for other_id, resolved_mtime in task_resolved_mtime.items():
+                        if other_id == task_id or resolved_mtime < last_mtime:
+                            continue
+                        modified = task_modified_files.get(other_id, ())
+                        if not modified:
+                            continue
+                        overlap = files & modified
+                        if not any(
+                            Path(f).suffix.lower() not in _DOC_EXTENSIONS for f in overlap
+                        ):
+                            continue
+                        if (stem and _normalize_task_stem(other_id) == stem) or (
+                            len(overlap) * 2 >= len(files)
+                        ):
+                            superseded = True
+                            break
+            if superseded:
+                funnel["resolved_tasks"] += 1
+                funnel["superseded_ok"] += 1
+                continue
             funnel["unresolved_tasks"] += 1
-            if len(runs) >= 2 or task_max_mtime.get(task_id, 0.0) >= recent_cutoff:
+            if len(runs) >= 2 or last_mtime >= recent_cutoff:
                 funnel["unresolved_active_tasks"] += 1
             else:
                 funnel["unresolved_stale_single_shot_tasks"] += 1
@@ -747,6 +853,7 @@ def format_state_insights_markdown(
             f"  - Retry/escalation: {funnel['retry_or_escalation_ok']}",
             f"  - Micro repair: {funnel['micro_repair_ok']}",
             f"  - Salvaged: {funnel['salvaged_ok']}",
+            f"  - Superseded (later task): {funnel.get('superseded_ok', 0)}",
             f"- Unresolved: {funnel['unresolved_tasks']}",
             f"  - Active / multi-attempt: {funnel['unresolved_active_tasks']}",
             f"  - Single-shot / probe / stale (>7d, 1 attempt): {funnel['unresolved_stale_single_shot_tasks']}",

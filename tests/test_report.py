@@ -691,5 +691,138 @@ class ExportDatasetModesTest(unittest.TestCase):
             report.export_sml_dataset(self.state_dir, mode="bogus")
 
 
+class SupersededTaskFunnelTest(unittest.TestCase):
+    """H-89: superseded task detection in task resolution funnel."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name) / "state"
+        (self.state_dir / "runs").mkdir(parents=True)
+        self.now = time.time()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write_run(
+        self,
+        name: str,
+        task_id: str,
+        status: str,
+        *,
+        mtime: float,
+        hashes_before: dict[str, str] | None = None,
+        hashes_after: dict[str, str] | None = None,
+        task_files: list[str] | None = None,
+    ) -> Path:
+        run_dir = self.state_dir / "runs" / name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        record: dict = {"task_id": task_id, "status": status, "model": "test-model"}
+        if hashes_before is not None:
+            record["hashes_before"] = hashes_before
+        if hashes_after is not None:
+            record["hashes_after"] = hashes_after
+        (run_dir / "result.json").write_text(json.dumps(record), encoding="utf-8")
+        if task_files is not None:
+            (run_dir / "task.json").write_text(
+                json.dumps({"task_id": task_id, "files": task_files}),
+                encoding="utf-8",
+            )
+        os.utime(run_dir, (mtime, mtime))
+        return run_dir
+
+    def test_blocked_task_superseded_by_later_passing_task(self) -> None:
+        self._write_run(
+            "task_v1-blocked",
+            "task_v1",
+            "blocked",
+            mtime=self.now - 100,
+            hashes_before={"/repo/a.py": "h1", "/repo/b.py": "h2"},
+        )
+        self._write_run(
+            "task_v2-passed",
+            "task_v2",
+            "succeeded",
+            mtime=self.now - 50,
+            hashes_before={"/repo/a.py": "h1", "/repo/b.py": "h2"},
+        )
+        insights = report.compute_state_insights(self.state_dir, now=self.now)
+        funnel = insights["task_funnel"]
+        self.assertEqual(funnel["total_tasks"], 2)
+        self.assertEqual(funnel["resolved_tasks"], 2)
+        self.assertEqual(funnel["superseded_ok"], 1)
+        self.assertEqual(funnel["unresolved_tasks"], 0)
+
+        md = report.format_state_insights_markdown(self.state_dir, now=self.now)
+        self.assertIn("- Superseded (later task): 1", md)
+
+    def test_partial_file_overlap_remains_unresolved(self) -> None:
+        self._write_run(
+            "task_v1-blocked",
+            "task_v1",
+            "blocked",
+            mtime=self.now - 100,
+            task_files=["/repo/a.py", "/repo/b.py"],
+        )
+        self._write_run(
+            "task_v2-passed",
+            "task_v2",
+            "succeeded",
+            mtime=self.now - 50,
+            hashes_before={"/repo/a.py": "h1"},
+        )
+        insights = report.compute_state_insights(self.state_dir, now=self.now)
+        funnel = insights["task_funnel"]
+        self.assertEqual(funnel["total_tasks"], 2)
+        self.assertEqual(funnel["resolved_tasks"], 1)
+        self.assertEqual(funnel["superseded_ok"], 0)
+        self.assertEqual(funnel["unresolved_tasks"], 1)
+
+    def test_narrowed_followup_with_shared_stem_and_worktree_path_superseded(self) -> None:
+        self._write_run(
+            "foo-bar-tests-20261124-blocked",
+            "foo-bar-tests-20261124",
+            "blocked",
+            mtime=self.now - 100,
+            task_files=["/repo/kernel.py", "/repo/test_x.py", "/repo/extra.py"],
+        )
+        self._write_run(
+            "foo-bar-align-state-20261124-passed",
+            "foo-bar-align-state-20261124",
+            "succeeded",
+            mtime=self.now - 50,
+            hashes_before={"/repo/.worktrees/wt1/kernel.py": "h1"},
+            hashes_after={"/repo/.worktrees/wt1/kernel.py": "h2"},
+        )
+        insights = report.compute_state_insights(self.state_dir, now=self.now)
+        funnel = insights["task_funnel"]
+        self.assertEqual(funnel["total_tasks"], 2)
+        self.assertEqual(funnel["resolved_tasks"], 2)
+        self.assertEqual(funnel["superseded_ok"], 1)
+        self.assertEqual(funnel["unresolved_tasks"], 0)
+
+    def test_unrelated_task_below_half_overlap_not_superseded(self) -> None:
+        self._write_run(
+            "alpha-beta-20261124-blocked",
+            "alpha-beta-20261124",
+            "blocked",
+            mtime=self.now - 100,
+            task_files=["/repo/a.py", "/repo/b.py", "/repo/c.py"],
+        )
+        self._write_run(
+            "gamma-delta-fix-20261124-passed",
+            "gamma-delta-fix-20261124",
+            "succeeded",
+            mtime=self.now - 50,
+            hashes_before={"/repo/a.py": "h1"},
+            hashes_after={"/repo/a.py": "h2"},
+        )
+        insights = report.compute_state_insights(self.state_dir, now=self.now)
+        funnel = insights["task_funnel"]
+        self.assertEqual(funnel["total_tasks"], 2)
+        self.assertEqual(funnel["resolved_tasks"], 1)
+        self.assertEqual(funnel["superseded_ok"], 0)
+        self.assertEqual(funnel["unresolved_tasks"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

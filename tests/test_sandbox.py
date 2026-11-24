@@ -322,5 +322,927 @@ class CheckPythonUndefinedNamesTests(unittest.TestCase):
         self.assertEqual(check_python_undefined_names(src), [])
 
 
+class ConcurrentReadOnlyCompanionTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.root = Path(os.path.realpath(self._td.name))
+        self.repo = self.root / 'repo'
+        self.state = self.root / 'state'
+        self.repo.mkdir()
+        (self.repo / 'tests').mkdir()
+        self.state.mkdir()
+        self.test_file = self.repo / 'tests' / 'test_mod.py'
+        self.mod_file = self.repo / 'mod.py'
+        self.test_file.write_text('def test_ok():\n    assert True\n', encoding='utf-8')
+        self.mod_file.write_text('VALUE = 1\n', encoding='utf-8')
+
+    def _write_sibling_run(self, run_name, *, task_id, status, files, started_at=None, duration_seconds=None):
+        import json
+        import time
+        run_dir = self.state / 'runs' / run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+        res = {
+            'task_id': task_id,
+            'status': status,
+            'started_at': time.time() if started_at is None else started_at,
+        }
+        if duration_seconds is not None:
+            res['duration_seconds'] = duration_seconds
+        (run_dir / 'result.json').write_text(json.dumps(res), encoding='utf-8')
+        (run_dir / 'task.json').write_text(json.dumps({'task_id': task_id, 'files': [str(f) for f in files]}),
+                                           encoding='utf-8')
+        return run_dir
+
+    def _run_model_task(self, task_dict, model_side_effect):
+        import json
+        import sys
+        from contextlib import nullcontext
+        from unittest import mock
+        from harness.sandbox import run_task
+
+        task_path = self.root / 'task.json'
+        task_path.write_text(json.dumps(task_dict), encoding='utf-8')
+        with mock.patch('harness.sandbox.preflight'), \
+                mock.patch('harness.sandbox.verify_db'), \
+                mock.patch('harness.sandbox.openrouter_proxy', return_value=nullcontext(None)), \
+                mock.patch('harness.sandbox.snapshot', return_value=None), \
+                mock.patch('harness.sandbox.model_run', side_effect=model_side_effect):
+            return run_task(
+                task_path,
+                cli='/usr/bin/true',
+                db=self.root / 'db.sqlite',
+                state=self.state,
+                _quiet=True,
+                _return_result=True,
+            )
+
+    def test_validate_task_preserves_explicit_read_only_files(self):
+        from harness.sandbox import validate_task
+        explicit = self.repo / 'explicit.py'
+        explicit.write_text('E = 1\n', encoding='utf-8')
+        task = validate_task({
+            'task_id': 't_explicit',
+            'directory': str(self.repo),
+            'files': [str(self.test_file)],
+            'read_only_files': [str(explicit)],
+            'test_argv': ['/usr/bin/true'],
+            'mode': 'model',
+            'prompt': 'edit test',
+        })
+        self.assertEqual(task['explicit_read_only_files'], [str(explicit)])
+        self.assertIn(str(self.mod_file), task['read_only_files'])
+        self.assertIn(str(explicit), task['read_only_files'])
+
+    def test_active_pending_sibling_editable_file_excluded_from_auto_inferred_ro(self):
+        import json
+        from pathlib import Path
+        self._write_sibling_run(
+            'sib_pending',
+            task_id='t_sib',
+            status='pending',
+            files=[self.mod_file],
+        )
+
+        def fake_model(cli, db, task, run_dir, result, budget, **kwargs):
+            Path(task['files'][0]).write_text('def test_ok():\n    assert 1 == 1\n', encoding='utf-8')
+            result['cost'] = 0.0
+            result['steps'] = 1
+
+        res = self._run_model_task({
+            'task_id': 't_main',
+            'directory': str(self.repo),
+            'files': [str(self.test_file)],
+            'test_argv': ['/usr/bin/true'],
+            'mode': 'model',
+            'prompt': 'edit test',
+        }, fake_model)
+        self.assertEqual(res['status'], 'validation_passed_review_required')
+        recorded_task = json.loads((Path(res['artifact']) / 'task.json').read_text(encoding='utf-8'))
+        self.assertNotIn(str(self.mod_file), recorded_task['read_only_files'])
+
+    def test_auto_inferred_ro_modified_by_concurrent_sibling_is_allowed(self):
+        import json
+        import time
+        from pathlib import Path
+
+        def fake_model(cli, db, task, run_dir, result, budget, **kwargs):
+            Path(task['files'][0]).write_text('def test_ok():\n    assert 2 == 2\n', encoding='utf-8')
+            # Simulate a concurrent sibling run starting mid-run and editing mod.py
+            self._write_sibling_run(
+                'sib_concurrent',
+                task_id='t_sib_concurrent',
+                status='pending',
+                files=[self.mod_file],
+                started_at=time.time(),
+            )
+            self.mod_file.write_text('VALUE = 2\n', encoding='utf-8')
+            result['cost'] = 0.0
+            result['steps'] = 1
+
+        res = self._run_model_task({
+            'task_id': 't_main_concurrent',
+            'directory': str(self.repo),
+            'files': [str(self.test_file)],
+            'test_argv': ['/usr/bin/true'],
+            'mode': 'model',
+            'prompt': 'edit test',
+        }, fake_model)
+        self.assertEqual(res['status'], 'validation_passed_review_required')
+        self.assertEqual(self.mod_file.read_text(encoding='utf-8'), 'VALUE = 2\n')
+        events_path = Path(res['artifact']) / 'events.jsonl'
+        events = [json.loads(line) for line in events_path.read_text(encoding='utf-8').splitlines() if line.strip()]
+        self.assertTrue(
+            any(ev.get('event') == 'concurrent_sibling_read_only_change_ignored'
+                and ev.get('file') == str(self.mod_file) for ev in events),
+            f'expected concurrent_sibling_read_only_change_ignored in {events}',
+        )
+
+    def test_explicit_ro_modified_during_run_still_blocked(self):
+        import time
+        from pathlib import Path
+
+        def fake_model(cli, db, task, run_dir, result, budget, **kwargs):
+            Path(task['files'][0]).write_text('def test_ok():\n    assert 3 == 3\n', encoding='utf-8')
+            self._write_sibling_run(
+                'sib_concurrent_explicit',
+                task_id='t_sib_explicit',
+                status='pending',
+                files=[self.mod_file],
+                started_at=time.time(),
+            )
+            self.mod_file.write_text('VALUE = 3\n', encoding='utf-8')
+            result['cost'] = 0.0
+            result['steps'] = 1
+
+        res = self._run_model_task({
+            'task_id': 't_main_explicit',
+            'directory': str(self.repo),
+            'files': [str(self.test_file)],
+            'read_only_files': [str(self.mod_file)],
+            'test_argv': ['/usr/bin/true'],
+            'mode': 'model',
+            'prompt': 'edit test',
+        }, fake_model)
+        self.assertEqual(res['status'], 'blocked')
+        self.assertEqual(res['reason'], 'read_only_file_modified')
+
+    def test_salvage_micro_repair_succeeds_after_step_limit(self):
+        import json
+        import sys
+        from pathlib import Path
+        from harness.sandbox import GuardError
+
+        self.test_file.write_text(
+            'from mod import VALUE\n'
+            'def test_val():\n'
+            '    assert VALUE == 2\n',
+            encoding='utf-8',
+        )
+        calls = []
+
+        def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(task['prompt'])
+            if len(calls) == 1:
+                self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+                result['steps'] = 5
+                result['cost'] = 0.01
+                raise GuardError('step_limit')
+            self.mod_file.write_text('VALUE = 2\n', encoding='utf-8')
+            result['steps'] = 1
+            result['cost'] = 0.005
+
+        res = self._run_model_task({
+            'task_id': 'h90-step-limit-pass',
+            'mode': 'model',
+            'directory': str(self.repo),
+            'files': [str(self.mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+            'max_steps': 4,
+            'budget_usd': 0.5,
+            'prompt': 'set VALUE=2',
+        }, fake_model_run)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(res['status'], 'validation_passed_review_required')
+        self.assertEqual(res['salvaged_from'], 'salvage_repaired_step_limit')
+        self.assertTrue(res.get('micro_repair_attempted'))
+        self.assertEqual(res['test_return_code'], 0)
+        events_path = Path(res['artifact']) / 'events.jsonl'
+        events = [json.loads(line)['event'] for line in events_path.read_text(encoding='utf-8').splitlines()]
+        self.assertIn('salvage_micro_repair_started', events)
+
+    def test_salvage_micro_repair_preserves_original_reason_on_failure(self):
+        import sys
+        from harness.sandbox import GuardError
+
+        self.test_file.write_text(
+            'from mod import VALUE\n'
+            'def test_val():\n'
+            '    assert VALUE == 2\n',
+            encoding='utf-8',
+        )
+        calls = []
+
+        def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+                result['steps'] = 2
+                result['cost'] = 0.01
+                raise GuardError('worker_timeout')
+            self.mod_file.write_text('VALUE = 100\n', encoding='utf-8')
+            result['steps'] = 1
+            result['cost'] = 0.005
+
+        res = self._run_model_task({
+            'task_id': 'h90-timeout-fail',
+            'mode': 'model',
+            'directory': str(self.repo),
+            'files': [str(self.mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+            'max_steps': 4,
+            'budget_usd': 0.5,
+            'prompt': 'set VALUE=2',
+        }, fake_model_run)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(res['status'], 'blocked')
+        self.assertEqual(res['reason'], 'worker_timeout')
+        self.assertTrue(res.get('micro_repair_attempted'))
+
+    def test_salvage_micro_repair_skipped_for_non_repairable_or_test_timeout(self):
+        import sys
+        from unittest import mock
+        from harness.sandbox import GuardError
+
+        self.test_file.write_text(
+            'from mod import VALUE\n'
+            'def test_val():\n'
+            '    assert VALUE == 2\n',
+            encoding='utf-8',
+        )
+
+        calls = []
+
+        def fake_model_run_non_repairable(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(1)
+            self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+            result['steps'] = 2
+            result['cost'] = 0.01
+            raise GuardError('repeated_tool_error')
+
+        res1 = self._run_model_task({
+            'task_id': 'h90-non-repairable',
+            'mode': 'model',
+            'directory': str(self.repo),
+            'files': [str(self.mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+            'max_steps': 4,
+            'budget_usd': 0.5,
+            'prompt': 'set VALUE=2',
+        }, fake_model_run_non_repairable)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res1['status'], 'blocked')
+        self.assertEqual(res1['reason'], 'repeated_tool_error')
+        self.assertFalse(res1.get('micro_repair_attempted', False))
+
+        self.mod_file.write_text('VALUE = 1\n', encoding='utf-8')
+        calls.clear()
+
+        def fake_model_run_timeout(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(1)
+            self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+            result['steps'] = 2
+            result['cost'] = 0.01
+            raise GuardError('worker_timeout')
+
+        with mock.patch('harness.sandbox.execute', return_value=124):
+            res2 = self._run_model_task({
+                'task_id': 'h90-test-timeout-124',
+                'mode': 'model',
+                'directory': str(self.repo),
+                'files': [str(self.mod_file)],
+                'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+                'max_steps': 4,
+                'budget_usd': 0.5,
+                'prompt': 'set VALUE=2',
+            }, fake_model_run_timeout)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(res2['status'], 'blocked')
+        self.assertEqual(res2['reason'], 'worker_timeout')
+        self.assertFalse(res2.get('micro_repair_attempted', False))
+
+
+class TestEnvAndPreflightTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.repo = Path(os.path.realpath(self._td.name))
+
+    def test_build_test_env_overrides_enriches_pythonpath_and_preserves_caller_first(self):
+        from harness.sandbox import build_test_env_overrides
+
+        ai_mcp = self.repo / 'ai' / 'mcp'
+        ai_tools = self.repo / 'ai' / 'tools'
+        ai_mcp.mkdir(parents=True)
+        ai_tools.mkdir(parents=True)
+        (ai_tools / 'agent_coding_policy.py').write_text('POLICY = 1\n', encoding='utf-8')
+        test_file = ai_tools / 'test_capri_coding_config.py'
+        test_file.write_text('import agent_coding_policy\n', encoding='utf-8')
+
+        caller_dir = str(self.repo / 'custom_caller')
+        saved = os.environ.get('PYTHONPATH')
+        try:
+            os.environ['PYTHONPATH'] = caller_dir
+            env = build_test_env_overrides({
+                'directory': str(self.repo),
+                'files': [str(test_file)],
+                'test_argv': ['/usr/bin/env', f'PYTHONPATH={caller_dir}', 'python', '-m', 'pytest', str(test_file)],
+            })
+        finally:
+            if saved is None:
+                os.environ.pop('PYTHONPATH', None)
+            else:
+                os.environ['PYTHONPATH'] = saved
+
+        parts = env['PYTHONPATH'].split(os.pathsep)
+        self.assertEqual(parts[0], caller_dir)
+        self.assertEqual(parts.count(caller_dir), 1)
+        self.assertIn(str(self.repo), parts)
+        self.assertIn(str(ai_tools), parts)
+        self.assertIn(str(ai_mcp), parts)
+
+    def test_preflight_test_argv_rejects_unsupported_flag_unless_script_editable(self):
+        import sys
+        from harness.sandbox import GuardError, preflight_test_argv
+
+        validator = self.repo / 'validate_openspec.py'
+        validator.write_text(
+            'import argparse\n'
+            'p = argparse.ArgumentParser()\n'
+            'p.add_argument("--strict", action="store_true")\n'
+            'p.parse_args()\n',
+            encoding='utf-8',
+        )
+
+        # Non-editable validator with unsupported --change flag -> GuardError
+        with self.assertRaises(GuardError) as ctx:
+            preflight_test_argv({
+                'directory': str(self.repo),
+                'files': [str(self.repo / 'other.py')],
+                'test_argv': [sys.executable, str(validator), '--change', 'abc'],
+            }, self.repo)
+        self.assertEqual(str(ctx.exception), 'invalid_test_argv_flags')
+
+        # Supported flag -> no error
+        preflight_test_argv({
+            'directory': str(self.repo),
+            'files': [str(self.repo / 'other.py')],
+            'test_argv': [sys.executable, str(validator), '--strict'],
+        }, self.repo)
+
+        # Editable validator -> no error even with unsupported --change flag
+        preflight_test_argv({
+            'directory': str(self.repo),
+            'files': [str(validator)],
+            'test_argv': [sys.executable, str(validator), '--change', 'abc'],
+        }, self.repo)
+
+    def test_preflight_test_argv_pytest_missing_target_and_empty_collection(self):
+        import sys
+        from harness.sandbox import GuardError, preflight_test_argv
+
+        mod_file = self.repo / 'mod.py'
+        mod_file.write_text('VALUE = 1\n', encoding='utf-8')
+        (self.repo / 'tests').mkdir(exist_ok=True)
+        (self.repo / 'tests' / 'test_mod.py').write_text('def test_ok():\n    assert True\n', encoding='utf-8')
+
+        # Missing non-editable pytest target -> missing_test_target
+        with self.assertRaises(GuardError) as ctx:
+            preflight_test_argv({
+                'directory': str(self.repo),
+                'files': [str(mod_file)],
+                'test_argv': [sys.executable, '-m', 'pytest', 'tests/missing_test.py::test_x'],
+            }, self.repo)
+        self.assertEqual(str(ctx.exception), 'missing_test_target')
+
+        # Missing target that IS in editable files -> allowed (worker may create it)
+        preflight_test_argv({
+            'directory': str(self.repo),
+            'files': [str(self.repo / 'tests' / 'new_test.py')],
+            'test_argv': [sys.executable, '-m', 'pytest', 'tests/new_test.py'],
+        }, self.repo)
+
+        # Existing test file with -k filter matching nothing -> empty_pytest_collection
+        with self.assertRaises(GuardError) as ctx:
+            preflight_test_argv({
+                'directory': str(self.repo),
+                'files': [str(mod_file)],
+                'test_argv': [sys.executable, '-m', 'pytest', 'tests/test_mod.py', '-k', 'no_such_test_xyz'],
+            }, self.repo)
+        self.assertEqual(str(ctx.exception), 'empty_pytest_collection')
+
+        # Existing test file with valid collection -> no error
+        preflight_test_argv({
+            'directory': str(self.repo),
+            'files': [str(mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', 'tests/test_mod.py'],
+        }, self.repo)
+
+    def test_preflight_test_argv_script_missing_positional_args(self):
+        import sys
+        from harness.sandbox import GuardError, preflight_test_argv
+
+        mod_file = self.repo / 'mod.py'
+        mod_file.write_text('VALUE = 1\n', encoding='utf-8')
+        req_script = self.repo / 'check_req.py'
+        req_script.write_text(
+            'import argparse\n'
+            'p = argparse.ArgumentParser()\n'
+            'p.add_argument("--strict", action="store_true")\n'
+            'p.add_argument("target")\n'
+            'p.parse_args()\n',
+            encoding='utf-8',
+        )
+
+        # Zero args when positional target is required -> missing_test_script_args
+        with self.assertRaises(GuardError) as ctx:
+            preflight_test_argv({
+                'directory': str(self.repo),
+                'files': [str(mod_file)],
+                'test_argv': [sys.executable, str(req_script)],
+            }, self.repo)
+        self.assertEqual(str(ctx.exception), 'missing_test_script_args')
+
+        # Flag only, still missing positional -> missing_test_script_args
+        with self.assertRaises(GuardError) as ctx:
+            preflight_test_argv({
+                'directory': str(self.repo),
+                'files': [str(mod_file)],
+                'test_argv': [sys.executable, str(req_script), '--strict'],
+            }, self.repo)
+        self.assertEqual(str(ctx.exception), 'missing_test_script_args')
+
+        # Positional arg supplied -> no error
+        preflight_test_argv({
+            'directory': str(self.repo),
+            'files': [str(mod_file)],
+            'test_argv': [sys.executable, str(req_script), 'foo.txt'],
+        }, self.repo)
+
+        # Optional positional arg -> no error with zero args
+        opt_script = self.repo / 'check_opt.py'
+        opt_script.write_text(
+            'import argparse\n'
+            'p = argparse.ArgumentParser()\n'
+            'p.add_argument("target", nargs="?")\n'
+            'p.parse_args()\n',
+            encoding='utf-8',
+        )
+        preflight_test_argv({
+            'directory': str(self.repo),
+            'files': [str(mod_file)],
+            'test_argv': [sys.executable, str(opt_script)],
+        }, self.repo)
+
+    def test_check_yaml_and_jinja_integrity(self):
+        from harness.guards import check_yaml_and_jinja_integrity
+
+        # Valid dbt schema.yml with Jinja, block scalar, apostrophe, and list items
+        valid_dbt = (
+            "version: 2\n"
+            "models:\n"
+            "  - name: users\n"
+            "    description: |\n"
+            "      User table it's great\n"
+            "      \ttab_inside_block_scalar_is_ok\n"
+            "    columns:\n"
+            "      - name: id\n"
+            "        description: \"{{ doc('user_id') }}\"\n"
+            "      - name: email\n"
+            "        description: User's email\n"
+            "        meta: {a: {b: 1}}\n"
+        )
+        self.assertEqual(check_yaml_and_jinja_integrity(valid_dbt, "schema.yml"), [])
+
+        # Tab indentation outside block scalar
+        tab_yaml = "models:\n\t- name: users\n"
+        issues = check_yaml_and_jinja_integrity(tab_yaml, "schema.yml")
+        self.assertTrue(any("tab indentation" in i for i in issues), issues)
+
+        # Duplicate sibling mapping keys in same parent / list item
+        dup_yaml = (
+            "models:\n"
+            "  - name: users\n"
+            "    description: first\n"
+            "    description: second\n"
+        )
+        issues = check_yaml_and_jinja_integrity(dup_yaml, "schema.yml")
+        self.assertTrue(any("duplicate YAML mapping key 'description'" in i for i in issues), issues)
+
+        # Unbalanced quote on single-line scalar
+        quote_yaml = 'name: "unclosed\n'
+        issues = check_yaml_and_jinja_integrity(quote_yaml, "config.yaml")
+        self.assertTrue(any("unbalanced" in i for i in issues), issues)
+
+        # Unclosed Jinja delimiters in .sql and .yml
+        sql_bad = "SELECT * FROM {{ ref('users')\n{% if is_incremental()\n"
+        issues = check_yaml_and_jinja_integrity(sql_bad, "model.sql")
+        self.assertEqual(len(issues), 2, issues)
+        self.assertTrue(any("'{{" in i for i in issues), issues)
+        self.assertTrue(any("'{%" in i for i in issues), issues)
+
+    def test_check_python_class_and_call_integrity(self):
+        from harness.guards import check_python_class_and_call_integrity
+
+        # Wrong positional arity, unknown kwarg, missing self._helper()
+        bad_py = (
+            "def add(a, b=1):\n"
+            "    return a + b\n"
+            "\n"
+            "class Worker:\n"
+            "    def run(self):\n"
+            "        self._missing()\n"
+            "        return add(1, 2, 3)\n"
+            "\n"
+            "x = add()\n"
+            "y = add(1, bogus=2)\n"
+        )
+        issues = check_python_class_and_call_integrity(bad_py, "mod.py")
+        self.assertTrue(any("has no method '_missing'" in i for i in issues), issues)
+        self.assertTrue(any("too many positional arguments" in i for i in issues), issues)
+        self.assertTrue(any("missing required argument(s) a" in i for i in issues), issues)
+        self.assertTrue(any("unexpected keyword argument 'bogus'" in i for i in issues), issues)
+
+        # Decorated, *args/**kwargs, inherited, __getattr__, and self.attr callable -> no false positives
+        clean_py = (
+            "def dec(f):\n"
+            "    return f\n"
+            "\n"
+            "@dec\n"
+            "def wrapped(a):\n"
+            "    return a\n"
+            "\n"
+            "def variadic(*args, **kwargs):\n"
+            "    return args\n"
+            "\n"
+            "class Child(Base):\n"
+            "    def run(self):\n"
+            "        return self.inherited_method()\n"
+            "\n"
+            "class Dyn:\n"
+            "    def __getattr__(self, name):\n"
+            "        return lambda: None\n"
+            "    def go(self):\n"
+            "        return self.anything()\n"
+            "\n"
+            "class WithCallback:\n"
+            "    def __init__(self, fn):\n"
+            "        self.fn = fn\n"
+            "    def call_it(self):\n"
+            "        return self.fn()\n"
+            "\n"
+            "wrapped(1, 2)\n"
+            "variadic(1, 2, x=3)\n"
+        )
+        self.assertEqual(check_python_class_and_call_integrity(clean_py, "clean.py"), [])
+
+    def test_render_guard_plugin_polyglot_hooks(self):
+        from harness.sandbox import render_guard_plugin
+
+        plugin = render_guard_plugin()
+        for needle in (
+            '"apply_patch"',
+            '.mjs',
+            '"node", "--check"',
+            '.ts',
+            'Bun.Transpiler',
+            '.yaml',
+            '.yml',
+            '.sql',
+            '[HARNESS IN-LOOP YAML/JINJA CHECK FAILED]',
+            'Bun.which("ruff")',
+            'has no method',
+            'unexpected kwarg',
+        ):
+            self.assertIn(needle, plugin)
+
+
+class PolyglotCompanionAndSymbolContextTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.task_dir = os.path.realpath(self._td.name)
+
+    def _write(self, rel_path, content=''):
+        path = os.path.join(self.task_dir, rel_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        return path
+
+    def test_2hop_python_chain_ranks_models_and_skips_sensitive(self):
+        service = self._write('service.py', 'from repo import load_user\n')
+        repo = self._write('repo.py', 'from models import UserRecord\n\ndef load_user():\n    return UserRecord\n')
+        models = self._write(
+            'models.py',
+            'from dataclasses import dataclass\n\n@dataclass\nclass UserRecord:\n    user_id: int\n',
+        )
+        secret_env = self._write('.env', 'SECRET=1\n')
+        result = infer_read_only_companion_files(
+            [service],
+            directory=self.task_dir,
+            prompt='Update `service.py` to handle `UserRecord` fields',
+        )
+        self.assertIn(repo, result)
+        self.assertIn(models, result)
+        self.assertNotIn(secret_env, result)
+
+        from harness.guards import build_cross_file_symbol_context
+        ctx = build_cross_file_symbol_context(
+            [service],
+            prompt='Handle `UserRecord` in `service.py`',
+            directory=self.task_dir,
+        )
+        self.assertIn('class UserRecord:', ctx)
+        self.assertIn('user_id: int', ctx)
+
+    def test_mjs_relative_import_companion_and_symbol_context(self):
+        main_mjs = self._write(
+            'src/main.mjs',
+            "import { computeBounds } from './bounds.mjs';\nexport function run() { return computeBounds(); }\n",
+        )
+        bounds_mjs = self._write(
+            'src/bounds.mjs',
+            'export function computeBounds(width, height) {\n  return width * height;\n}\n'
+            'export const MAX_BOUNDS = 100;\n',
+        )
+        result = infer_read_only_companion_files([main_mjs], directory=self.task_dir)
+        self.assertEqual(result, [bounds_mjs])
+
+        from harness.guards import build_cross_file_symbol_context
+        ctx = build_cross_file_symbol_context(
+            [main_mjs],
+            prompt='Fix `computeBounds` usage',
+            directory=self.task_dir,
+        )
+        self.assertIn('src/bounds.mjs', ctx)
+        self.assertIn('export function computeBounds(width, height)', ctx)
+
+    def test_dbt_ref_companion_discovery_under_models(self):
+        fct_sql = self._write(
+            'models/marts/fct_orders.sql',
+            "select * from {{ ref('stg_payments') }}\n",
+        )
+        stg_sql = self._write(
+            'models/staging/stg_payments.sql',
+            'select 1 as payment_id\n',
+        )
+        stg_yml = self._write(
+            'models/staging/schema.yml',
+            'version: 2\nmodels:\n  - name: stg_payments\n',
+        )
+        result = infer_read_only_companion_files([fct_sql], directory=self.task_dir)
+        self.assertIn(stg_sql, result)
+        self.assertIn(stg_yml, result)
+
+
+class RuntimeAssertionLocalsTests(unittest.TestCase):
+    def test_extract_runtime_assertion_locals_parses_diff_strips_noise_redacts_and_bounds(self):
+        from harness.guards import extract_runtime_assertion_locals
+
+        long_str = 'x' * 300
+        diag_log = (
+            "=================================== FAILURES ===================================\n"
+            "________________________________ test_dict_diff ________________________________\n"
+            "tests/test_ex.py:4: in test_dict_diff\n"
+            "    compute(actual)\n"
+            "outer_only = 999\n"
+            "src/mod.py:12: in compute\n"
+            "    assert actual == expected\n"
+            "E   AssertionError: assert {'a': 1, 'b': 2} == {'a': 1, 'b': 9}\n"
+            "E     Full diff:\n"
+            "E     - {'a': 1, 'b': 9}\n"
+            "E     + {'a': 1, 'b': 2}\n"
+            "actual     = {'a': 1, 'b': 2}\n"
+            "expected   = {'a': 1, 'b': 9}\n"
+            "__builtins__ = <builtins>\n"
+            "mod        = <module 'mod' from '/tmp/mod.py'>\n"
+            "helper     = <function helper at 0x104abc120>\n"
+            "os_env     = environ({'PATH': '/usr/bin'})\n"
+            "cfg        = <AppConfig object at 0x104abc999>\n"
+            "api_key    = 'sk-or-v1-secret1234567890abcdef'\n"
+            "pem_key    = '-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEA123456789012345678901234567890'\n"
+            f"long_val   = '{long_str}'\n"
+            "=========================== short test summary info ============================\n"
+            "FAILED tests/test_ex.py::test_dict_diff - AssertionError\n"
+        )
+        out = extract_runtime_assertion_locals(diag_log)
+        self.assertIn("E     - {'a': 1, 'b': 9}", out)
+        self.assertIn("actual = {'a': 1, 'b': 2}", out)
+        self.assertIn("expected = {'a': 1, 'b': 9}", out)
+        self.assertNotIn("outer_only", out)
+        self.assertNotIn("__builtins__", out)
+        self.assertNotIn("<module", out)
+        self.assertNotIn("<function", out)
+        self.assertNotIn("environ({", out)
+        self.assertNotIn("<AppConfig", out)
+        self.assertNotIn("sk-or-v1-secret", out)
+        self.assertNotIn("MIIEowIBAAKCAQEA", out)
+        self.assertIn("[REDACTED]", out)
+        long_lines = [line for line in out.splitlines() if line.startswith("long_val = ")]
+        self.assertEqual(len(long_lines), 1)
+        self.assertLessEqual(len(long_lines[0]), len("long_val = ") + 240)
+
+        bounded = extract_runtime_assertion_locals(diag_log, max_chars=120)
+        self.assertLessEqual(len(bounded), 120)
+        self.assertTrue(bounded)
+
+    def test_build_micro_repair_prompt_injects_runtime_assertion_locals(self):
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_micro_repair_prompt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            mod_file = tmp_path / 'mod.py'
+            mod_file.write_text('def val():\n    return 1\n', encoding='utf-8')
+            run_dir = tmp_path / 'run'
+            run_dir.mkdir()
+            (run_dir / 'changes.patch').write_text('--- a/mod.py\n+++ b/mod.py\n', encoding='utf-8')
+            (run_dir / 'test.log').write_text(
+                'FAILED test_mod.py::test_val - AssertionError: assert 1 == 2\n',
+                encoding='utf-8',
+            )
+            (run_dir / 'test_assertion_locals.log').write_text(
+                "test_mod.py:3: in test_val\n"
+                "    assert actual == expected\n"
+                "E   AssertionError: assert {'k': 1} == {'k': 2}\n"
+                "actual     = {'k': 1}\n"
+                "expected   = {'k': 2}\n",
+                encoding='utf-8',
+            )
+            task = {
+                'prompt': 'fix val()',
+                'directory': str(tmp_path),
+                'files': [str(mod_file)],
+                'read_only_files': [],
+            }
+            prompt = build_micro_repair_prompt(task, run_dir)
+            self.assertIn('\n[RUNTIME_ASSERTION_LOCALS]\n', prompt)
+            self.assertIn("actual = {'k': 1}", prompt)
+            self.assertLess(
+                prompt.index('[TEST_ARGV FAILURE'),
+                prompt.index('[RUNTIME_ASSERTION_LOCALS]'),
+            )
+
+    def test_capture_assertion_locals_strips_quiet_and_swallows_timeout(self):
+        import sys
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from harness.sandbox import GuardError, _capture_assertion_locals
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            (run_dir / 'test.log').write_text(
+                'FAILED tests/test_mod.py::test_a - AssertionError: assert 1 == 2\n'
+                'E   AssertionError: assert 1 == 2\n',
+                encoding='utf-8',
+            )
+            recorded = {}
+
+            def fake_execute(argv, directory, timeout, path, *, env_overrides=None):
+                recorded['argv'] = argv
+                recorded['timeout'] = timeout
+                recorded['path'] = path
+                raise GuardError('command_timeout')
+
+            task = {
+                'directory': tmp,
+                'test_argv': [sys.executable, '-m', 'pytest', '-q', str(Path(tmp) / 'tests')],
+                'test_timeout_seconds': 60,
+            }
+            with mock.patch('harness.sandbox.execute', side_effect=fake_execute):
+                _capture_assertion_locals(task, run_dir)
+
+            self.assertEqual(recorded['timeout'], 15)
+            self.assertEqual(recorded['path'], run_dir / 'test_assertion_locals.log')
+            self.assertNotIn('-q', recorded['argv'])
+            self.assertIn('--showlocals', recorded['argv'])
+            self.assertIn('-vv', recorded['argv'])
+            self.assertIn('--tb=short', recorded['argv'])
+            self.assertIn('--no-header', recorded['argv'])
+
+
+from harness.sandbox import is_seatbelt_available
+
+
+class SeatbeltSandboxTests(unittest.TestCase):
+    def test_build_seatbelt_profile_canonicalizes_and_escapes(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_seatbelt_profile, wrap_argv_with_seatbelt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            quoted_dir = Path(tmp) / 'dir"with"quotes'
+            quoted_dir.mkdir()
+            secret_dir = Path(tmp) / 'secret_creds'
+            secret_dir.mkdir()
+
+            profile = build_seatbelt_profile(
+                writable_paths=['/tmp', quoted_dir],
+                denied_read_paths=[secret_dir],
+                allow_localhost_only=True,
+                allowed_tcp_ports=[8080],
+            )
+            self.assertTrue(profile.startswith('(version 1)\n(allow default)\n(deny file-write*)\n'))
+            self.assertIn(f'(allow file-write* (subpath "{os.path.realpath("/tmp")}"))', profile)
+            self.assertIn('dir\\"with\\"quotes', profile)
+            self.assertIn(f'(deny file-read* (subpath "{os.path.realpath(secret_dir)}"))', profile)
+            self.assertIn('(allow network* (local unix))', profile)
+            self.assertIn('(deny network-outbound (remote ip))', profile)
+            self.assertIn('(allow network-outbound (remote ip "localhost:8080"))', profile)
+
+            profile_localhost = build_seatbelt_profile(
+                writable_paths=[quoted_dir],
+                allow_localhost_only=True,
+            )
+            self.assertIn('(allow network-outbound (remote ip "localhost:*"))', profile_localhost)
+
+            wrapped = wrap_argv_with_seatbelt(['python3', '-V'], Path(tmp) / 'p.sb')
+            self.assertEqual(wrapped, ['/usr/bin/sandbox-exec', '-f', str(Path(tmp) / 'p.sb'), 'python3', '-V'])
+
+    def test_validate_task_os_sandbox_modes(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        from harness.proxy import GuardError
+        from harness.sandbox import validate_task
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / 'a.py'
+            target.write_text('x = 1\n', encoding='utf-8')
+            base = {
+                'task_id': 't-sb',
+                'directory': tmp,
+                'files': [str(target)],
+                'prompt': 'edit a.py',
+                'test_argv': ['/usr/bin/true'],
+            }
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop('HARNESS_OS_SANDBOX', None)
+                self.assertEqual(validate_task(dict(base))['os_sandbox'], 'off')
+            with mock.patch.dict(os.environ, {'HARNESS_OS_SANDBOX': 'test_only'}):
+                self.assertEqual(validate_task(dict(base))['os_sandbox'], 'test_only')
+            for mode in ('off', 'test_only', 'strict'):
+                t = validate_task({**base, 'os_sandbox': mode})
+                self.assertEqual(t['os_sandbox'], mode)
+            with self.assertRaises(GuardError) as ctx:
+                validate_task({**base, 'os_sandbox': 'bogus'})
+            self.assertEqual(str(ctx.exception), 'invalid_os_sandbox')
+
+    @unittest.skipUnless(is_seatbelt_available(), "macOS sandbox-exec required")
+    def test_seatbelt_exec_enforces_write_confinement(self):
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_seatbelt_profile, wrap_argv_with_seatbelt
+
+        with tempfile.TemporaryDirectory() as allowed_tmp, tempfile.TemporaryDirectory() as outside_tmp:
+            profile_path = Path(allowed_tmp) / 'test.sb'
+            profile_path.write_text(
+                build_seatbelt_profile(writable_paths=[allowed_tmp], allow_localhost_only=True),
+                encoding='utf-8',
+            )
+            inside_file = Path(allowed_tmp) / 'ok.txt'
+            ok_argv = wrap_argv_with_seatbelt(
+                [sys.executable, '-c', f'from pathlib import Path; Path({str(inside_file)!r}).write_text("ok")'],
+                profile_path,
+            )
+            ok_proc = subprocess.run(ok_argv, capture_output=True, text=True)
+            self.assertEqual(ok_proc.returncode, 0, ok_proc.stderr)
+            self.assertEqual(inside_file.read_text(encoding='utf-8'), 'ok')
+
+            outside_file = Path(outside_tmp) / 'blocked.txt'
+            bad_argv = wrap_argv_with_seatbelt(
+                [sys.executable, '-c', f'from pathlib import Path; Path({str(outside_file)!r}).write_text("no")'],
+                profile_path,
+            )
+            bad_proc = subprocess.run(bad_argv, capture_output=True, text=True)
+            self.assertNotEqual(bad_proc.returncode, 0)
+            self.assertIn('PermissionError', bad_proc.stderr)
+            self.assertFalse(outside_file.exists())
+
+
 if __name__ == '__main__':
     unittest.main()

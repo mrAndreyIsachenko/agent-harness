@@ -34,14 +34,17 @@ from typing import Any
 
 __all__ = [
     "FORBIDDEN_EGRESS_KEYS",
+    "audit_patch_for_reward_hacking",
     "build_cross_file_symbol_context",
     "build_file_skeletons",
     "check_allowed_files_syntax",
     "check_cot_and_slop_integrity",
     "check_egress_payload",
+    "check_python_class_and_call_integrity",
     "check_python_undefined_names",
     "check_readonly_sql_tool_calls",
     "check_sql_syntax",
+    "check_yaml_and_jinja_integrity",
     "collect_python_top_symbols",
     "compact_context_window",
     "compact_stale_reads",
@@ -49,6 +52,7 @@ __all__ = [
     "detect_edit_oscillation",
     "detect_zero_edit_read_stall",
     "extract_failing_test_excerpts",
+    "extract_runtime_assertion_locals",
     "estimate_messages_tokens",
     "extract_compact_test_failure",
     "inject_edit_failure_hints",
@@ -530,6 +534,755 @@ def check_python_undefined_names(source: str, filename: str = "<input>") -> list
     ]
 
 
+_YAML_BLOCK_SCALAR_RE = re.compile(
+    r"^(?:[^:#'\"]*:\s*|-\s+)[|>][+-]?\d*\s*(?:#.*)?$"
+)
+_YAML_KEY_RE = re.compile(
+    r"""^([A-Za-z0-9_.\-/]+|"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s|$)(.*)$"""
+)
+
+
+def _check_jinja_delimiters(source: str, filename: str) -> list[str]:
+    """Verify balanced Jinja ``{{ }}``, ``{% %}``, and ``{# #}`` delimiters."""
+    issues: list[str] = []
+    n = len(source)
+    i = 0
+    line = 1
+    state: str | None = None
+    open_line = 0
+    quote: str | None = None
+    brace_depth = 0
+
+    while i < n:
+        ch = source[i]
+        if ch == "\n":
+            line += 1
+            i += 1
+            continue
+
+        if state == "{#":
+            if source.startswith("#}", i):
+                state = None
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if state in ("{{", "{%"):
+            if quote is not None:
+                if ch == "\\" and i + 1 < n:
+                    if source[i + 1] == "\n":
+                        line += 1
+                    i += 2
+                    continue
+                if ch == quote:
+                    quote = None
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            close_tok = "}}" if state == "{{" else "%}"
+            if source.startswith(close_tok, i):
+                state = None
+                i += 2
+                continue
+            if source.startswith("{{", i) or source.startswith("{%", i) or source.startswith("{#", i):
+                issues.append(
+                    f"{filename}:L{open_line}: unclosed Jinja '{state}' delimiter"
+                )
+                state = source[i : i + 2]
+                open_line = line
+                quote = None
+                i += 2
+                continue
+            i += 1
+            continue
+
+        # Outside Jinja tags
+        if source.startswith("{{", i):
+            state = "{{"
+            open_line = line
+            quote = None
+            i += 2
+            continue
+        if source.startswith("{%", i):
+            state = "{%"
+            open_line = line
+            quote = None
+            i += 2
+            continue
+        if source.startswith("{#", i):
+            state = "{#"
+            open_line = line
+            quote = None
+            i += 2
+            continue
+        if source.startswith("%}", i) or source.startswith("#}", i):
+            issues.append(
+                f"{filename}:L{line}: unmatched Jinja '{source[i:i+2]}' delimiter"
+            )
+            i += 2
+            continue
+        if source.startswith("}}", i):
+            if brace_depth >= 2:
+                brace_depth -= 2
+            else:
+                issues.append(f"{filename}:L{line}: unmatched Jinja '}}' delimiter")
+            i += 2
+            continue
+        if ch == "{":
+            brace_depth += 1
+        elif ch == "}" and brace_depth > 0:
+            brace_depth -= 1
+        i += 1
+
+    if state is not None:
+        issues.append(f"{filename}:L{open_line}: unclosed Jinja '{state}' delimiter")
+    return issues
+
+
+
+def _has_unbalanced_single_line_quote(val: str) -> str | None:
+    """Return the quote char if ``val`` starts a quoted scalar without closing it."""
+    s = val.strip()
+    if not s or s[0] not in ('"', "'"):
+        return None
+    q = s[0]
+    i = 1
+    n = len(s)
+    if q == "'":
+        while i < n:
+            if s[i] == "'":
+                if i + 1 < n and s[i + 1] == "'":
+                    i += 2
+                    continue
+                return None
+            i += 1
+        return "'"
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if s[i] == '"':
+            return None
+        i += 1
+    return '"'
+
+
+def check_yaml_and_jinja_integrity(source: str, filename: str = "<input>") -> list[str]:
+    """Pure-stdlib validator for YAML indentation/keys/quotes and Jinja delimiters (H-93).
+
+    - For ``.yaml``/``.yml``/``.sql``: verifies balanced Jinja delimiters
+      (``{{``/``}}``, ``{%``/``%}``, ``{#``/``#}``).
+    - For ``.yaml``/``.yml``: rejects leading tab indentation outside block scalars,
+      unbalanced single/double quotes on single-line scalar values, and duplicate
+      sibling mapping keys at the same indentation level within the same parent block
+      or list item.
+    """
+    lower = filename.lower()
+    is_sql = lower.endswith(".sql")
+    is_yaml = lower.endswith((".yaml", ".yml")) or filename == "<input>"
+
+    issues = _check_jinja_delimiters(source, filename)
+    if is_sql or not is_yaml:
+        return issues
+
+
+    # Stack of active mapping scopes: list of (indent, {key: first_lineno})
+    frames: list[tuple[int, dict[str, int]]] = []
+    block_indent: int | None = None
+
+    for lineno, raw_line in enumerate(source.splitlines(), 1):
+        stripped = raw_line.strip()
+
+        if block_indent is not None:
+            if not stripped:
+                continue
+            lead_spaces = len(raw_line) - len(raw_line.lstrip(" "))
+            if raw_line.startswith("\t") or (
+                "\t" in raw_line[: len(raw_line) - len(raw_line.lstrip(" \t"))]
+                and lead_spaces <= block_indent
+            ):
+                issues.append(
+                    f"{filename}:L{lineno}: tab indentation is not allowed in YAML"
+                )
+                block_indent = None
+                continue
+            elif lead_spaces > block_indent:
+                continue
+            else:
+                block_indent = None
+
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped in ("---", "..."):
+            frames.clear()
+            continue
+
+        lead_ws_len = len(raw_line) - len(raw_line.lstrip(" \t"))
+        lead_ws = raw_line[:lead_ws_len]
+        if "\t" in lead_ws:
+            issues.append(
+                f"{filename}:L{lineno}: tab indentation is not allowed in YAML"
+            )
+            continue
+
+        if stripped.startswith(("{%", "{#")):
+            continue
+
+        indent = lead_ws_len
+        content = stripped
+
+        # Handle YAML sequence item prefix `- ` or bare `-`
+        if content == "-" or content.startswith("- "):
+            while frames and frames[-1][0] >= indent:
+                frames.pop()
+            if content == "-":
+                continue
+            item_rest = content[2:].lstrip(" ")
+            item_indent = indent + (len(content) - len(item_rest))
+            m_key = _YAML_KEY_RE.match(item_rest)
+            if m_key:
+                key_name = m_key.group(1).strip("\"'")
+                val_part = m_key.group(2)
+                frames.append((item_indent, {key_name: lineno}))
+                bad_q = _has_unbalanced_single_line_quote(val_part)
+                if bad_q:
+                    issues.append(
+                        f"{filename}:L{lineno}: unbalanced {bad_q} quote in YAML scalar"
+                    )
+                if _YAML_BLOCK_SCALAR_RE.match(item_rest):
+                    block_indent = indent
+            else:
+                bad_q = _has_unbalanced_single_line_quote(item_rest)
+                if bad_q:
+                    issues.append(
+                        f"{filename}:L{lineno}: unbalanced {bad_q} quote in YAML scalar"
+                    )
+                if _YAML_BLOCK_SCALAR_RE.match(content):
+                    block_indent = indent
+            continue
+
+        # Regular mapping line
+        m_key = _YAML_KEY_RE.match(content)
+        if m_key:
+            key_name = m_key.group(1).strip("\"'")
+            val_part = m_key.group(2)
+            while frames and frames[-1][0] > indent:
+                frames.pop()
+            if frames and frames[-1][0] == indent:
+                seen = frames[-1][1]
+                if key_name in seen:
+                    issues.append(
+                        f"{filename}:L{lineno}: duplicate YAML mapping key '{key_name}' "
+                        f"(first defined at L{seen[key_name]})"
+                    )
+                else:
+                    seen[key_name] = lineno
+            else:
+                frames.append((indent, {key_name: lineno}))
+            bad_q = _has_unbalanced_single_line_quote(val_part)
+            if bad_q:
+                issues.append(
+                    f"{filename}:L{lineno}: unbalanced {bad_q} quote in YAML scalar"
+                )
+            if _YAML_BLOCK_SCALAR_RE.match(content):
+                block_indent = indent
+
+    return issues
+
+
+def _normalize_block(lines: list[str]) -> tuple[int, list[str]]:
+    """Return ``(base_indent, relative_lines)`` for H-85 indentation normalization."""
+    base_indent = min(
+        (len(line) - len(line.lstrip(" ")) for line in lines if line.strip()),
+        default=0,
+    )
+    rel_lines = [
+        "" if not line.strip() else line[base_indent:].rstrip() for line in lines
+    ]
+    return base_indent, rel_lines
+
+
+def _find_normalized_matches(
+    buf_lines: list[str],
+    rel_lines: list[str],
+    *,
+    start_idx: int = 0,
+    end_idx: int | None = None,
+) -> list[tuple[int, int]]:
+    """Find ``(line_index, delta_indent)`` matches for ``rel_lines`` in ``buf_lines``."""
+    if not rel_lines:
+        return []
+    end = len(buf_lines) if end_idx is None else min(end_idx, len(buf_lines))
+    first_nonempty = next((i for i, r in enumerate(rel_lines) if r != ""), None)
+    matches: list[tuple[int, int]] = []
+    for start in range(max(0, start_idx), end - len(rel_lines) + 1):
+        if first_nonempty is None:
+            if all(buf_lines[start + k].strip() == "" for k in range(len(rel_lines))):
+                matches.append((start, 0))
+            continue
+        cur0 = buf_lines[start + first_nonempty]
+        delta = len(cur0) - len(cur0.lstrip(" "))
+        prefix = " " * delta
+        ok = True
+        for k, rel in enumerate(rel_lines):
+            cur = buf_lines[start + k]
+            if rel == "":
+                if cur.strip() != "":
+                    ok = False
+                    break
+            elif cur.rstrip() != prefix + rel:
+                ok = False
+                break
+        if ok:
+            matches.append((start, delta))
+    return matches
+
+
+def _reindent_lines(lines: list[str], shift: int) -> list[str]:
+    """Shift non-empty lines by ``shift`` spaces."""
+    if shift == 0:
+        return list(lines)
+    out: list[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append("")
+        elif shift > 0:
+            out.append((" " * shift) + line)
+        else:
+            lead = len(line) - len(line.lstrip(" "))
+            out.append(line[min(-shift, lead):])
+    return out
+
+
+def apply_transactional_multiedit(
+    content: str, edits: list[dict[str, str]]
+) -> tuple[bool, str, str]:
+    """Apply sequential edits atomically in-memory with H-85 indentation fallback (H-94)."""
+    if not isinstance(edits, list) or not edits:
+        return False, content, "No edits provided"
+    buf = content
+    for idx, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            return False, content, f"Edit #{idx + 1} must be a dict"
+        old_str = edit["oldString"] if "oldString" in edit else edit.get("old_string", "")
+        new_str = edit["newString"] if "newString" in edit else edit.get("new_string", "")
+        if not isinstance(old_str, str) or not isinstance(new_str, str) or old_str == "":
+            return False, content, f"Edit #{idx + 1} has missing or empty oldString"
+
+        count = buf.count(old_str)
+        if count == 1:
+            buf = buf.replace(old_str, new_str, 1)
+            continue
+        if count > 1:
+            line_nums: list[str] = []
+            pos = 0
+            while len(line_nums) < 5:
+                hit = buf.find(old_str, pos)
+                if hit < 0:
+                    break
+                line_nums.append(str(buf[:hit].count("\n") + 1))
+                pos = hit + len(old_str)
+            return (
+                False,
+                content,
+                f"Edit #{idx + 1} matched {count} times (ambiguous) at lines {', '.join(line_nums)}",
+            )
+
+        raw_old = old_str.split("\n")
+        while raw_old and not raw_old[0].strip():
+            raw_old.pop(0)
+        while raw_old and not raw_old[-1].strip():
+            raw_old.pop()
+        if not raw_old:
+            return False, content, f"Edit #{idx + 1} has only whitespace in oldString"
+
+        base_old_indent, rel_old = _normalize_block(raw_old)
+        buf_lines = buf.split("\n")
+        matches = _find_normalized_matches(buf_lines, rel_old)
+        if len(matches) == 1:
+            start, delta = matches[0]
+            shift = delta - base_old_indent
+            new_lines = _reindent_lines(new_str.split("\n"), shift)
+            buf_lines = buf_lines[:start] + new_lines + buf_lines[start + len(rel_old):]
+            buf = "\n".join(buf_lines)
+        elif len(matches) > 1:
+            locs = ", ".join(str(m[0] + 1) for m in matches[:5])
+            return (
+                False,
+                content,
+                f"Edit #{idx + 1} matched {len(matches)} times after indentation normalization (ambiguous) at lines {locs}",
+            )
+        else:
+            needle = next((line.strip() for line in raw_old if line.strip()), "")
+            near = [
+                str(i + 1)
+                for i, line in enumerate(buf_lines)
+                if needle and (line.strip() == needle or needle in line)
+            ][:3]
+            hint = f" (near-matching lines: {', '.join(near)})" if near else ""
+            return False, content, f"Edit #{idx + 1} had 0 matches{hint}"
+
+    return True, buf, f"Applied {len(edits)} edit(s) successfully."
+
+
+_UNIFIED_HUNK_RE = re.compile(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@(?:\s+(.*))?$")
+
+
+def apply_context_patch(content: str, patch_text: str) -> tuple[bool, str, str]:
+    """Apply context-only V4A ``@@`` hunks atomically in-memory (H-94)."""
+    if not isinstance(patch_text, str) or not patch_text.strip():
+        return False, content, "Empty patch"
+
+    hunks: list[tuple[str, list[str], list[str]]] = []
+    cur_anchor = ""
+    cur_old: list[str] = []
+    cur_new: list[str] = []
+    in_hunk = False
+
+    def _flush_hunk() -> None:
+        nonlocal in_hunk, cur_anchor, cur_old, cur_new
+        if in_hunk and (cur_old or cur_new):
+            hunks.append((cur_anchor, cur_old, cur_new))
+        in_hunk = False
+        cur_anchor = ""
+        cur_old = []
+        cur_new = []
+
+    for raw_line in patch_text.splitlines():
+        if raw_line.startswith((
+            "*** Begin Patch",
+            "*** End Patch",
+            "*** Update File:",
+            "*** Add File:",
+            "*** Delete File:",
+            "*** End of File",
+            "\\ No newline at end of file",
+        )):
+            if raw_line.startswith("*** End Patch"):
+                _flush_hunk()
+            continue
+        if not in_hunk and raw_line.startswith(("--- ", "+++ ", "diff --git ", "index ")):
+            continue
+        if raw_line.startswith("@@"):
+            _flush_hunk()
+            m = _UNIFIED_HUNK_RE.match(raw_line)
+            cur_anchor = (m.group(1) or "").strip() if m else raw_line[2:].strip()
+            in_hunk = True
+            continue
+        if not in_hunk:
+            if not raw_line.strip():
+                continue
+            if raw_line[0] in (" ", "-", "+"):
+                in_hunk = True
+                cur_anchor = ""
+            else:
+                return False, content, f"Unexpected line outside hunk: {raw_line!r}"
+        if raw_line == "":
+            cur_old.append("")
+            cur_new.append("")
+        elif raw_line[0] == " ":
+            cur_old.append(raw_line[1:])
+            cur_new.append(raw_line[1:])
+        elif raw_line[0] == "-":
+            cur_old.append(raw_line[1:])
+        elif raw_line[0] == "+":
+            cur_new.append(raw_line[1:])
+        else:
+            return False, content, f"Invalid hunk line prefix: {raw_line!r}"
+    _flush_hunk()
+
+    if not hunks:
+        return False, content, "No patch hunks found"
+
+    buf_lines = content.split("\n")
+    for h_idx, (anchor, old_lines, new_lines) in enumerate(hunks):
+        windows: list[tuple[int, int]] = [(0, len(buf_lines))]
+        anchor_hits: list[int] = []
+        if anchor:
+            anchor_hits = [
+                i for i, line in enumerate(buf_lines)
+                if anchor in line or line.strip() == anchor
+            ]
+            if not anchor_hits:
+                return False, content, f"Hunk #{h_idx + 1} anchor not found: {anchor!r}"
+            windows = []
+            for a_idx in anchor_hits:
+                a_indent = len(buf_lines[a_idx]) - len(buf_lines[a_idx].lstrip(" "))
+                block_end = len(buf_lines)
+                for j in range(a_idx + 1, len(buf_lines)):
+                    if buf_lines[j].strip() and (len(buf_lines[j]) - len(buf_lines[j].lstrip(" "))) <= a_indent:
+                        block_end = j
+                        break
+                windows.append((a_idx + 1, block_end))
+
+        if not old_lines:
+            if anchor and len(anchor_hits) == 1:
+                ins = anchor_hits[0] + 1
+                buf_lines = buf_lines[:ins] + new_lines + buf_lines[ins:]
+                continue
+            return False, content, f"Hunk #{h_idx + 1} has no context or removed lines to locate insertion"
+
+        def _search_windows(win_list: list[tuple[int, int]]) -> tuple[str, list[tuple[int, int]]]:
+            exact: list[tuple[int, int]] = []
+            for ws, we in win_list:
+                for s in range(ws, we - len(old_lines) + 1):
+                    if buf_lines[s:s + len(old_lines)] == old_lines:
+                        exact.append((s, 0))
+            if exact:
+                return "exact", exact
+            _, rel_old = _normalize_block(old_lines)
+            norm: list[tuple[int, int]] = []
+            for ws, we in win_list:
+                norm.extend(_find_normalized_matches(buf_lines, rel_old, start_idx=ws, end_idx=we))
+            return "norm", norm
+
+        kind, hits = _search_windows(windows)
+        if not hits and anchor and len(anchor_hits) == 1:
+            kind, hits = _search_windows([(anchor_hits[0] + 1, len(buf_lines))])
+
+        if len(hits) == 1:
+            s, delta = hits[0]
+            if kind == "exact":
+                adj_new = list(new_lines)
+            else:
+                base_old_indent, _ = _normalize_block(old_lines)
+                adj_new = _reindent_lines(new_lines, delta - base_old_indent)
+            buf_lines = buf_lines[:s] + adj_new + buf_lines[s + len(old_lines):]
+        elif len(hits) > 1:
+            locs = ", ".join(str(m[0] + 1) for m in hits[:5])
+            return (
+                False,
+                content,
+                f"Hunk #{h_idx + 1} matched {len(hits)} times (ambiguous) at lines {locs}",
+            )
+        else:
+            ctx = f" below anchor {anchor!r}" if anchor else ""
+            return False, content, f"Hunk #{h_idx + 1} had 0 matches{ctx}"
+
+    return True, "\n".join(buf_lines), f"Applied {len(hunks)} hunk(s) successfully."
+
+
+def _collect_local_bound_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Collect parameter and locally assigned names inside a function body."""
+    bound: set[str] = set()
+    for a in (*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs):
+        bound.add(a.arg)
+    if fn.args.vararg is not None:
+        bound.add(fn.args.vararg.arg)
+    if fn.args.kwarg is not None:
+        bound.add(fn.args.kwarg.arg)
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            bound.add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node is not fn:
+                bound.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bound.add(alias.asname or alias.name.split(".")[0])
+    return bound
+
+
+def _check_call_against_sig(
+    call: ast.Call,
+    callee_name: str,
+    fn_def: ast.FunctionDef | ast.AsyncFunctionDef,
+    is_bound_method: bool,
+    filename: str,
+) -> list[str]:
+    """Validate positional arity and keyword argument names against a signature."""
+    if fn_def.decorator_list:
+        return []
+    args = fn_def.args
+    if args.vararg is not None or args.kwarg is not None:
+        return []
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        return []
+    if any(kw.arg is None for kw in call.keywords):
+        return []
+
+    posonly = list(args.posonlyargs)
+    regular = list(args.args)
+    if is_bound_method:
+        if posonly:
+            posonly = posonly[1:]
+        elif regular:
+            regular = regular[1:]
+        else:
+            return []
+
+    all_pos = [*posonly, *regular]
+    max_pos = len(all_pos)
+    num_required_pos = max_pos - len(args.defaults)
+    if num_required_pos < 0:
+        num_required_pos = 0
+
+    valid_kw = {a.arg for a in regular} | {a.arg for a in args.kwonlyargs}
+    call_kw_names = {kw.arg for kw in call.keywords if kw.arg is not None}
+
+    issues: list[str] = []
+    for kw in call.keywords:
+        if kw.arg is not None and kw.arg not in valid_kw:
+            issues.append(
+                f"{filename}:L{call.lineno}: unexpected keyword argument "
+                f"'{kw.arg}' in call to '{callee_name}'"
+            )
+
+    if len(call.args) > max_pos:
+        issues.append(
+            f"{filename}:L{call.lineno}: too many positional arguments in call to "
+            f"'{callee_name}' (got {len(call.args)}, expected at most {max_pos})"
+        )
+    else:
+        posonly_names = {a.arg for a in posonly}
+        missing_pos = [
+            p.arg
+            for idx, p in enumerate(all_pos[:num_required_pos])
+            if idx >= len(call.args)
+            and (p.arg in posonly_names or p.arg not in call_kw_names)
+        ]
+        if missing_pos:
+            issues.append(
+                f"{filename}:L{call.lineno}: missing required argument(s) "
+                f"{', '.join(missing_pos)} in call to '{callee_name}'"
+            )
+    return issues
+
+
+
+def check_python_class_and_call_integrity(
+    source: str, filename: str = "<input>"
+) -> list[str]:
+    """Pure-stdlib AST checker for missing ``self.<method>`` and call-arity bugs (H-93).
+
+    - On base-free classes (``len(cls.bases) == 0``) without ``__getattr__`` /
+      ``__getattribute__``, flags ``self.<method>(...)`` calls whose target is not
+      defined on the class or assigned as ``self.<attr>``.
+    - Within the same module, validates direct ``foo(...)`` and ``self.foo(...)``
+      calls against undecorated intra-file function/method signatures without
+      ``*args``/``**kwargs``.
+    """
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return []
+
+    issues: list[str] = []
+
+    # Collect top-level functions (skip names defined multiple times).
+    top_funcs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | None] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            top_funcs[stmt.name] = None if stmt.name in top_funcs else stmt
+
+    # Walk classes for self.<method>() and self.<method> arity checks.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        methods: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | None] = {}
+        class_attrs: set[str] = set()
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                methods[stmt.name] = None if stmt.name in methods else stmt
+            elif isinstance(stmt, ast.Assign):
+                for t in stmt.targets:
+                    if isinstance(t, ast.Name):
+                        class_attrs.add(t.id)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                class_attrs.add(stmt.target.id)
+
+        has_dynamic_getattr = "__getattr__" in methods or "__getattribute__" in methods
+        self_assigned_attrs: set[str] = set()
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, ast.Assign):
+                        for t in sub.targets:
+                            if (
+                                isinstance(t, ast.Attribute)
+                                and isinstance(t.value, ast.Name)
+                                and t.value.id == "self"
+                            ):
+                                self_assigned_attrs.add(t.attr)
+                    elif (
+                        isinstance(sub, ast.AnnAssign)
+                        and isinstance(sub.target, ast.Attribute)
+                        and isinstance(sub.target.value, ast.Name)
+                        and sub.target.value.id == "self"
+                    ):
+                        self_assigned_attrs.add(sub.target.attr)
+
+        known_attrs = set(methods) | class_attrs | self_assigned_attrs
+        check_missing_self = len(node.bases) == 0 and not has_dynamic_getattr
+
+        for stmt in node.body:
+            if not isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            # Only check self.<method> inside methods whose first arg is 'self'.
+            pos = [*stmt.args.posonlyargs, *stmt.args.args]
+            if not pos or pos[0].arg != "self":
+                continue
+
+            def _visit_method_node(n: ast.AST) -> None:
+                if isinstance(n, ast.ClassDef):
+                    return
+                if isinstance(n, ast.Call):
+                    if (
+                        isinstance(n.func, ast.Attribute)
+                        and isinstance(n.func.value, ast.Name)
+                        and n.func.value.id == "self"
+                    ):
+                        mname = n.func.attr
+                        if mname in methods:
+                            mdef = methods[mname]
+                            if mdef is not None:
+                                issues.extend(
+                                    _check_call_against_sig(
+                                        n, f"self.{mname}", mdef, True, filename
+                                    )
+                                )
+                        elif check_missing_self and mname not in known_attrs:
+                            issues.append(
+                                f"{filename}:L{n.lineno}: '{node.name}' has no method "
+                                f"'{mname}' (called via self.{mname})"
+                            )
+                for child in ast.iter_child_nodes(n):
+                    _visit_method_node(child)
+
+            for body_stmt in stmt.body:
+                _visit_method_node(body_stmt)
+
+    # Check direct top-level foo(...) calls across the module.
+    def _scan_direct_calls(
+        node: ast.AST, shadowed: set[str]
+    ) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn_shadowed = shadowed | _collect_local_bound_names(node)
+            for child in node.body:
+                _scan_direct_calls(child, fn_shadowed)
+            return
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            fname = node.func.id
+            if fname not in shadowed and fname in top_funcs:
+                fdef = top_funcs[fname]
+                if fdef is not None:
+                    issues.extend(
+                        _check_call_against_sig(node, fname, fdef, False, filename)
+                    )
+        for child in ast.iter_child_nodes(node):
+            _scan_direct_calls(child, shadowed)
+
+    for stmt in tree.body:
+        _scan_direct_calls(stmt, set())
+
+    return issues
+
+
+
 def _resolve_importfrom_target(
     path: str, node: ast.ImportFrom, known_files: Iterable[str] | None
 ) -> Path | None:
@@ -827,7 +1580,17 @@ _READ_TOOL_NAMES: frozenset[str] = frozenset({"read", "read_file", "view", "cat"
 
 #: Tool names counted as writes/edits by :func:`detect_zero_edit_read_stall`.
 _WRITE_EDIT_TOOL_NAMES: frozenset[str] = frozenset(
-    {"edit", "edit_file", "write", "write_file", "multiedit", "patch"}
+    {
+        "edit",
+        "edit_file",
+        "write",
+        "write_file",
+        "multiedit",
+        "patch",
+        "apply_patch",
+        "harness_multiedit",
+        "harness_apply_patch",
+    }
 )
 
 
@@ -1294,7 +2057,7 @@ _EDIT_MISMATCH_RE = re.compile(
     re.IGNORECASE,
 )
 _TOOL_JSON_OR_ARGS_ERROR_RE = re.compile(
-    r"(?:could not be parsed as json|invalid arguments for tool)",
+    r"(?:could not be parsed as json|invalid arguments for tool(?:\s+\"(?:edit|write)\")?|stream ended without finish_reason)",
     re.IGNORECASE,
 )
 _EDIT_NOOP_RE = re.compile(
@@ -1310,10 +2073,16 @@ _EDIT_UNKNOWN_TOOL_RE = re.compile(
     re.IGNORECASE,
 )
 _EDIT_HINT_MARKER = "[HARNESS_EDIT_HINT"
+_CHUNKED_EDIT_RECOVERY_MARKER = "[HARNESS CHUNKED-EDIT RECOVERY]"
 _EDIT_JSON_TRUNCATION_HINT = (
     "\n[HARNESS_EDIT_HINT: Tool call JSON arguments were malformed or truncated. "
     "Keep oldString/newString small (under 40 lines) and prefer targeted edit calls "
-    "instead of rewriting whole files.]"
+    "instead of rewriting whole files.]\n"
+    "[HARNESS CHUNKED-EDIT RECOVERY] Your previous `write`/`edit` tool call failed "
+    "JSON serialization because the payload was too large or had unescaped "
+    "quotes/newlines. Do NOT retry a full-file `write` or >80-line `edit`. "
+    "Split the change into 2–3 small surgical `edit` calls (<= 40 lines each) "
+    "with minimal unique context."
 )
 _EDIT_FAILURE_HINT = (
     "\n[HARNESS_EDIT_HINT: Exact target text did not match file contents. "
@@ -1485,7 +2254,7 @@ def _select_edit_failure_hint(
     expected_id: str | None = None,
 ) -> str | None:
     """H-36: pick the specialized hint for a single edit/tool error result."""
-    if _EDIT_HINT_MARKER in text:
+    if _EDIT_HINT_MARKER in text or _CHUNKED_EDIT_RECOVERY_MARKER in text:
         return None
     if _EDIT_NOOP_RE.search(text):
         return _EDIT_NOOP_HINT
@@ -1617,7 +2386,15 @@ _READ_COMPLETE_PRELOADED_HINT = (
     "initial prompt. Do NOT call read on it again; proceed directly to edit.]"
 )
 _READ_TOOLS = {"read"}
-_READ_RESET_TOOLS = {"edit", "write", "apply_patch"}
+_READ_RESET_TOOLS = {
+    "edit",
+    "write",
+    "multiedit",
+    "patch",
+    "apply_patch",
+    "harness_multiedit",
+    "harness_apply_patch",
+}
 
 
 def _requested_read_path(messages: list[dict[str, Any]], result_text: str) -> str:
@@ -2495,9 +3272,11 @@ def build_cross_file_symbol_context(
     prompt_symbols = _extract_prompt_symbols(prompt)
     editable_paths = [str(p) for p in files if str(p).endswith(".py")]
     editable_set = set(editable_paths)
+    all_editable_set = {str(p) for p in files} | {str(Path(p).resolve()) for p in files}
     read_only_set = {str(p) for p in read_only_files}
     base = Path(directory).resolve() if directory else None
     base_raw = Path(directory) if directory else None
+    js_ts_suffixes = (".mjs", ".js", ".cjs", ".ts", ".tsx")
 
     def _resolve_module_file(parts: list[str], level: int, importer: Path) -> str | None:
         if not parts:
@@ -2654,29 +3433,149 @@ def build_cross_file_symbol_context(
         return out
 
     sections: list[str] = []
-    for target, names in needed.items():
-        if target in editable_set:
-            continue
-        try:
-            text = Path(target).read_text(encoding="utf-8")
-            tree = ast.parse(text, filename=target)
-        except (OSError, UnicodeDecodeError, SyntaxError):
-            continue
-        lines = text.splitlines()
-        if target in read_only_set:
-            if len(lines) <= 150 or names & set(prompt_symbols):
-                continue
-        symbol_lines = _extract_symbol_lines(tree, lines, names)
-        if not symbol_lines:
-            continue
+
+    def _rel_display(target_path: str) -> str:
         if base_raw is not None:
             try:
-                rel = Path(target).relative_to(base_raw).as_posix()
+                return Path(target_path).relative_to(base_raw).as_posix()
             except ValueError:
-                rel = target
-        else:
-            rel = target
-        sections.append(f"# {rel}\n" + "\n".join(symbol_lines))
+                return target_path
+        return target_path
+
+    def _emit_python_targets(target_map: dict[str, set[str]]) -> None:
+        for target, names in target_map.items():
+            if target in editable_set or target in all_editable_set:
+                continue
+            try:
+                text = Path(target).read_text(encoding="utf-8")
+                tree = ast.parse(text, filename=target)
+            except (OSError, UnicodeDecodeError, SyntaxError):
+                continue
+            lines = text.splitlines()
+            if target in read_only_set:
+                if len(lines) <= 150 or names & set(prompt_symbols):
+                    continue
+            symbol_lines = _extract_symbol_lines(tree, lines, names)
+            if not symbol_lines:
+                continue
+            sections.append(f"# {_rel_display(target)}\n" + "\n".join(symbol_lines))
+
+    _emit_python_targets(needed)
+
+    # 2b: 2nd-hop Python targets referenced by hop-1 re-exports or prompt identifiers.
+    hop2_needed: dict[str, set[str]] = {}
+    prompt_symbol_set = set(prompt_symbols)
+    for hop1_target, hop1_names in needed.items():
+        if hop1_target in editable_set:
+            continue
+        try:
+            h1_text = Path(hop1_target).read_text(encoding="utf-8")
+            h1_tree = ast.parse(h1_text, filename=hop1_target)
+        except (OSError, UnicodeDecodeError, SyntaxError):
+            continue
+        h1_importer = Path(hop1_target)
+        for node in ast.walk(h1_tree):
+            if isinstance(node, ast.ImportFrom):
+                mod_parts = (node.module or "").split(".") if node.module else []
+                resolved = _resolve_module_file(mod_parts, node.level, h1_importer)
+                if resolved and resolved not in editable_set and resolved not in needed:
+                    imported = {a.asname or a.name for a in node.names if a.name != "*"}
+                    if (imported & hop1_names) or (imported & prompt_symbol_set) or (
+                        Path(resolved).stem in prompt_symbol_set
+                    ):
+                        bucket = hop2_needed.setdefault(resolved, set())
+                        bucket.update(prompt_symbol_set)
+                        bucket.update(imported)
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    sub = _resolve_module_file(mod_parts + [alias.name], node.level, h1_importer)
+                    if sub and sub not in editable_set and sub not in needed:
+                        if (alias.asname or alias.name) in hop1_names or Path(sub).stem in prompt_symbol_set:
+                            bucket = hop2_needed.setdefault(sub, set())
+                            bucket.update(prompt_symbol_set)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    resolved = _resolve_module_file(alias.name.split("."), 0, h1_importer)
+                    if resolved and resolved not in editable_set and resolved not in needed:
+                        top_alias = alias.asname or alias.name.split(".")[0]
+                        if top_alias in hop1_names or Path(resolved).stem in prompt_symbol_set:
+                            bucket = hop2_needed.setdefault(resolved, set())
+                            bucket.update(prompt_symbol_set)
+    _emit_python_targets(hop2_needed)
+
+    # 3: JS/TS (.mjs/.js/.cjs/.ts/.tsx) relative companion signature extraction.
+    def _resolve_js_ts_file(spec: str, importer: Path) -> str | None:
+        raw_target = importer.parent / spec
+        candidates = [raw_target]
+        if raw_target.suffix == "":
+            candidates.extend(Path(str(raw_target) + ext) for ext in js_ts_suffixes)
+        candidates.extend(raw_target / ("index" + ext) for ext in js_ts_suffixes)
+        for cand in candidates:
+            try:
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            if base is not None and not resolved.is_relative_to(base):
+                continue
+            if resolved.is_file():
+                return str(resolved)
+        return None
+
+    def _extract_js_ts_symbol_lines(text: str, names: set[str]) -> list[str]:
+        matched_lines: list[str] = []
+        fallback_lines: list[str] = []
+        export_sig_re = re.compile(
+            r"^\s*export\s+(?:default\s+)?(?:async\s+)?"
+            r"(function|class|const|let|var|type|interface)\s+([A-Za-z_$][A-Za-z0-9_$]*)"
+        )
+        for raw_line in text.splitlines():
+            m = export_sig_re.match(raw_line)
+            if not m:
+                continue
+            sym_name = m.group(2)
+            sig = raw_line.strip()
+            if sig.endswith("{"):
+                sig = sig[:-1].rstrip()
+            sig = sig[:120]
+            fallback_lines.append(sig)
+            if sym_name in names:
+                matched_lines.append(sig)
+        return (matched_lines or fallback_lines)[:12]
+
+    js_needed: dict[str, set[str]] = {}
+    for fpath in files:
+        p = Path(fpath)
+        if p.suffix.lower() not in js_ts_suffixes:
+            continue
+        try:
+            js_text = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for m in re.finditer(
+            r"""(?:import\s+([^;'"]+?)\s+from\s*|export\s+[^;'"]*?\bfrom\s*|"""
+            r"""\b(?:import|require)\s*\(\s*)['"](\.\.?/[^'"]+)['"]""",
+            js_text,
+        ):
+            clause, spec = m.group(1) or "", m.group(2)
+            resolved = _resolve_js_ts_file(spec, p)
+            if not resolved or resolved in all_editable_set:
+                continue
+            bucket = js_needed.setdefault(resolved, set())
+            bucket.update(prompt_symbol_set)
+            for ident in re.findall(r"[A-Za-z_$][A-Za-z0-9_$]*", clause):
+                if ident not in ("as", "type", "default"):
+                    bucket.add(ident)
+    for target, names in js_needed.items():
+        try:
+            js_text = Path(target).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if target in read_only_set and (len(js_text.splitlines()) <= 150 or names & prompt_symbol_set):
+            continue
+        js_lines = _extract_js_ts_symbol_lines(js_text, names)
+        if js_lines:
+            sections.append(f"# {_rel_display(target)}\n" + "\n".join(js_lines))
 
     # 4: pytest fixture inference from nearby conftest.py files.
     test_files = [
@@ -2831,6 +3730,100 @@ def extract_compact_test_failure(
             total += len(line) + 1
         result = "\n".join(kept)
     return result
+
+
+_NOISY_LOCAL_VALUE_RE = re.compile(
+    r"^(?:<(?:module|function|built-in function|bound method|class)\b"
+    r"|environ\(\{"
+    r"|<os\._Environ\b"
+    r"|<[^>]*?(?:Config|Settings|Env|Environment)\b[^>]*object at 0x)",
+    re.IGNORECASE,
+)
+_LOCAL_BINDING_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$")
+_PYTEST_SHORT_FRAME_RE = re.compile(r"^[^\s:][^:]*\.py:\d+:")
+_PYTEST_TB_FRAME_RE = re.compile(r'^File "[^"]+\.py", line \d+')
+_PYTEST_FAILURE_HDR_RE = re.compile(r"^_{3,}\s+.+?\s+_{3,}$")
+_PYTEST_SUMMARY_END_RE = re.compile(
+    r"^=+\s+(?:short test summary info|warnings summary|\d+\s+(?:failed|passed|error))"
+)
+
+
+def _redact_credentials(text: str) -> str:
+    """Replace any `_CREDENTIAL_PATTERNS` match with `[REDACTED]`."""
+    for _, pattern in _CREDENTIAL_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
+
+def extract_runtime_assertion_locals(diag_log: str, *, max_chars: int = 1500) -> str:
+    """Extract assertion comparison lines and innermost-frame locals from pytest ``--showlocals`` output.
+
+    Parses ``pytest -vv --tb=short --showlocals`` output, keeping ``E   ...``
+    assertion lines and ``name = value`` bindings from the innermost failing
+    frame(s), filtering noisy runtime objects, redacting credentials, and
+    bounding individual values to 240 chars and total output to ``max_chars``.
+    """
+    if not diag_log or max_chars <= 0:
+        return ""
+
+    blocks: list[tuple[str | None, list[str], list[str]]] = []
+    cur_header: str | None = None
+    cur_e_lines: list[str] = []
+    cur_locals: list[str] = []
+
+    def _flush() -> None:
+        if cur_e_lines or cur_locals:
+            blocks.append((cur_header, list(cur_e_lines), list(cur_locals)))
+
+    for raw_line in diag_log.splitlines():
+        if _PYTEST_SUMMARY_END_RE.match(raw_line):
+            break
+        if _PYTEST_FAILURE_HDR_RE.match(raw_line):
+            _flush()
+            cur_header = raw_line.strip()
+            cur_e_lines = []
+            cur_locals = []
+            continue
+        if _PYTEST_SHORT_FRAME_RE.match(raw_line) or _PYTEST_TB_FRAME_RE.match(raw_line.lstrip()):
+            cur_locals = []
+            continue
+        if raw_line.startswith("E   "):
+            cur_e_lines.append(_redact_credentials(raw_line.rstrip()))
+            continue
+        match = _LOCAL_BINDING_RE.match(raw_line)
+        if match:
+            name, raw_val = match.group(1), match.group(2).strip()
+            if name == "__builtins__" or (name.startswith("__") and name.endswith("__")):
+                continue
+            if _NOISY_LOCAL_VALUE_RE.match(raw_val):
+                continue
+            val = _redact_credentials(raw_val)
+            if len(val) > 240:
+                val = val[:237] + "..."
+            cur_locals.append(f"{name} = {val}")
+
+    _flush()
+    if not blocks:
+        return ""
+
+    out_lines: list[str] = []
+    for header, e_lines, local_lines in blocks:
+        if header is not None:
+            out_lines.append(header)
+        out_lines.extend(e_lines)
+        out_lines.extend(local_lines)
+
+    kept: list[str] = []
+    total = 0
+    for line in out_lines:
+        add_len = len(line) + (1 if kept else 0)
+        if total + add_len > max_chars:
+            if not kept:
+                kept.append(line[:max_chars])
+            break
+        kept.append(line)
+        total += add_len
+    return "\n".join(kept)
 
 
 #: Failed pytest nodeids in short summary lines.
@@ -3507,3 +4500,128 @@ def check_cot_and_slop_integrity(messages: list[dict[str, Any]]) -> list[str]:
             "[SLOP GUARD WARNING: omit conversational filler and output direct technical action or artifact]"
         )
     return warnings
+
+
+_TRAP_TOKENS: tuple[str, ...] = (
+    "breakpoint()",
+    "pdb.set_trace()",
+    "ipdb.set_trace()",
+    "describe.only(",
+    "it.only(",
+    "test.only(",
+)
+_SKIP_MARKERS: tuple[tuple[str, str], ...] = (
+    ("@pytest.mark.skip", "skip"),
+    ("pytest.skip(", "skip"),
+    ("@unittest.skip", "skip"),
+    ("@pytest.mark.xfail", "xfail"),
+    (".skip(", "skip"),
+)
+_ASSERT_OR_EXPECT_RE = re.compile(r"(?:^\s*assert\s+|\bexpect\s*\()")
+_STUB_PATTERNS: tuple[tuple[re.Pattern[str], str, str], ...] = (
+    (re.compile(r"\bTODO\b"), "todo", "TODO"),
+    (re.compile(r"\bFIXME\b"), "fixme", "FIXME"),
+    (re.compile(r"\bNotImplementedError\b"), "notimplementederror", "NotImplementedError"),
+)
+
+
+def _is_test_file_path(path: str) -> bool:
+    name = Path(path).name
+    return (
+        (name.startswith("test_") and name.endswith(".py"))
+        or name.endswith("_test.py")
+        or name.endswith(".test.mjs")
+        or name.endswith(".test.ts")
+        or ".spec." in name
+    )
+
+
+def audit_patch_for_reward_hacking(patch_text: str, prompt: str = "") -> dict[str, Any]:
+    """H-97 Tier-1 deterministic diff auditor for test-tampering and debug traps."""
+    if not isinstance(patch_text, str) or not patch_text.strip():
+        return {"ok": True, "blocking_issues": [], "warnings": []}
+
+    prompt_lower = (prompt or "").lower()
+    prompt_allows_delete = (
+        any(v in prompt_lower for v in ("delete", "remove", "drop"))
+        and any(t in prompt_lower for t in ("test", "tests", "obsolete", "assertion", "assertions"))
+    )
+
+    blocking_issues: list[str] = []
+    warnings: list[str] = []
+
+    current_file: str | None = None
+    in_hunk = False
+    hunk_header = ""
+    removed_assertions = 0
+    added_assertions = 0
+
+    def _flush_hunk() -> None:
+        nonlocal removed_assertions, added_assertions
+        if (
+            in_hunk
+            and current_file is not None
+            and _is_test_file_path(current_file)
+            and removed_assertions >= 2
+            and added_assertions == 0
+            and not prompt_allows_delete
+        ):
+            blocking_issues.append(
+                f"{current_file}: removed {removed_assertions} assertions with 0 replacement "
+                f"assertions in hunk {hunk_header}".strip()
+            )
+        removed_assertions = 0
+        added_assertions = 0
+
+    for line in patch_text.splitlines():
+        if line.startswith("+++ "):
+            _flush_hunk()
+            in_hunk = False
+            raw_path = line[4:].split("\t", 1)[0].strip()
+            if raw_path == "/dev/null":
+                current_file = None
+            elif raw_path.startswith("b/"):
+                current_file = raw_path[2:]
+            else:
+                current_file = raw_path
+            continue
+        if line.startswith("--- "):
+            _flush_hunk()
+            in_hunk = False
+            continue
+        if line.startswith("@@ "):
+            _flush_hunk()
+            in_hunk = True
+            hunk_header = line.strip()
+            continue
+        if not in_hunk or current_file is None:
+            continue
+
+        is_test = _is_test_file_path(current_file)
+        if line.startswith("+") and not line.startswith("+++ "):
+            body = line[1:]
+            for trap in _TRAP_TOKENS:
+                if trap in body and trap.lower() not in prompt_lower:
+                    blocking_issues.append(f"{current_file}: added '{trap}' trap")
+            if is_test:
+                for marker, kw in _SKIP_MARKERS:
+                    if marker in body and kw not in prompt_lower:
+                        blocking_issues.append(f"{current_file}: added '{marker}' skip/xfail marker")
+                        break
+                if _ASSERT_OR_EXPECT_RE.search(body):
+                    added_assertions += 1
+            else:
+                for pat, kw, label in _STUB_PATTERNS:
+                    if pat.search(body) and kw not in prompt_lower:
+                        warnings.append(f"{current_file}: added {label} stub")
+        elif line.startswith("-") and not line.startswith("--- "):
+            body = line[1:]
+            if is_test and _ASSERT_OR_EXPECT_RE.search(body):
+                removed_assertions += 1
+
+    _flush_hunk()
+    return {
+        "ok": not blocking_issues,
+        "blocking_issues": blocking_issues,
+        "warnings": warnings,
+    }

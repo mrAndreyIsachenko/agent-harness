@@ -432,7 +432,7 @@ $ harness herdr status --state-dir state/                # Herdr multiplexer das
 $ pytest -q tests/test_harness.py                   # contract suite
 ```
 
-## Capabilities H-15 .. H-88
+## Capabilities H-15 .. H-98
 
 | ID | Capability | Module |
 | --- | --- | --- |
@@ -495,6 +495,16 @@ $ pytest -q tests/test_harness.py                   # contract suite
 | **H-86** | Claude Code / OpenHands-style in-loop stdlib `ast` undefined-name semantic linter (`check_python_undefined_names` + `[HARNESS IN-LOOP SEMANTIC LINT]` after `py_compile` in `harness_guard.ts`) | `guards.py`, `sandbox.py` |
 | **H-87** | OpenHands / SWE-RL mid-run zero-edit read-stall nudge (`detect_zero_edit_read_stall`, `[HARNESS FORCE-EDIT DEADLINE]`, `guard.zero_edit_stall_nudge` span, and `reasoning_max_tokens <= 256` clamp on `turn_index >= 3`) | `guards.py`, `proxy.py` |
 | **H-88** | Qwen3-Coder / SWE-Gym intra-run `micro_repair` DPO (`pair_source="intra_run_micro_repair"` vs `"cross_run_retry"`) and `repair-sft` dataset export (`harness export-dataset --mode repair-sft`) for `Tenet` self-repair training | `report.py`, `cli.py` |
+| **H-89** | Test-command preflight (`preflight_test_argv`) verifying `pytest` target existence, fast `--collect-only` sanity checks, and required `.py` CLI positional args before calling the LLM | `sandbox.py` |
+| **H-90** | Salvage-to-`micro_repair` bridge (`REPAIRABLE_SALVAGE_REASONS`) allowing bounded `micro_repair` when `worker_timeout`/`step_limit` leaves a non-empty `changes.patch` failing validation | `sandbox.py` |
+| **H-91** | Stem- & modified-file-aware `Superseded` funnel resolution (`_normalize_task_stem`, `hashes_before != hashes_after` overlap) in `compute_state_insights` | `report.py` |
+| **H-92** | In-loop chunked-edit recovery (`[HARNESS CHUNKED-EDIT RECOVERY]`) on malformed/truncated JSON `write`/`edit` tool arguments | `guards.py`, `sandbox.py` |
+| **H-93** | Polyglot in-loop shadow diagnostics (`node --check` for `.mjs`/`.js`, Bun TS scanner, `check_yaml_and_jinja_integrity`, `check_python_class_and_call_integrity`, optional `ruff`) | `guards.py`, `sandbox.py` |
+| **H-94** | Codex V4A context-only patch (`apply_context_patch`) & transactional multi-edit (`apply_transactional_multiedit`, `harness_multiedit`, `harness_apply_patch`) with syntax rollback | `guards.py`, `sandbox.py`, `finops.py` |
+| **H-95** | 2-hop polyglot Repo-Map & companion graph (`infer_read_only_companion_files`, `build_cross_file_symbol_context` across `.py`, `.mjs`/`.ts`, and `dbt` `ref(...)`) | `sandbox.py`, `guards.py` |
+| **H-96** | Execution-grounded assertion diagnostics (`_capture_assertion_locals`, `extract_runtime_assertion_locals` via targeted `pytest -vv --showlocals`) for `micro_repair` | `guards.py`, `sandbox.py` |
+| **H-97** | Pre-finish anti-reward-hacking diff audit (`audit_patch_for_reward_hacking`) and optional single-shot LLM semantic diff critic (`run_semantic_diff_critic`) | `guards.py`, `sandbox.py` |
+| **H-98** | Zero-overhead macOS Seatbelt OS kernel sandboxing (`is_seatbelt_available`, `build_seatbelt_profile`, `wrap_argv_with_seatbelt`, `os_sandbox` modes via `/usr/bin/sandbox-exec`) | `sandbox.py` |
 
 ## Quickstart
 

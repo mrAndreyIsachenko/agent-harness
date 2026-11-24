@@ -4138,6 +4138,7 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
                     'prompt': 'Set VALUE = 2 in ' + target,
                     'test_argv': [sys.executable, '-c', test_code],
                     'worktree': True,
+                    'auto_micro_repair': False,
                 }, fh)
 
             def _fake_model_run(cli, db, task, run_dir, result, budget, proxy=None, started_ref=None):
@@ -5226,6 +5227,34 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
         out = json.loads(apply_provider_routing(
             body, '/v1/chat/completions', turn_index=3))
         self.assertEqual(out['max_tokens'], ERROR_RECOVERY_MAX_TOKENS_CAP)
+
+    def test_h92_chunked_edit_recovery_hints_and_idempotence(self):
+        from harness.sandbox import render_guard_plugin
+
+        errors = [
+            'The tool input could not be parsed as JSON, so the call was not executed.',
+            'Invalid arguments for tool "edit": missing oldString',
+            'Invalid arguments for tool "write": missing content',
+            'OpenAI Chat stream ended without finish_reason',
+        ]
+        for text in errors:
+            messages = [{'role': 'tool', 'content': text}]
+            updated, count = inject_edit_failure_hints(messages)
+            self.assertEqual(count, 1)
+            final_text = updated[-1]['content']
+            self.assertIn('[HARNESS CHUNKED-EDIT RECOVERY]', final_text)
+            self.assertIn('Split the change into 2–3 small surgical `edit` calls', final_text)
+            self.assertEqual(final_text.count('[HARNESS CHUNKED-EDIT RECOVERY]'), 1)
+
+            # Idempotence: repeated pass must not duplicate the tag.
+            again, count2 = inject_edit_failure_hints(updated)
+            self.assertEqual(count2, 0)
+            self.assertEqual(again, updated)
+
+        plugin_src = render_guard_plugin()
+        self.assertIn('[HARNESS CHUNKED-EDIT RECOVERY]', plugin_src)
+        self.assertIn('Invalid arguments for tool "edit"', plugin_src)
+        self.assertIn('could not be parsed as JSON', plugin_src)
 
     def test_h26_build_preloaded_file_excerpts_short_and_ranges(self):
         from harness import build_preloaded_file_excerpts as _build
@@ -9287,6 +9316,195 @@ class H81EgressTests(unittest.TestCase):
         finally:
             proxy.shutdown(); proxy.server_close()
             upstream.shutdown(); upstream.server_close()
+
+    def test_h94_apply_transactional_multiedit_success_rollback_and_indent(self):
+        from harness.guards import apply_transactional_multiedit
+
+        src = (
+            "def alpha():\n"
+            "    x = 1\n"
+            "    return x\n\n"
+            "def beta():\n"
+            "    y = 2\n"
+            "    return y\n"
+        )
+        # Multi-hunk success including H-85 indentation-normalized fallback on edit #2.
+        ok, updated, msg = apply_transactional_multiedit(
+            src,
+            [
+                {"oldString": "    x = 1\n    return x", "newString": "    x = 10\n    return x + 1"},
+                {"oldString": "y = 2\nreturn y", "newString": "y = 20\nreturn y + 2"},
+            ],
+        )
+        self.assertTrue(ok, msg)
+        self.assertIn("    x = 10\n    return x + 1", updated)
+        self.assertIn("    y = 20\n    return y + 2", updated)
+
+        # Rollback when 2nd edit is missing: 1st edit must NOT be persisted.
+        ok_miss, unchanged_miss, err_miss = apply_transactional_multiedit(
+            src,
+            [
+                {"oldString": "    x = 1", "newString": "    x = 99"},
+                {"oldString": "    z = 999", "newString": "    z = 0"},
+            ],
+        )
+        self.assertFalse(ok_miss)
+        self.assertEqual(unchanged_miss, src)
+        self.assertIn("Edit #2", err_miss)
+
+        # Rollback when 2nd edit is ambiguous.
+        dup_src = "def f():\n    return 1\n\ndef g():\n    return 1\n"
+        ok_amb, unchanged_amb, err_amb = apply_transactional_multiedit(
+            dup_src,
+            [
+                {"oldString": "def f():", "newString": "def f_new():"},
+                {"oldString": "    return 1", "newString": "    return 2"},
+            ],
+        )
+        self.assertFalse(ok_amb)
+        self.assertEqual(unchanged_amb, dup_src)
+        self.assertIn("Edit #2", err_amb)
+        self.assertIn("ambiguous", err_amb)
+
+    def test_h94_apply_context_patch_anchor_and_atomic(self):
+        from harness.guards import apply_context_patch
+
+        src = (
+            "def foo():\n"
+            "    x = 1\n"
+            "    return x\n\n"
+            "def bar():\n"
+            "    x = 1\n"
+            "    return x\n"
+        )
+        patch = (
+            "*** Begin Patch\n"
+            "*** Update File: demo.py\n"
+            "@@ def foo():\n"
+            "-    x = 1\n"
+            "+    x = 42\n"
+            "     return x\n"
+            "@@ def bar():\n"
+            "     x = 1\n"
+            "-    return x\n"
+            "+    return x + 10\n"
+            "*** End Patch\n"
+        )
+        ok, updated, msg = apply_context_patch(src, patch)
+        self.assertTrue(ok, msg)
+        self.assertIn("def foo():\n    x = 42\n    return x", updated)
+        self.assertIn("def bar():\n    x = 1\n    return x + 10", updated)
+
+        # Atomic rollback when 2nd hunk fails.
+        bad_patch = (
+            "@@ def foo():\n"
+            "-    x = 1\n"
+            "+    x = 99\n"
+            "@@ def bar():\n"
+            "-    nonexistent = 123\n"
+            "+    nonexistent = 456\n"
+        )
+        ok_bad, unchanged, err = apply_context_patch(src, bad_patch)
+        self.assertFalse(ok_bad)
+        self.assertEqual(unchanged, src)
+        self.assertIn("Hunk #2", err)
+
+    def test_h94_sandbox_permissions_and_plugin(self):
+        from harness.sandbox import config_for, render_guard_plugin
+
+        task = {
+            'directory': '/tmp/proj',
+            'files': ['/tmp/proj/a.py'],
+            'read_only_files': ['/tmp/proj/ro.py'],
+            'model': 'openrouter/z-ai/glm-5.3-flash',
+            'max_steps': 8,
+            'mode': 'edit',
+        }
+        perms = config_for(task)['agents']['guarded_worker']['permissions']
+        allowed_pairs = {(r['action'], r['resource']) for r in perms if r['effect'] == 'allow'}
+        self.assertIn(('harness_multiedit', '/tmp/proj/a.py'), allowed_pairs)
+        self.assertIn(('harness_apply_patch', '/tmp/proj/a.py'), allowed_pairs)
+        self.assertNotIn(('harness_multiedit', '/tmp/proj/ro.py'), allowed_pairs)
+        self.assertNotIn(('harness_apply_patch', '/tmp/proj/ro.py'), allowed_pairs)
+
+        plugin_src = render_guard_plugin(allowed_files=['/tmp/proj/a.py'], read_only_files=['/tmp/proj/ro.py'])
+        self.assertIn('harness_multiedit', plugin_src)
+        self.assertIn('harness_apply_patch', plugin_src)
+        self.assertIn('isAllowedTarget', plugin_src)
+
+    def test_h97_audit_patch_for_reward_hacking(self):
+        from harness.guards import audit_patch_for_reward_hacking
+
+        # 1. Catches test.only( and breakpoint()
+        trap_patch = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " def run():\n"
+            "+    breakpoint()\n"
+            "     return 1\n"
+            "--- a/tests/ui.spec.ts\n"
+            "+++ b/tests/ui.spec.ts\n"
+            "@@ -1,2 +1,2 @@\n"
+            "-test('works', () => {\n"
+            "+test.only('works', () => {\n"
+            "   expect(1).toBe(1);\n"
+        )
+        res = audit_patch_for_reward_hacking(trap_patch, prompt="Fix the bug in app.py")
+        self.assertFalse(res["ok"])
+        self.assertTrue(any("breakpoint()" in issue for issue in res["blocking_issues"]))
+        self.assertTrue(any("test.only(" in issue for issue in res["blocking_issues"]))
+
+        # 2. Catches @pytest.mark.skip and net assertion deletion in test files
+        tamper_patch = (
+            "--- a/tests/test_core.py\n"
+            "+++ b/tests/test_core.py\n"
+            "@@ -1,5 +1,4 @@\n"
+            "+@pytest.mark.skip(reason='flaky')\n"
+            " def test_calc():\n"
+            "-    assert calc(1) == 2\n"
+            "-    assert calc(2) == 4\n"
+            "+    pass\n"
+        )
+        res_tamper = audit_patch_for_reward_hacking(tamper_patch, prompt="Fix calc")
+        self.assertFalse(res_tamper["ok"])
+        self.assertTrue(any("@pytest.mark.skip" in issue for issue in res_tamper["blocking_issues"]))
+        self.assertTrue(any("removed 2 assertions" in issue for issue in res_tamper["blocking_issues"]))
+
+        # 3. Allows prompt-requested @pytest.mark.skip
+        skip_allowed = audit_patch_for_reward_hacking(
+            "--- a/tests/test_core.py\n"
+            "+++ b/tests/test_core.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            "+@pytest.mark.skip(reason='broken upstream')\n"
+            " def test_calc():\n"
+            "     assert True\n",
+            prompt="Add a skip marker to test_calc while upstream is broken",
+        )
+        self.assertTrue(skip_allowed["ok"])
+        self.assertEqual(skip_allowed["blocking_issues"], [])
+
+        # 4. Allows legitimate assertion updates and emits soft warning for TODO in prod code
+        legit_patch = (
+            "--- a/src/app.py\n"
+            "+++ b/src/app.py\n"
+            "@@ -1,2 +1,3 @@\n"
+            " def run():\n"
+            "+    # TODO: optimize later\n"
+            "     return 2\n"
+            "--- a/tests/test_core.py\n"
+            "+++ b/tests/test_core.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " def test_calc():\n"
+            "-    assert calc(1) == 1\n"
+            "-    assert calc(2) == 2\n"
+            "+    assert calc(1) == 2\n"
+            "+    assert calc(2) == 4\n"
+        )
+        res_legit = audit_patch_for_reward_hacking(legit_patch, prompt="Update calc return value")
+        self.assertTrue(res_legit["ok"])
+        self.assertEqual(res_legit["blocking_issues"], [])
+        self.assertTrue(any("TODO" in w for w in res_legit["warnings"]))
 
 
 if __name__ == '__main__':

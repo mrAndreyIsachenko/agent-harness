@@ -63,9 +63,11 @@ from .finops import (
     verify_db,
     violation,
 )
-from .guards import (build_cross_file_symbol_context, build_file_skeletons,
+from .guards import (audit_patch_for_reward_hacking,
+                     build_cross_file_symbol_context, build_file_skeletons,
                      build_preloaded_file_excerpts, extract_compact_test_failure,
-                     extract_failing_test_excerpts)
+                     extract_failing_test_excerpts,
+                     extract_runtime_assertion_locals)
 from .proxy import OPENROUTER_UPSTREAM, GuardError, openrouter_proxy
 from .report import build_repo_memory_hint
 from .routing import DEFAULT_MODEL, MODELS, TEACHER_MODELS, ProviderHealthStore
@@ -88,6 +90,11 @@ SALVAGEABLE_BLOCK_REASONS = frozenset({
     'repeated_tool_error',
     'repeated_file_read_without_write',
     'model_error',
+})
+
+REPAIRABLE_SALVAGE_REASONS = frozenset({
+    'worker_timeout',
+    'step_limit',
 })
 
 CLI = os.environ.get("HARNESS_CLI") or os.environ.get("OPENCODE_CLI") or "/Applications/OpenCode.app/Contents/Resources/opencode-cli"
@@ -142,6 +149,326 @@ def resolve_pytest_test_argv(test_argv, directory):
             if candidate.is_file() and os.access(candidate, os.X_OK) and _python_has_pytest(candidate):
                 return [str(candidate), *argv[1:]]
     raise GuardError('test_runner_missing_pytest')
+
+
+def _extract_leading_env_pythonpath(argv) -> tuple[list[str], list[str]]:
+    """Return (pythonpath_entries, remaining_cmd_argv) for leading `env PYTHONPATH=...`."""
+    tokens = list(argv or ())
+    env_pp: list[str] = []
+    if tokens and Path(tokens[0]).name == 'env':
+        idx = 1
+        while idx < len(tokens) and '=' in tokens[idx] and not tokens[idx].startswith('-'):
+            key, val = tokens[idx].split('=', 1)
+            if key == 'PYTHONPATH' and val:
+                env_pp.extend(p for p in val.split(os.pathsep) if p)
+            idx += 1
+        return env_pp, tokens[idx:]
+    return env_pp, tokens
+
+
+def _top_level_imported_modules(py_path: Path) -> set[str]:
+    """Return top-level module names imported by a Python file."""
+    try:
+        tree = ast.parse(py_path.read_text(encoding='utf-8', errors='replace'))
+    except (OSError, SyntaxError, ValueError):
+        return set()
+    mods: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name:
+                    mods.add(alias.name.split('.')[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0 and node.module:
+                mods.add(node.module.split('.')[0])
+    return mods
+
+
+def _has_module_in_dir(directory: Path, module_name: str) -> bool:
+    return (directory / f'{module_name}.py').is_file() or (directory / module_name / '__init__.py').is_file()
+
+
+def build_test_env_overrides(task: dict) -> dict[str, str]:
+    """Build PYTHONPATH env overrides for test/validation runs."""
+    directory = str(task.get('directory') or '')
+    base = Path(directory) if directory else None
+
+    caller_entries, _ = _extract_leading_env_pythonpath(task.get('test_argv'))
+    env_pp = os.environ.get('PYTHONPATH', '')
+    if env_pp:
+        caller_entries.extend(p for p in env_pp.split(os.pathsep) if p)
+
+    candidates: list[str] = []
+    if base is not None:
+        candidates.append(str(base))
+        src_dir = base / 'src'
+        if src_dir.is_dir():
+            candidates.append(str(src_dir))
+
+    all_task_paths = (
+        list(task.get('files') or ())
+        + list(task.get('read_only_files') or ())
+        + list(task.get('test_argv') or ())
+    )
+    under_ai = any(
+        '/ai/' in str(p).replace('\\', '/')
+        or str(p).replace('\\', '/').startswith('ai/')
+        or str(p).replace('\\', '/').endswith('/ai')
+        for p in all_task_paths
+    )
+    ai_subdirs = ('ai/mcp', 'ai/serving', 'ai/tools', 'ai/coding_worker')
+    if base is not None and under_ai:
+        for sub in ai_subdirs:
+            sub_dir = base / sub
+            if sub_dir.is_dir():
+                candidates.append(str(sub_dir))
+
+    # Inspect .py files for bare top-level sibling imports and ai/* module imports.
+    py_candidates = (
+        list(task.get('files') or ())
+        + list(task.get('read_only_files') or ())
+        + list(task.get('test_argv') or ())
+    )
+    for raw_path in py_candidates:
+        s = str(raw_path)
+        if not s.endswith('.py'):
+            continue
+        p = Path(s)
+        if not p.is_absolute() and base is not None:
+            p = base / p
+        if not p.is_file():
+            continue
+        mods = _top_level_imported_modules(p)
+        if not mods:
+            continue
+        parent = p.parent
+        if any(_has_module_in_dir(parent, mod) for mod in mods):
+            candidates.append(str(parent))
+        if base is not None:
+            for sub in ('src', *ai_subdirs):
+                sub_dir = base / sub
+                if sub_dir.is_dir() and any(_has_module_in_dir(sub_dir, mod) for mod in mods):
+                    candidates.append(str(sub_dir))
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for entry in [*caller_entries, *candidates]:
+        if not entry:
+            continue
+        norm = os.path.normpath(os.path.abspath(entry))
+        if norm not in seen:
+            seen.add(norm)
+            merged.append(entry)
+    return {'PYTHONPATH': os.pathsep.join(merged)} if merged else {}
+
+
+def _usage_has_required_positional(help_output: str) -> bool:
+    """Return True if an argparse-style usage synopsis requires a positional arg."""
+    lines = help_output.splitlines()
+    usage_lines: list[str] = []
+    in_usage = False
+    for line in lines:
+        if not in_usage:
+            m = re.match(r'^\s*usage:\s*(.*)$', line, re.IGNORECASE)
+            if m:
+                in_usage = True
+                usage_lines.append(m.group(1))
+        else:
+            if not line.strip() or not line[0].isspace():
+                break
+            usage_lines.append(line.strip())
+    if not usage_lines:
+        return False
+    usage_text = ' '.join(usage_lines)
+    while True:
+        stripped = re.sub(r'\[[^\[\]]*\]', ' ', usage_text)
+        if stripped == usage_text:
+            break
+        usage_text = stripped
+    tokens = usage_text.split()
+    if len(tokens) <= 1:
+        return False
+    skip_next = False
+    for tok in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok.startswith('-'):
+            if '=' not in tok:
+                skip_next = True
+            continue
+        if tok in ('options', '...'):
+            continue
+        return True
+    return False
+
+
+def preflight_test_argv(task: dict, run_dir: Path) -> None:
+    """Validate pytest targets/collection and non-editable local .py test scripts before calling the LLM."""
+    del run_dir
+    argv = list(task.get('test_argv') or ())
+    if not argv:
+        return
+    _, cmd = _extract_leading_env_pythonpath(argv)
+    if not cmd:
+        return
+
+    directory = str(task.get('directory') or '')
+    editable_real = {
+        os.path.realpath(str(Path(directory) / f if directory and not Path(f).is_absolute() else f))
+        for f in (task.get('files') or ())
+    }
+
+    pytest_rest: list[str] | None = None
+    if Path(cmd[0]).name.startswith('pytest'):
+        pytest_rest = cmd[1:]
+    else:
+        idx = next((i for i in range(len(cmd) - 1) if cmd[i:i + 2] == ['-m', 'pytest']), None)
+        if idx is not None:
+            pytest_rest = cmd[idx + 2:]
+
+    if pytest_rest is not None:
+        positional_targets: list[str] = []
+        has_k_filter = False
+        skip_next = False
+        after_double_dash = False
+        for i, arg in enumerate(pytest_rest):
+            if skip_next:
+                skip_next = False
+                continue
+            if not after_double_dash and arg == '--':
+                after_double_dash = True
+                continue
+            if not after_double_dash and arg.startswith('-'):
+                name = arg.split('=', 1)[0]
+                if name == '-k' or arg.startswith('-k'):
+                    has_k_filter = True
+                if name in _PYTEST_VALUE_FLAGS and '=' not in arg:
+                    nxt = pytest_rest[i + 1] if i + 1 < len(pytest_rest) else None
+                    if nxt is not None and not nxt.startswith('-'):
+                        skip_next = True
+                continue
+            target_str = arg.split('::', 1)[0]
+            if target_str:
+                positional_targets.append(target_str)
+
+        target_reals: list[str] = []
+        for target_str in positional_targets:
+            target_path = Path(target_str)
+            if not target_path.is_absolute() and directory:
+                target_path = Path(directory) / target_path
+            target_real = os.path.realpath(str(target_path))
+            target_reals.append(target_real)
+            if not target_path.exists() and target_real not in editable_real:
+                raise GuardError('missing_test_target')
+
+        has_missing_editable_test = False
+        for f in (task.get('files') or ()):
+            fp = Path(directory) / f if directory and not Path(f).is_absolute() else Path(f)
+            if ((fp.name.startswith('test_') and fp.name.endswith('.py'))
+                    or fp.name.endswith('_test.py')) and not fp.exists():
+                has_missing_editable_test = True
+                break
+
+        if (directory
+                and (positional_targets or has_k_filter)
+                and not any(r in editable_real for r in target_reals)
+                and not has_missing_editable_test):
+            env = worker_env(directory, env_overrides=build_test_env_overrides(task))
+            try:
+                proc = subprocess.run(
+                    [*cmd, '--collect-only', '-q'],
+                    cwd=directory,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return
+            output = f'{proc.stdout or ""}\n{proc.stderr or ""}'
+            if proc.returncode == 5 or (
+                proc.returncode == 4
+                and 'ImportError' not in output
+                and 'SyntaxError' not in output
+            ):
+                raise GuardError('empty_pytest_collection')
+        return
+
+    python_bin: str | None = None
+    script_token: str | None = None
+    flag_tokens: list[str] = []
+    if Path(cmd[0]).name.startswith('python'):
+        for i in range(1, len(cmd)):
+            tok = cmd[i]
+            if tok.startswith('-'):
+                if tok in ('-m', '-c'):
+                    return
+                continue
+            if tok.endswith('.py'):
+                python_bin = cmd[0]
+                script_token = tok
+                flag_tokens = cmd[i + 1:]
+            break
+    elif cmd[0].endswith('.py'):
+        python_bin = sys.executable
+        script_token = cmd[0]
+        flag_tokens = cmd[1:]
+
+    if not python_bin or not script_token:
+        return
+
+    script_path = Path(script_token)
+    if not script_path.is_absolute() and directory:
+        script_path = Path(directory) / script_path
+    if not script_path.is_file():
+        return
+
+    if os.path.realpath(str(script_path)) in editable_real:
+        return
+
+    flags: list[str] = []
+    positional_args: list[str] = []
+    after_double_dash = False
+    for tok in flag_tokens:
+        if not after_double_dash and tok == '--':
+            after_double_dash = True
+            continue
+        if not after_double_dash and tok.startswith('-'):
+            if tok == '--help':
+                continue
+            m = re.match(r'^(--[a-zA-Z0-9_-]+)(?:=.*)?$', tok)
+            if m:
+                flags.append(m.group(1))
+        else:
+            positional_args.append(tok)
+    if not flags and positional_args:
+        return
+
+    env = worker_env(directory, env_overrides=build_test_env_overrides(task)) if directory else None
+    try:
+        proc = subprocess.run(
+            [python_bin, str(script_path), '--help'],
+            cwd=directory or None,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+    if proc.returncode != 0:
+        return
+    help_output = f'{proc.stdout or ""}\n{proc.stderr or ""}'
+    if 'usage:' not in help_output.lower():
+        return
+
+    for flag in flags:
+        if not re.search(r'(?<![a-zA-Z0-9_-])' + re.escape(flag) + r'(?![a-zA-Z0-9_-])', help_output):
+            raise GuardError('invalid_test_argv_flags')
+    if not positional_args and _usage_has_required_positional(help_output):
+        raise GuardError('missing_test_script_args')
 
 _PYTEST_VALUE_FLAGS = frozenset({
     '-k', '-m', '-c', '-o', '-p', '-W', '-n',
@@ -365,16 +692,210 @@ def heal_directory(directory, test_argv, *, dry_run=False, edit_tests=False,
     return dict(res, synthesized_task=task)
 
 
-def infer_read_only_companion_files(files, *, directory='', existing_read_only=(), worktree=False, max_files=5):
-    """H-62: infer existing implementation companion files for test_<mod>.py editable targets."""
-    editable_set = {str(Path(f).resolve()) for f in files}
+_JS_TS_SUFFIXES = ('.mjs', '.js', '.cjs', '.ts', '.tsx')
+_DBT_SKIP_DIRS = frozenset({'.git', 'target', 'node_modules', '.venv', '__pycache__', 'dbt_packages'})
+_SAFE_ENV_NAMES = frozenset({'.env.example', '.env.sample', '.env.template'})
+_JS_IMPORT_FROM_RE = re.compile(r'''(?:import|export)\b[^;'"]*?\bfrom\s*['"](\.\.?/[^'"]+)['"]''')
+_JS_DYNAMIC_IMPORT_RE = re.compile(r'''\b(?:import|require)\s*\(\s*['"](\.\.?/[^'"]+)['"]\s*\)''')
+_JS_EXPORT_DECL_RE = re.compile(
+    r'''\bexport\s+(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|type|interface)\s+([A-Za-z_$][A-Za-z0-9_$]*)'''
+)
+_JS_EXPORT_BRACE_RE = re.compile(r'''\bexport\s*\{([^}]+)\}''')
+_DBT_REF_RE = re.compile(r'''\{\{\s*ref\(\s*['"]([a-zA-Z0-9_]+)['"]\s*\)\s*\}\}''')
+
+
+def _is_sensitive_companion_path(path: Path) -> bool:
+    name = path.name.lower()
+    if name in _SAFE_ENV_NAMES:
+        return False
+    if name == '.env' or name.startswith('.env.'):
+        return True
+    return (
+        fnmatch.fnmatch(name, '*secret*')
+        or fnmatch.fnmatch(name, '*credentials*')
+        or fnmatch.fnmatch(name, '*key*')
+    )
+
+
+def _build_dbt_models_index(
+    dir_path: Path | None, seed_files: list[Path]
+) -> tuple[dict[str, list[Path]], dict[Path, list[Path]]]:
+    models_root: Path | None = None
+    if dir_path is not None and (dir_path / 'models').is_dir():
+        models_root = (dir_path / 'models').resolve()
+    else:
+        for sf in seed_files:
+            for anc in [sf.parent, *list(sf.parents)]:
+                if dir_path is not None and not anc.is_relative_to(dir_path):
+                    break
+                if anc.name == 'models' and anc.is_dir():
+                    models_root = anc.resolve()
+                    break
+            if models_root is not None:
+                break
+    sql_by_stem: dict[str, list[Path]] = {}
+    yml_by_dir: dict[Path, list[Path]] = {}
+    if models_root is None:
+        return sql_by_stem, yml_by_dir
+    scanned = 0
+    for root, dirs, filenames in os.walk(models_root):
+        dirs[:] = sorted(d for d in dirs if d not in _DBT_SKIP_DIRS)
+        root_path = Path(root)
+        for fname in sorted(filenames):
+            scanned += 1
+            if scanned > 400:
+                return sql_by_stem, yml_by_dir
+            fpath = (root_path / fname).resolve()
+            if _is_sensitive_companion_path(fpath):
+                continue
+            suf = fpath.suffix.lower()
+            if suf == '.sql':
+                sql_by_stem.setdefault(fpath.stem, []).append(fpath)
+            elif suf in ('.yml', '.yaml'):
+                yml_by_dir.setdefault(fpath.parent, []).append(fpath)
+    return sql_by_stem, yml_by_dir
+
+
+def _extract_exported_symbols_for_ranking(path: Path) -> set[str]:
+    try:
+        text = path.read_text(encoding='utf-8', errors='ignore')
+    except OSError:
+        return set()
+    suf = path.suffix.lower()
+    if suf == '.py':
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            return set()
+        syms: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if not node.name.startswith('_'):
+                    syms.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and not tgt.id.startswith('_'):
+                        syms.add(tgt.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                if not node.target.id.startswith('_'):
+                    syms.add(node.target.id)
+        return syms
+    if suf in _JS_TS_SUFFIXES:
+        syms = set(_JS_EXPORT_DECL_RE.findall(text))
+        for grp in _JS_EXPORT_BRACE_RE.findall(text):
+            for part in grp.split(','):
+                name = part.strip().split(' as ')[-1].strip()
+                if re.fullmatch(r'[A-Za-z_$][A-Za-z0-9_$]*', name):
+                    syms.add(name)
+        return syms
+    if suf == '.sql':
+        return {path.stem}
+    return set()
+
+
+def _local_dependency_edges(
+    src: Path, dir_path: Path | None, dbt_index_getter
+) -> list[Path]:
+    if not src.is_file():
+        return []
+    suf = src.suffix.lower()
+    edges: list[Path] = []
+    seen_edges: set[Path] = set()
+
+    def _add_if_valid(cand: Path) -> None:
+        try:
+            resolved = cand.resolve()
+        except OSError:
+            return
+        if resolved == src or resolved in seen_edges or not resolved.is_file():
+            return
+        if dir_path is not None and not resolved.is_relative_to(dir_path):
+            return
+        if _is_sensitive_companion_path(resolved):
+            return
+        seen_edges.add(resolved)
+        edges.append(resolved)
+
+    if suf == '.py':
+        try:
+            tree = ast.parse(src.read_text(encoding='utf-8', errors='ignore'))
+        except (SyntaxError, OSError, ValueError):
+            return []
+        roots = [src.parent]
+        if src.parent.parent != src.parent:
+            roots.append(src.parent.parent)
+        if dir_path is not None:
+            roots.extend([dir_path, dir_path / 'src'])
+        mod_candidates: list[Path | str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.level and node.level > 0:
+                    base = src.parent
+                    for _ in range(node.level - 1):
+                        base = base.parent
+                    if node.module:
+                        base = base / node.module.replace('.', '/')
+                    mod_candidates.append(base)
+                    for alias in node.names:
+                        if alias.name != '*':
+                            mod_candidates.append(base / alias.name)
+                elif node.module:
+                    rel = node.module.replace('.', '/')
+                    mod_candidates.append(rel)
+                    for alias in node.names:
+                        if alias.name != '*':
+                            mod_candidates.append(rel + '/' + alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    mod_candidates.append(alias.name.replace('.', '/'))
+        for cand in mod_candidates:
+            cand_paths = [root / cand for root in roots] if isinstance(cand, str) else [cand]
+            for cand_path in cand_paths:
+                py_cand = cand_path if cand_path.suffix == '.py' else cand_path.with_suffix('.py')
+                _add_if_valid(py_cand)
+                _add_if_valid(cand_path / '__init__.py')
+    elif suf in _JS_TS_SUFFIXES:
+        try:
+            text = src.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            return []
+        specs = _JS_IMPORT_FROM_RE.findall(text) + _JS_DYNAMIC_IMPORT_RE.findall(text)
+        for spec in specs:
+            raw_target = src.parent / spec
+            candidates = [raw_target]
+            if raw_target.suffix == '':
+                candidates.extend(Path(str(raw_target) + ext) for ext in _JS_TS_SUFFIXES)
+            candidates.extend(raw_target / ('index' + ext) for ext in _JS_TS_SUFFIXES)
+            for cand in candidates:
+                if cand.is_file():
+                    _add_if_valid(cand)
+                    break
+    elif suf in ('.sql', '.yml', '.yaml'):
+        try:
+            text = src.read_text(encoding='utf-8', errors='ignore')
+        except OSError:
+            return []
+        refs = _DBT_REF_RE.findall(text)
+        if refs:
+            sql_by_stem, yml_by_dir = dbt_index_getter()
+            for model_name in refs:
+                for sql_path in sql_by_stem.get(model_name, ()):
+                    _add_if_valid(sql_path)
+                    for yml_path in yml_by_dir.get(sql_path.parent, ()):
+                        _add_if_valid(yml_path)
+    return edges
+
+
+def infer_read_only_companion_files(files, *, directory='', existing_read_only=(), worktree=False, max_files=5, prompt=''):
+    """H-62/H-79/H-95: infer companion files via test/conftest heuristics and a 2-hop polyglot dependency graph."""
+    editable_paths = [Path(f).resolve() for f in files]
+    editable_set = {str(p) for p in editable_paths}
     result = [str(Path(f).resolve()) for f in existing_read_only]
     seen = set(editable_set) | set(result)
     dir_path = Path(directory).resolve() if directory else None
-    for f in files:
+    for p in editable_paths:
         if len(result) >= max_files:
             break
-        p = Path(f).resolve()
         if not (p.suffix == '.py' and p.name.startswith('test_') and len(p.name) > len('test_.py')):
             continue
         mod_name = p.name[len('test_'):]
@@ -396,14 +917,15 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                 continue
             if dir_path is not None and not resolved.is_relative_to(dir_path):
                 continue
+            if _is_sensitive_companion_path(resolved):
+                continue
             seen.add(str(resolved))
             result.append(str(resolved))
     # H-79: add existing conftest.py ancestors for test-file targets.
     if len(result) < max_files:
-        for f in files:
+        for p in editable_paths:
             if len(result) >= max_files:
                 break
-            p = Path(f).resolve()
             if not (p.name.startswith('test_') or p.name.endswith('_test.py')
                     or 'tests' in p.parts):
                 continue
@@ -424,65 +946,65 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                     continue
                 if dir_path is not None and not resolved.is_relative_to(dir_path):
                     continue
+                if _is_sensitive_companion_path(resolved):
+                    continue
                 seen.add(str(resolved))
                 result.append(str(resolved))
                 if len(result) >= max_files:
                     break
-    # H-65: second pass — infer companions from local imports of editable .py files.
+    # H-95: 2-hop polyglot dependency graph ranked by hop weight, in-degree, and prompt overlap.
     if len(result) < max_files:
-        for f in files:
-            if len(result) >= max_files:
+        dbt_cache: list[tuple[dict[str, list[Path]], dict[Path, list[Path]]]] = []
+
+        def _get_dbt_index():
+            if not dbt_cache:
+                dbt_cache.append(_build_dbt_models_index(dir_path, editable_paths))
+            return dbt_cache[0]
+
+        hop1: set[Path] = set()
+        incoming: dict[Path, set[Path]] = {}
+        for src in editable_paths:
+            for tgt in _local_dependency_edges(src, dir_path, _get_dbt_index):
+                if str(tgt) not in editable_set:
+                    hop1.add(tgt)
+                    incoming.setdefault(tgt, set()).add(src)
+        hop2: set[Path] = set()
+        for h1 in sorted(hop1):
+            for tgt in _local_dependency_edges(h1, dir_path, _get_dbt_index):
+                if str(tgt) not in editable_set:
+                    if tgt not in hop1:
+                        hop2.add(tgt)
+                    incoming.setdefault(tgt, set()).add(h1)
+
+        prompt_tokens = set(re.findall(r'[A-Za-z_][A-Za-z0-9_]*', prompt or ''))
+        prompt_lower = {tok.lower() for tok in prompt_tokens}
+        scored: list[tuple[float, int, str, bool]] = []
+        for cand in (hop1 | hop2):
+            cand_str = str(cand)
+            if cand_str in seen:
+                continue
+            hop_num = 1 if cand in hop1 else 2
+            hop_weight = 1.0 if hop_num == 1 else 0.45
+            in_deg = len(incoming.get(cand, ()))
+            prompt_match = False
+            if prompt_tokens:
+                if (
+                    cand.stem in prompt_tokens
+                    or (len(cand.stem) >= 3 and cand.stem.lower() in prompt_lower)
+                    or bool(_extract_exported_symbols_for_ranking(cand) & prompt_tokens)
+                ):
+                    prompt_match = True
+            score = hop_weight + 0.35 * in_deg + (0.5 if prompt_match else 0.0)
+            scored.append((score, hop_num, cand_str, prompt_match))
+
+        scored.sort(key=lambda item: (-item[0], item[1], item[2]))
+        has_2hop_prompt = any(hop_num == 2 and pmatch for _, hop_num, _, pmatch in scored)
+        effective_max = 6 if (max_files == 5 and has_2hop_prompt) else max_files
+        for _, _, cand_str, _ in scored:
+            if len(result) >= effective_max:
                 break
-            p = Path(f).resolve()
-            if p.suffix != '.py' or not p.is_file():
-                continue
-            try:
-                tree = ast.parse(p.read_text(encoding='utf-8', errors='ignore'))
-            except (SyntaxError, OSError, ValueError):
-                continue
-            roots = [p.parent]
-            if p.parent.parent != p.parent:
-                roots.append(p.parent.parent)
-            if dir_path is not None:
-                roots.append(dir_path)
-            mod_candidates = []
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    if node.level and node.level > 0:
-                        base = p.parent
-                        for _ in range(node.level - 1):
-                            base = base.parent
-                        if node.module:
-                            base = base / node.module.replace('.', '/')
-                        mod_candidates.append(base)
-                        for alias in node.names:
-                            mod_candidates.append(base / alias.name)
-                    elif node.module:
-                        rel = node.module.replace('.', '/')
-                        mod_candidates.append(rel)
-                        for alias in node.names:
-                            mod_candidates.append(rel + '/' + alias.name)
-                elif isinstance(node, ast.Import):
-                    for alias in node.names:
-                        mod_candidates.append(alias.name.replace('.', '/'))
-            for cand in mod_candidates:
-                if len(result) >= max_files:
-                    break
-                cand_paths = ([root / cand for root in roots]
-                              if isinstance(cand, str) else [cand])
-                for cand_path in cand_paths:
-                    m_path = cand_path if cand_path.suffix == '.py' else cand_path.with_suffix('.py')
-                    try:
-                        resolved = m_path.resolve()
-                    except OSError:
-                        continue
-                    if str(resolved) in seen or not resolved.is_file():
-                        continue
-                    if dir_path is not None and not resolved.is_relative_to(dir_path):
-                        continue
-                    seen.add(str(resolved))
-                    result.append(str(resolved))
-                    break
+            seen.add(cand_str)
+            result.append(cand_str)
     return sorted(result)
 
 
@@ -535,6 +1057,7 @@ def validate_task(raw):
             read_only_file_aliases.append(os.path.abspath(f))
             prompt_replacements.append((os.path.abspath(f), str(p)))
     t['read_only_files'] = sorted(set(normalized_ro))
+    t['explicit_read_only_files'] = list(t['read_only_files'])
     t['test_argv'] = executable_argv(t.get('test_argv'))
     t.setdefault('mode', 'model')
     if t['mode'] not in ('model', 'patch', 'command'):
@@ -615,7 +1138,8 @@ def validate_task(raw):
     if t['mode'] == 'model' and t['auto_infer_read_only'] and len(t['read_only_files']) < 5:
         t['read_only_files'] = infer_read_only_companion_files(
             t['files'], directory=t['directory'], existing_read_only=t['read_only_files'],
-            worktree=t['worktree'], max_files=5)
+            worktree=t['worktree'], max_files=5,
+            prompt=t['prompt'] if isinstance(t.get('prompt'), str) else '')
     t.setdefault('include_repo_memory', True)
     if not isinstance(t['include_repo_memory'], bool):
         raise GuardError('invalid_include_repo_memory_flag')
@@ -625,6 +1149,9 @@ def validate_task(raw):
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
         raise GuardError('invalid_auto_micro_repair_flag')
+    t.setdefault('os_sandbox', os.environ.get('HARNESS_OS_SANDBOX', 'off'))
+    if t['os_sandbox'] not in ('off', 'test_only', 'strict'):
+        raise GuardError('invalid_os_sandbox')
     for key, (default, maximum) in LIMITS.items():
         value = number(t.setdefault(key, default), key)
         if not 0 < value <= maximum or (key == 'max_steps' and type(value) is not int):
@@ -698,65 +1225,415 @@ def render_guard_plugin(allowed_files=(), read_only_files=()) -> str:
     """Render the in-loop TypeScript guard plugin injected into OpenCode runs."""
     allowed_json = json.dumps([str(a) for a in allowed_files])
     read_only_json = json.dumps([str(r) for r in read_only_files])
+    harness_root_json = json.dumps(str(Path(__file__).resolve().parent.parent))
     body = r'''// Harness in-loop guard plugin (auto-generated; do not edit by hand).
-// Provides immediate syntax checks after write-like tools and targeted
-// recovery hints after failed edit calls.
+// Provides immediate syntax checks after write-like tools, targeted
+// recovery hints after failed edit calls, and transactional H-94 tools.
+import { realpathSync } from "node:fs";
+import * as nodePath from "node:path";
+
+function resolveCanonical(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return nodePath.resolve(p);
+  }
+}
+
+function isAllowedTarget(filePath: string): { ok: boolean; resolved: string; error?: string } {
+  const resolved = resolveCanonical(filePath);
+  const allowed = (__HARNESS_ALLOWED_JSON__ as string[]).map(resolveCanonical);
+  const readOnly = (__HARNESS_READ_ONLY_JSON__ as string[]).map(resolveCanonical);
+  if (readOnly.includes(resolved) && !allowed.includes(resolved)) {
+    return { ok: false, resolved, error: `Permission denied: ${filePath} is read-only.` };
+  }
+  if (allowed.length > 0 && !allowed.includes(resolved)) {
+    return { ok: false, resolved, error: `Permission denied: ${filePath} is not in allowed_files.` };
+  }
+  return { ok: true, resolved };
+}
+
+async function runHarnessEdit(
+  mode: "multiedit" | "patch",
+  filePath: string,
+  payload: unknown,
+): Promise<string> {
+  const gate = isAllowedTarget(filePath);
+  if (!gate.ok) return gate.error || "Permission denied.";
+  const resolved = gate.resolved;
+  let orig = "";
+  try {
+    orig = await Bun.file(resolved).text();
+  } catch (err: any) {
+    return `Failed to read ${filePath}: ${String(err?.message || err)}`;
+  }
+
+  const pyCode = [
+    "import json, sys",
+    "from harness.guards import apply_transactional_multiedit, apply_context_patch",
+    "data = json.load(sys.stdin)",
+    "fn = apply_transactional_multiedit if data['mode'] == 'multiedit' else apply_context_patch",
+    "ok, updated, msg = fn(data['content'], data['payload'])",
+    "print(json.dumps({'ok': ok, 'updated': updated, 'msg': msg}))",
+  ].join("\n");
+
+  const proc = Bun.spawnSync(["python3", "-c", pyCode], {
+    stdin: new TextEncoder().encode(JSON.stringify({ mode, content: orig, payload })),
+    env: { ...process.env, PYTHONPATH: __HARNESS_REPO_ROOT__ },
+  });
+  if (proc.exitCode !== 0) {
+    const stderr = new TextDecoder().decode(proc.stderr || new Uint8Array());
+    return `[HARNESS ${mode.toUpperCase()} ERROR] ${stderr || "Python helper failed"}`;
+  }
+  let res: { ok: boolean; updated: string; msg: string };
+  try {
+    res = JSON.parse(new TextDecoder().decode(proc.stdout || new Uint8Array()));
+  } catch {
+    return `[HARNESS ${mode.toUpperCase()} ERROR] Invalid response from Python helper`;
+  }
+  if (!res.ok) {
+    return `[HARNESS ${mode.toUpperCase()} REJECTED] ${res.msg}`;
+  }
+
+  await Bun.write(resolved, res.updated);
+  let syntaxOk = true;
+  let syntaxErr = "";
+  if (resolved.endsWith(".py")) {
+    const chk = Bun.spawnSync(["python3", "-m", "py_compile", resolved]);
+    if (chk.exitCode !== 0) {
+      syntaxOk = false;
+      syntaxErr = new TextDecoder().decode(chk.stderr || new Uint8Array());
+    }
+  } else if (resolved.endsWith(".json")) {
+    try {
+      JSON.parse(res.updated);
+    } catch (err: any) {
+      syntaxOk = false;
+      syntaxErr = String(err?.message || err);
+    }
+  } else if (resolved.endsWith(".js") || resolved.endsWith(".mjs") || resolved.endsWith(".cjs")) {
+    const chk = Bun.spawnSync(["node", "--check", resolved]);
+    if (chk.exitCode !== 0) {
+      syntaxOk = false;
+      syntaxErr = new TextDecoder().decode(chk.stderr || new Uint8Array());
+    }
+  }
+
+  if (!syntaxOk) {
+    await Bun.write(resolved, orig);
+    return `[HARNESS ${mode.toUpperCase()} ROLLED BACK] Post-write syntax check failed; original file restored.\n${syntaxErr}`;
+  }
+  return res.msg;
+}
+
 export default async function harnessGuardPlugin() {
+  let toolDefs: Record<string, any> | undefined;
+  try {
+    const mod: any = await import("@opencode-ai/plugin");
+    const toolFn = mod?.tool;
+    if (typeof toolFn === "function" && toolFn.schema) {
+      const z = toolFn.schema;
+      toolDefs = {
+        harness_multiedit: toolFn({
+          description: "Atomically apply multiple sequential {oldString, newString} edits to a single allowed file with rollback on mismatch or syntax error.",
+          args: {
+            filePath: z.string().describe("Path to the target file"),
+            edits: z.array(z.object({
+              oldString: z.string().describe("Exact or indentation-aligned text to replace"),
+              newString: z.string().describe("Replacement text"),
+            })).describe("Sequential list of edits to apply atomically"),
+          },
+          async execute(args: any) {
+            return await runHarnessEdit("multiedit", String(args.filePath || ""), args.edits || []);
+          },
+        }),
+        harness_apply_patch: toolFn({
+          description: "Atomically apply a context-only V4A @@ patch (with optional @@ <anchor> disambiguation) to a single allowed file with rollback on mismatch or syntax error.",
+          args: {
+            filePath: z.string().describe("Path to the target file"),
+            patch: z.string().describe("Context-only V4A @@ patch text"),
+          },
+          async execute(args: any) {
+            return await runHarnessEdit("patch", String(args.filePath || ""), String(args.patch || ""));
+          },
+        }),
+      };
+    }
+  } catch {
+    // @opencode-ai/plugin unavailable in standalone mock/test environments.
+  }
+
   return {
+    ...(toolDefs ? { tool: toolDefs } : {}),
     "tool.execute.after": async (input: any, output: any) => {
       try {
         const tool = String(input?.tool || "");
         const filePath = String(input?.args?.filePath || input?.args?.file_path || input?.args?.path || "");
 
-        // (a) Immediate syntax check for .py and .json targets.
-        if (["edit", "write", "multiedit", "patch"].includes(tool)
-            && (filePath.endsWith(".py") || filePath.endsWith(".json"))) {
+        // (a) Immediate polyglot syntax & semantic checks for write-like tools.
+        if (["edit", "write", "multiedit", "patch", "apply_patch", "harness_multiedit", "harness_apply_patch"].includes(tool)) {
           if (filePath.endsWith(".py")) {
             const proc = Bun.spawnSync(["python3", "-m", "py_compile", filePath]);
             if (proc.exitCode !== 0) {
               const stderr = new TextDecoder().decode(proc.stderr || new Uint8Array());
               output.output += `\n[HARNESS IN-LOOP SYNTAX CHECK FAILED]\n${stderr}\nFix this syntax error immediately before finishing.`;
             } else {
-              // H-86: in-loop undefined-name semantic lint (pure stdlib ast).
+              // H-93: fast-path ruff check when available.
+              try {
+                if (Bun.which("ruff")) {
+                  const ruffProc = Bun.spawnSync([
+                    "ruff",
+                    "check",
+                    "--select",
+                    "F,E9",
+                    "--isolated",
+                    "--output-format",
+                    "concise",
+                    filePath,
+                  ]);
+                  if (ruffProc.exitCode !== 0) {
+                    const ruffOut = new TextDecoder().decode(ruffProc.stdout || new Uint8Array()).trim();
+                    if (ruffOut) {
+                      output.output += `\n[HARNESS IN-LOOP SEMANTIC LINT]\n${ruffOut}`;
+                    }
+                  }
+                }
+              } catch {
+                // Lint must never break the tool result.
+              }
+              // H-86 + H-93: pure-stdlib undefined-name, missing self.<method>, and call-arity lint.
               try {
                 const lintScript = [
                   'import ast,sys,builtins',
                   'tree=ast.parse(open(sys.argv[1]).read())',
-                  'for n in ast.walk(tree):',
-                  "    if isinstance(n,ast.ImportFrom) and any(a.name=='*' for a in n.names): sys.exit(0)",
-                  'names=set(dir(builtins))|{"__file__","__name__","__doc__","__package__","__all__","__spec__","__loader__","__cached__","__annotations__"}',
-                  'for n in ast.walk(tree):',
-                  '    if isinstance(n,ast.Name) and isinstance(n.ctx,(ast.Store,ast.Del)): names.add(n.id)',
-                  '    elif isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): names.add(n.name)',
-                  '    elif isinstance(n,(ast.Import,ast.ImportFrom)):',
-                  '        for a in n.names: names.add(a.asname or a.name.split(".")[0])',
-                  '    elif isinstance(n,ast.ExceptHandler) and n.name: names.add(n.name)',
-                  '    elif isinstance(n,ast.arg): names.add(n.arg)',
-                  '    elif isinstance(n,(ast.Global,ast.Nonlocal)): names.update(n.names)',
-                  '    elif isinstance(n,ast.MatchAs) and n.name: names.add(n.name)',
-                  '    elif isinstance(n,ast.MatchStar) and n.name: names.add(n.name)',
-                  '    elif isinstance(n,ast.MatchMapping) and n.rest: names.add(n.rest)',
-                  'undef=[]',
-                  'for n in ast.walk(tree):',
-                  '    if isinstance(n,ast.Name) and isinstance(n.ctx,ast.Load) and n.id not in names:',
-                  "        undef.append('L%d:%s'%(n.lineno,n.id))",
-                  'if undef: print(",".join(sorted(set(undef))))',
+                  'skip_undef=any(isinstance(n,ast.ImportFrom) and any(a.name=="*" for a in n.names) for n in ast.walk(tree))',
+                  'if not skip_undef:',
+                  '    names=set(dir(builtins))|{"__file__","__name__","__doc__","__package__","__all__","__spec__","__loader__","__cached__","__annotations__"}',
+                  '    for n in ast.walk(tree):',
+                  '        if isinstance(n,ast.Name) and isinstance(n.ctx,(ast.Store,ast.Del)): names.add(n.id)',
+                  '        elif isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef,ast.ClassDef)): names.add(n.name)',
+                  '        elif isinstance(n,(ast.Import,ast.ImportFrom)):',
+                  '            for a in n.names: names.add(a.asname or a.name.split(".")[0])',
+                  '        elif isinstance(n,ast.ExceptHandler) and n.name: names.add(n.name)',
+                  '        elif isinstance(n,ast.arg): names.add(n.arg)',
+                  '        elif isinstance(n,(ast.Global,ast.Nonlocal)): names.update(n.names)',
+                  '        elif isinstance(n,ast.MatchAs) and n.name: names.add(n.name)',
+                  '        elif isinstance(n,ast.MatchStar) and n.name: names.add(n.name)',
+                  '        elif isinstance(n,ast.MatchMapping) and n.rest: names.add(n.rest)',
+                  '    undef=[f"L{n.lineno}:{n.id}" for n in ast.walk(tree) if isinstance(n,ast.Name) and isinstance(n.ctx,ast.Load) and n.id not in names]',
+                  '    if undef: print("UNDEF:" + ",".join(sorted(set(undef))))',
+                  'sem=[]',
+                  'top_fn={}',
+                  'for s in tree.body:',
+                  '    if isinstance(s,(ast.FunctionDef,ast.AsyncFunctionDef)): top_fn[s.name]=None if s.name in top_fn else s',
+                  'def chk_call(c,cname,fd,is_m):',
+                  '    if fd.decorator_list or fd.args.vararg or fd.args.kwarg: return',
+                  '    if any(isinstance(a,ast.Starred) for a in c.args) or any(k.arg is None for k in c.keywords): return',
+                  '    po=list(fd.args.posonlyargs); rg=list(fd.args.args)',
+                  '    if is_m:',
+                  '        if po: po=po[1:]',
+                  '        elif rg: rg=rg[1:]',
+                  '        else: return',
+                  '    ap=po+rg; mx=len(ap); mr=max(0,mx-len(fd.args.defaults))',
+                  '    vkw={a.arg for a in rg}|{a.arg for a in fd.args.kwonlyargs}',
+                  '    ckw={k.arg for k in c.keywords if k.arg is not None}',
+                  '    for k in c.keywords:',
+                  '        if k.arg is not None and k.arg not in vkw: sem.append(f"L{c.lineno}:unexpected kwarg {k.arg} in {cname}")',
+                  '    if len(c.args)>mx: sem.append(f"L{c.lineno}:too many args in {cname}")',
+                  '    else:',
+                  '        pn={a.arg for a in po}',
+                  '        miss=[p.arg for i,p in enumerate(ap[:mr]) if i>=len(c.args) and (p.arg in pn or p.arg not in ckw)]',
+                  '        if miss: sem.append(f"L{c.lineno}:missing arg(s) {\',\'.join(miss)} in {cname}")',
+                  'for cnode in ast.walk(tree):',
+                  '    if not isinstance(cnode,ast.ClassDef): continue',
+                  '    ms={}; ca=set(); sa=set()',
+                  '    for s in cnode.body:',
+                  '        if isinstance(s,(ast.FunctionDef,ast.AsyncFunctionDef)): ms[s.name]=None if s.name in ms else s',
+                  '        elif isinstance(s,ast.Assign): ca.update(t.id for t in s.targets if isinstance(t,ast.Name))',
+                  '        elif isinstance(s,ast.AnnAssign) and isinstance(s.target,ast.Name): ca.add(s.target.id)',
+                  '    for s in cnode.body:',
+                  '        if isinstance(s,(ast.FunctionDef,ast.AsyncFunctionDef)):',
+                  '            for sub in ast.walk(s):',
+                  '                if isinstance(sub,ast.Assign):',
+                  '                    for t in sub.targets:',
+                  '                        if isinstance(t,ast.Attribute) and isinstance(t.value,ast.Name) and t.value.id=="self": sa.add(t.attr)',
+                  '                elif isinstance(sub,ast.AnnAssign) and isinstance(sub.target,ast.Attribute) and isinstance(sub.target.value,ast.Name) and sub.target.value.id=="self": sa.add(sub.target.attr)',
+                  '    chk_self=(len(cnode.bases)==0 and "__getattr__" not in ms and "__getattribute__" not in ms)',
+                  '    known=set(ms)|ca|sa',
+                  '    for s in cnode.body:',
+                  '        if not isinstance(s,(ast.FunctionDef,ast.AsyncFunctionDef)): continue',
+                  '        ps=s.args.posonlyargs+s.args.args',
+                  '        if not ps or ps[0].arg!="self": continue',
+                  '        for sub in ast.walk(s):',
+                  '            if isinstance(sub,ast.Call) and isinstance(sub.func,ast.Attribute) and isinstance(sub.func.value,ast.Name) and sub.func.value.id=="self":',
+                  '                mn=sub.func.attr',
+                  '                if mn in ms and ms[mn] is not None: chk_call(sub,f"self.{mn}",ms[mn],True)',
+                  '                elif chk_self and mn not in known: sem.append(f"L{sub.lineno}:{cnode.name} has no method {mn}")',
+                  'for s in tree.body:',
+                  '    for sub in ast.walk(s):',
+                  '        if isinstance(sub,ast.Call) and isinstance(sub.func,ast.Name) and sub.func.id in top_fn and top_fn[sub.func.id] is not None:',
+                  '            chk_call(sub,sub.func.id,top_fn[sub.func.id],False)',
+                  'if sem: print("SEM:" + "; ".join(sorted(set(sem))))',
                 ].join("\n");
                 const lintProc = Bun.spawnSync(["python3", "-c", lintScript, filePath]);
-                const undefOut = new TextDecoder().decode(lintProc.stdout || new Uint8Array()).trim();
-                if (undefOut) {
-                    output.output += `\n[HARNESS IN-LOOP SEMANTIC LINT] Undefined name(s) detected: ${undefOut} — add the missing import or fix the identifier before finishing.`;
+                const lintOut = new TextDecoder().decode(lintProc.stdout || new Uint8Array()).trim();
+                for (const line of lintOut.split("\n")) {
+                  if (line.startsWith("UNDEF:")) {
+                    output.output += `\n[HARNESS IN-LOOP SEMANTIC LINT] Undefined name(s) detected: ${line.slice(6)} — add the missing import or fix the identifier before finishing.`;
+                  } else if (line.startsWith("SEM:")) {
+                    output.output += `\n[HARNESS IN-LOOP SEMANTIC LINT] ${line.slice(4)}`;
                   }
-                } catch {
-                  // Lint must never break the tool result.
                 }
+              } catch {
+                // Lint must never break the tool result.
+              }
             }
-          } else {
+          } else if (filePath.endsWith(".json")) {
             try {
               JSON.parse(await Bun.file(filePath).text());
             } catch (err: any) {
               const errMsg = String(err?.message || err);
               output.output += `\n[HARNESS IN-LOOP JSON CHECK FAILED]\n${errMsg}\nFix this invalid JSON immediately.`;
+            }
+          } else if (filePath.endsWith(".mjs") || filePath.endsWith(".js") || filePath.endsWith(".cjs")) {
+            try {
+              if (Bun.which("node")) {
+                const jsProc = Bun.spawnSync(["node", "--check", filePath]);
+                if (jsProc.exitCode !== 0 && jsProc.exitCode !== null) {
+                  const stderr = new TextDecoder().decode(jsProc.stderr || new Uint8Array());
+                  output.output += `\n[HARNESS IN-LOOP SYNTAX CHECK FAILED]\n${stderr}\nFix this syntax error immediately before finishing.`;
+                }
+              }
+            } catch {
+              // Gracefully skip if node binary is missing / ENOENT.
+            }
+          } else if (filePath.endsWith(".ts") || filePath.endsWith(".tsx")) {
+            try {
+              const tsSrc = await Bun.file(filePath).text();
+              new Bun.Transpiler({ loader: filePath.endsWith(".tsx") ? "tsx" : "ts" }).scan(tsSrc);
+            } catch (err: any) {
+              const errMsg = String(err?.message || err);
+              output.output += `\n[HARNESS IN-LOOP SYNTAX CHECK FAILED]\n${errMsg}\nFix this syntax error immediately before finishing.`;
+            }
+          } else if (filePath.endsWith(".yaml") || filePath.endsWith(".yml") || filePath.endsWith(".sql")) {
+            try {
+              const txt = await Bun.file(filePath).text();
+              const isSql = filePath.endsWith(".sql");
+              const issues: string[] = [];
+              // Jinja delimiter balance check ({{ }}, {% %}, {# #})
+              let state: string | null = null;
+              let openLine = 0;
+              let quote: string | null = null;
+              let lineNo = 1;
+              let braceDepth = 0;
+              for (let i = 0; i < txt.length; i++) {
+                const ch = txt[i];
+                if (ch === "\n") { lineNo++; continue; }
+                if (state === "{#") {
+                  if (txt.startsWith("#}", i)) { state = null; i++; }
+                  continue;
+                }
+                if (state === "{{" || state === "{%") {
+                  if (quote) {
+                    if (ch === "\\" && i + 1 < txt.length) { i++; continue; }
+                    if (ch === quote) quote = null;
+                    continue;
+                  }
+                  if (ch === "'" || ch === '"') { quote = ch; continue; }
+                  const closeTok = state === "{{" ? "}}" : "%}";
+                  if (txt.startsWith(closeTok, i)) { state = null; i++; continue; }
+                  if (txt.startsWith("{{", i) || txt.startsWith("{%", i) || txt.startsWith("{#", i)) {
+                    issues.push(`L${openLine}: unclosed Jinja '${state}' delimiter`);
+                    state = txt.slice(i, i + 2);
+                    openLine = lineNo;
+                    quote = null;
+                    i++;
+                  }
+                  continue;
+                }
+                if (txt.startsWith("{{", i) || txt.startsWith("{%", i) || txt.startsWith("{#", i)) {
+                  state = txt.slice(i, i + 2);
+                  openLine = lineNo;
+                  quote = null;
+                  i++;
+                  continue;
+                }
+                if (txt.startsWith("%}", i) || txt.startsWith("#}", i)) {
+                  issues.push(`L${lineNo}: unmatched Jinja '${txt.slice(i, i + 2)}' delimiter`);
+                  i++;
+                  continue;
+                }
+                if (txt.startsWith("}}", i)) {
+                  if (braceDepth >= 2) braceDepth -= 2;
+                  else issues.push(`L${lineNo}: unmatched Jinja '}}' delimiter`);
+                  i++;
+                  continue;
+                }
+                if (ch === "{") braceDepth++;
+                else if (ch === "}" && braceDepth > 0) braceDepth--;
+              }
+              if (state) issues.push(`L${openLine}: unclosed Jinja '${state}' delimiter`);
+              if (!isSql) {
+                const bunYaml = (Bun as any).YAML;
+                if (bunYaml && typeof bunYaml.parse === "function") {
+                  try { bunYaml.parse(txt); } catch (yErr: any) { issues.push(String(yErr?.message || yErr)); }
+                }
+                const frames: Array<[number, Map<string, number>]> = [];
+                let blockIndent: number | null = null;
+                const keyRe = /^([A-Za-z0-9_.\-/]+|"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')\s*:(?:\s|$)(.*)$/;
+                const blockRe = /^(?:[^:#'"]*:\s*|-\s+)[|>][+-]?\d*\s*(?:#.*)?$/;
+                const lines = txt.split("\n");
+                for (let li = 0; li < lines.length; li++) {
+                  const raw = lines[li];
+                  const trimmed = raw.trim();
+                  const ln = li + 1;
+                  if (blockIndent !== null) {
+                    if (!trimmed) continue;
+                    const sp = raw.length - raw.replace(/^ +/, "").length;
+                    if (raw.startsWith("\t")) { issues.push(`L${ln}: tab indentation is not allowed in YAML`); blockIndent = null; }
+                    else if (sp > blockIndent) continue;
+                    else blockIndent = null;
+                  }
+                  if (!trimmed || trimmed.startsWith("#")) continue;
+                  if (trimmed === "---" || trimmed === "...") { frames.length = 0; continue; }
+                  const leadLen = raw.length - raw.replace(/^[ \t]+/, "").length;
+                  if (raw.slice(0, leadLen).includes("\t")) { issues.push(`L${ln}: tab indentation is not allowed in YAML`); continue; }
+                  if (trimmed.startsWith("{%") || trimmed.startsWith("{#")) continue;
+                  if (trimmed === "-" || trimmed.startsWith("- ")) {
+                    while (frames.length > 0 && frames[frames.length - 1][0] >= leadLen) frames.pop();
+                    if (trimmed === "-") continue;
+                    const rest = trimmed.slice(2).replace(/^ +/, "");
+                    const itemIndent = leadLen + (trimmed.length - rest.length);
+                    const km = rest.match(keyRe);
+                    if (km) {
+                      const k = km[1].replace(/^['"]|['"]$/g, "");
+                      frames.push([itemIndent, new Map([[k, ln]])]);
+                      if (blockRe.test(rest)) blockIndent = leadLen;
+                    } else if (blockRe.test(trimmed)) {
+                      blockIndent = leadLen;
+                    }
+                    continue;
+                  }
+                  const km = trimmed.match(keyRe);
+                  if (km) {
+                    const k = km[1].replace(/^['"]|['"]$/g, "");
+                    while (frames.length > 0 && frames[frames.length - 1][0] > leadLen) frames.pop();
+                    if (frames.length > 0 && frames[frames.length - 1][0] === leadLen) {
+                      const seen = frames[frames.length - 1][1];
+                      if (seen.has(k)) issues.push(`L${ln}: duplicate YAML mapping key '${k}' (first at L${seen.get(k)})`);
+                      else seen.set(k, ln);
+                    } else {
+                      frames.push([leadLen, new Map([[k, ln]])]);
+                    }
+                    if (blockRe.test(trimmed)) blockIndent = leadLen;
+                  }
+                }
+              }
+              if (issues.length > 0) {
+                output.output += `\n[HARNESS IN-LOOP YAML/JINJA CHECK FAILED]\n${issues.join("\n")}\nFix these YAML/Jinja issues immediately before finishing.`;
+              }
+            } catch {
+              // Lint must never break the tool result.
             }
           }
         }
@@ -903,6 +1780,30 @@ export default async function harnessGuardPlugin() {
           }
         }
 
+        // (b2) H-92: chunked-edit recovery hint on JSON parse / invalid-args failures.
+        {
+          const rawOut = String(output?.output || "");
+          if ((rawOut.includes('Invalid arguments for tool "edit"')
+              || rawOut.includes('Invalid arguments for tool "write"')
+              || rawOut.includes("could not be parsed as JSON")
+              || rawOut.includes("stream ended without finish_reason"))
+              && !rawOut.includes("[HARNESS CHUNKED-EDIT RECOVERY]")) {
+            output.output += "\n[HARNESS CHUNKED-EDIT RECOVERY] Your previous `write`/`edit` tool call failed JSON serialization because the payload was too large or had unescaped quotes/newlines. Do NOT retry a full-file `write` or >80-line `edit`. Split the change into 2–3 small surgical `edit` calls (<= 40 lines each) with minimal unique context.";
+          }
+        }
+
+        // (b2) H-92: chunked-edit recovery hint on JSON parse / invalid-args failures.
+        {
+          const rawOut = String(output?.output || "");
+          if ((rawOut.includes('Invalid arguments for tool "edit"')
+              || rawOut.includes('Invalid arguments for tool "write"')
+              || rawOut.includes("could not be parsed as JSON")
+              || rawOut.includes("stream ended without finish_reason"))
+              && !rawOut.includes("[HARNESS CHUNKED-EDIT RECOVERY]")) {
+            output.output += "\n[HARNESS CHUNKED-EDIT RECOVERY] Your previous `write`/`edit` tool call failed JSON serialization because the payload was too large or had unescaped quotes/newlines. Do NOT retry a full-file `write` or >80-line `edit`. Split the change into 2–3 small surgical `edit` calls (<= 40 lines each) with minimal unique context.";
+          }
+        }
+
         // (c) H-79: read-guard hint after a denied read.
         if (tool === "read" && String(output?.output || "").includes("Permission denied")) {
           const allowed: string[] = __HARNESS_ALLOWED_JSON__;
@@ -921,8 +1822,11 @@ export default async function harnessGuardPlugin() {
   };
 }
 '''
-    return body.replace('__HARNESS_ALLOWED_JSON__', allowed_json).replace(
-        '__HARNESS_READ_ONLY_JSON__', read_only_json)
+    return (
+        body.replace('__HARNESS_ALLOWED_JSON__', allowed_json)
+        .replace('__HARNESS_READ_ONLY_JSON__', read_only_json)
+        .replace('__HARNESS_REPO_ROOT__', harness_root_json)
+    )
 
 
 def sandbox_root_for(run_dir) -> Path:
@@ -941,6 +1845,158 @@ def stage_isolation_sandbox(run_dir) -> dict:
 
 def cleanup_isolation_sandbox(run_dir) -> None:
     shutil.rmtree(sandbox_root_for(run_dir), ignore_errors=True)
+
+
+DEFAULT_SEATBELT_DENIED_READ_PATHS = (
+    '~/.ssh',
+    '~/.aws',
+    '~/.gnupg',
+    '~/.kube',
+    '~/.config/gcloud',
+)
+
+_SEATBELT_SYSTEM_WRITABLE_PATHS = (
+    '/dev/null',
+    '/private/dev/null',
+    '/dev/tty',
+    '/dev/dtracehelper',
+    '/private/var/folders',
+)
+
+
+def is_seatbelt_available() -> bool:
+    """Return True when macOS /usr/bin/sandbox-exec is available and executable."""
+    return sys.platform == 'darwin' and os.access('/usr/bin/sandbox-exec', os.X_OK)
+
+
+def _sbpl_quote(value: str) -> str:
+    """Escape a string for inclusion inside an SBPL double-quoted literal."""
+    return value.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def build_seatbelt_profile(
+    *,
+    writable_paths=(),
+    denied_read_paths=(),
+    allow_localhost_only: bool = True,
+    allowed_tcp_ports=(),
+) -> str:
+    """Build a macOS Seatbelt (SBPL) profile for filesystem and network confinement."""
+    lines = [
+        '(version 1)',
+        '(allow default)',
+        '(deny file-write*)',
+    ]
+
+    canonical_writable: list[str] = []
+    seen_writable: set[str] = set()
+    for raw_path in writable_paths:
+        if not raw_path:
+            continue
+        canon = os.path.realpath(os.path.expanduser(str(raw_path)))
+        if canon not in seen_writable:
+            seen_writable.add(canon)
+            canonical_writable.append(canon)
+            quoted = _sbpl_quote(canon)
+            if os.path.isdir(canon):
+                lines.append(f'(allow file-write* (subpath "{quoted}"))')
+            elif os.path.exists(canon):
+                lines.append(f'(allow file-write* (literal "{quoted}"))')
+            elif os.path.basename(canon) in ('.pytest_cache', '__pycache__'):
+                lines.append(f'(allow file-write* (subpath "{quoted}"))')
+            else:
+                lines.append(f'(allow file-write* (literal "{quoted}"))')
+
+    denied_candidates = list(DEFAULT_SEATBELT_DENIED_READ_PATHS)
+    for raw_path in denied_read_paths:
+        if raw_path:
+            denied_candidates.append(str(raw_path))
+
+    seen_denied: set[str] = set()
+    for raw_path in denied_candidates:
+        canon = os.path.realpath(os.path.expanduser(str(raw_path)))
+        if canon in seen_denied:
+            continue
+        if any(canon == w or canon.startswith(w + os.sep) for w in canonical_writable):
+            continue
+        seen_denied.add(canon)
+        lines.append(f'(deny file-read* (subpath "{_sbpl_quote(canon)}"))')
+
+    if allow_localhost_only:
+        lines.append('(allow network* (local unix))')
+        lines.append('(deny network-outbound (remote ip))')
+        ports = sorted({int(p) for p in allowed_tcp_ports if p is not None})
+        if ports:
+            for port in ports:
+                lines.append(f'(allow network-outbound (remote ip "localhost:{port}"))')
+        else:
+            lines.append('(allow network-outbound (remote ip "localhost:*"))')
+
+    return '\n'.join(lines) + '\n'
+
+
+def wrap_argv_with_seatbelt(argv: list[str], profile_path: Path) -> list[str]:
+    """Wrap argv with /usr/bin/sandbox-exec using the given SBPL profile."""
+    return ['/usr/bin/sandbox-exec', '-f', str(profile_path), *argv]
+
+
+def _stage_test_seatbelt_profile(task: dict, run_dir: Path) -> Path:
+    """Stage seatbelt-test.sb in run_dir and return its path."""
+    writable = [
+        sandbox_root_for(run_dir),
+        run_dir,
+        *_SEATBELT_SYSTEM_WRITABLE_PATHS,
+    ]
+    if task.get('worktree'):
+        writable.append(task['directory'])
+    else:
+        writable.extend(task.get('files', ()))
+        writable.append(Path(task['directory']) / '.pytest_cache')
+        writable.append(Path(task['directory']) / '__pycache__')
+        for f in task.get('files', ()):
+            writable.append(Path(f).parent / '__pycache__')
+    profile = build_seatbelt_profile(writable_paths=writable, allow_localhost_only=True)
+    profile_path = Path(run_dir) / 'seatbelt-test.sb'
+    private_write(profile_path, profile)
+    return profile_path
+
+
+def _stage_worker_seatbelt_profile(task: dict, run_dir: Path, db, *, proxy=None) -> Path:
+    """Stage seatbelt-worker.sb in run_dir and return its path."""
+    writable = [
+        *task.get('files', ()),
+        run_dir,
+        sandbox_root_for(run_dir),
+        *_SEATBELT_SYSTEM_WRITABLE_PATHS,
+    ]
+    if task.get('mode') == 'patch' and task.get('patch_file'):
+        writable.append(task['patch_file'])
+    if db is not None:
+        writable.append(Path(db).parent)
+    ports: tuple[int, ...] = ()
+    if proxy is not None and getattr(proxy, 'base_url', None):
+        from urllib.parse import urlparse
+        parsed_port = urlparse(proxy.base_url).port
+        if parsed_port is not None:
+            ports = (parsed_port,)
+    profile = build_seatbelt_profile(
+        writable_paths=writable,
+        allow_localhost_only=True,
+        allowed_tcp_ports=ports,
+    )
+    profile_path = Path(run_dir) / 'seatbelt-worker.sb'
+    private_write(profile_path, profile)
+    return profile_path
+
+
+def _seatbelt_test_argv(task: dict, run_dir: Path, argv: list[str]) -> list[str]:
+    """Return argv wrapped with seatbelt-test.sb when OS sandboxing is active."""
+    if task.get('os_sandbox', 'off') in ('test_only', 'strict') and is_seatbelt_available():
+        profile_path = Path(run_dir) / 'seatbelt-test.sb'
+        if not profile_path.is_file():
+            profile_path = _stage_test_seatbelt_profile(task, run_dir)
+        return wrap_argv_with_seatbelt(argv, profile_path)
+    return argv
 
 
 def stage_guard_plugin(run_dir, *, allowed_files=(), read_only_files=()) -> Path:
@@ -975,7 +2031,19 @@ def config_for(task, *, base_url=None, run_dir=None):
                      'effect': 'allow'}
                     for p in safe_env_patterns
                     for pattern in (f'{task_dir}/{p}', f'{task_dir}/**/{p}')]
-    actions = ('read',) if task['mode'] == 'patch' else ('read', 'edit')
+    actions = (
+        ('read',)
+        if task['mode'] == 'patch'
+        else (
+            'read',
+            'edit',
+            'multiedit',
+            'patch',
+            'apply_patch',
+            'harness_multiedit',
+            'harness_apply_patch',
+        )
+    )
     permissions += [{'action': action, 'resource': path, 'effect': 'allow'}
                     for path in task['files'] for action in actions]
     permissions += [{'action': 'read', 'resource': path, 'effect': 'allow'}
@@ -1075,17 +2143,19 @@ def interruptions():
         for s, handler in saved.items():
             signal.signal(s, handler)
 
-def execute(argv, directory, timeout, path):
-    with private_log(path) as log, owned_process(argv, directory, log) as proc:
+def execute(argv, directory, timeout, path, *, env_overrides=None):
+    with private_log(path) as log, owned_process(argv, directory, log, env_overrides=env_overrides) as proc:
         try:
             return proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             raise GuardError('command_timeout') from None
 
-def preflight(cli, task, run_dir, *, base_url=None):
+def preflight(cli, task, run_dir, *, base_url=None, check=False):
     executable_argv([str(cli)])
     if task.get('mode', 'model') == 'model':
         task['test_argv'] = resolve_pytest_test_argv(task['test_argv'], task['directory'])
+    if not check and task.get('preflight_test_argv', True) and task.get('test_argv'):
+        preflight_test_argv(task, run_dir)
     private_write(run_dir / 'opencode.jsonc', config_for(task, base_url=base_url, run_dir=run_dir))
     path = run_dir / 'config-check.log'
     rc = execute([str(cli), 'api', '--standalone', 'GET', '/api/agent'], run_dir, 30, path)
@@ -1156,6 +2226,9 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
     naturally_exited = False
     last_reported_step = -1
     isolation_env = stage_isolation_sandbox(run_dir)
+    if task.get('os_sandbox', 'off') == 'strict' and is_seatbelt_available():
+        worker_sb = _stage_worker_seatbelt_profile(task, run_dir, db, proxy=proxy)
+        argv = wrap_argv_with_seatbelt(argv, worker_sb)
     try:
         with private_log(run_dir / 'worker.log') as log, owned_process(argv, run_dir, log, env_overrides=isolation_env) as proc:
             while True:
@@ -1276,6 +2349,34 @@ def _python_symbol_spans(source):
     return spans
 
 
+def _capture_assertion_locals(task, run_dir, test_env=None):
+    """H-96: capture a bounded -vv --showlocals snapshot of failing assertion tests."""
+    if not task.get('capture_assertion_locals', True):
+        return
+    run_dir = Path(run_dir)
+    try:
+        test_log_text = (run_dir / 'test.log').read_text(errors='replace')
+    except OSError:
+        return
+    if 'AssertionError' not in test_log_text and 'assert ' not in test_log_text:
+        return
+    targeted = build_targeted_pytest_argv(task['test_argv'], test_log_text, max_nodeids=3)
+    if not targeted:
+        return
+    if '--showlocals' not in targeted:
+        targeted = [arg for arg in targeted if arg not in ('-q', '--quiet')]
+        targeted.extend(['-vv', '--tb=short', '--showlocals', '--no-header'])
+    diag_timeout = min(15, task['test_timeout_seconds'])
+    try:
+        execute(targeted, task['directory'], diag_timeout,
+                run_dir / 'test_assertion_locals.log', env_overrides=test_env)
+    except GuardError as exc:
+        if str(exc) != 'command_timeout':
+            raise
+    except OSError:
+        pass
+
+
 def build_micro_repair_prompt(task, run_dir, originals=None):
     """Assemble a zero-read micro-repair prompt (H-41).
 
@@ -1375,6 +2476,15 @@ def build_micro_repair_prompt(task, run_dir, originals=None):
         'do NOT re-read entire files from scratch.\n'
         + compact_failure
     )
+    diag_log_path = run_dir / 'test_assertion_locals.log'
+    if diag_log_path.is_file():
+        try:
+            diag_text = diag_log_path.read_text(errors='replace')
+        except OSError:
+            diag_text = ''
+        assertion_locals = extract_runtime_assertion_locals(diag_text)
+        if assertion_locals:
+            prompt += '\n\n[RUNTIME_ASSERTION_LOCALS]\n' + assertion_locals
     return prompt
 
 
@@ -1970,6 +3080,142 @@ def load_workspace_lessons(state_dir, task_dir, files=None, max_items=3, max_cha
     return header + '\n' + '\n'.join(out_lines)
 
 
+def _active_locked_or_sibling_editable_files(state: Path, current_task_id: str) -> set[str]:
+    """H-90: return editable files owned by active pending sibling runs in state/runs."""
+    runs_dir = Path(state) / 'runs'
+    if not runs_dir.is_dir():
+        return set()
+    now = time.time()
+    owned: set[str] = set()
+    try:
+        entries = list(runs_dir.iterdir())
+    except OSError:
+        return set()
+    for d in entries:
+        try:
+            if not d.is_dir() or (now - d.stat().st_mtime) > 600:
+                continue
+            res = json.loads((d / 'result.json').read_text(encoding='utf-8'))
+            task_data = json.loads((d / 'task.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(res, dict) or not isinstance(task_data, dict):
+            continue
+        if res.get('status') != 'pending' or res.get('task_id') == current_task_id:
+            continue
+        for f in task_data.get('files') or ():
+            if isinstance(f, str):
+                try:
+                    owned.add(str(Path(f).resolve()))
+                except OSError:
+                    owned.add(f)
+    return owned
+
+
+def _concurrent_sibling_editable_files(
+    state: Path, current_task_id: str, window_start: float, window_end: float
+) -> set[str]:
+    """H-90: return editable files of sibling runs overlapping [window_start, window_end]."""
+    runs_dir = Path(state) / 'runs'
+    if not runs_dir.is_dir():
+        return set()
+    owned: set[str] = set()
+    try:
+        entries = list(runs_dir.iterdir())
+    except OSError:
+        return set()
+    for d in entries:
+        try:
+            if not d.is_dir():
+                continue
+            res_path = d / 'result.json'
+            task_path = d / 'task.json'
+            res = json.loads(res_path.read_text(encoding='utf-8'))
+            task_data = json.loads(task_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(res, dict) or not isinstance(task_data, dict):
+            continue
+        if res.get('task_id') == current_task_id:
+            continue
+        sib_start = res.get('started_at')
+        if not isinstance(sib_start, (int, float)):
+            try:
+                sib_start = d.stat().st_mtime
+            except OSError:
+                continue
+        if sib_start > window_end:
+            continue
+        if res.get('status') == 'pending':
+            sib_end = window_end
+        else:
+            dur = res.get('duration_seconds')
+            if isinstance(dur, (int, float)):
+                sib_end = sib_start + max(0.0, float(dur))
+            else:
+                try:
+                    sib_end = res_path.stat().st_mtime
+                except OSError:
+                    sib_end = sib_start
+        if sib_end < window_start:
+            continue
+        for key in ('files', 'origin_files'):
+            for f in task_data.get(key) or ():
+                if isinstance(f, str):
+                    try:
+                        owned.add(str(Path(f).resolve()))
+                    except OSError:
+                        owned.add(f)
+    return owned
+
+
+def run_semantic_diff_critic(task: dict, patch_text: str, *, base_url: str | None) -> dict:
+    """H-97 Tier-2 single-shot LLM diff critic (best-effort)."""
+    if not base_url or not isinstance(patch_text, str) or not patch_text.strip():
+        return {'verdict': 'pass', 'issues': []}
+    url = base_url if base_url.rstrip('/').endswith('/chat/completions') else base_url.rstrip('/') + '/chat/completions'
+    model = task.get('diff_critic_model') or task.get('model') or 'openrouter/z-ai/glm-5.3-flash'
+    prompt_text = str(task.get('prompt', '') or '')[:4000]
+    diff_excerpt = patch_text[:12000]
+    system_msg = (
+        'You are a strict semantic diff critic. Respond ONLY with a single JSON object: '
+        '{"verdict": "pass"|"fail", "issues": [...]}. '
+        'Check ONLY: (a) hardcoded test literals instead of real logic, and '
+        '(b) explicitly numbered requirements in the task prompt completely missing from the diff. '
+        'If neither is present, return {"verdict": "pass", "issues": []}.'
+    )
+    user_msg = f'Task prompt:\n{prompt_text}\n\nDiff:\n{diff_excerpt}'
+    payload = json.dumps({
+        'model': model,
+        'messages': [
+            {'role': 'system', 'content': system_msg},
+            {'role': 'user', 'content': user_msg},
+        ],
+        'max_tokens': 200,
+        'temperature': 0,
+        'stream': False,
+    }).encode('utf-8')
+    headers = {'Content-Type': 'application/json'}
+    api_key = os.environ.get('OPENROUTER_API_KEY')
+    if api_key:
+        headers['Authorization'] = f'Bearer {api_key}'
+    req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            raw = json.loads(resp.read().decode('utf-8', errors='replace'))
+        content = str(raw['choices'][0]['message']['content'] or '').strip()
+        if content.startswith('```'):
+            content = re.sub(r'^```(?:json)?\s*|\s*```$', '', content, flags=re.DOTALL).strip()
+        parsed = json.loads(content)
+        if isinstance(parsed, dict) and parsed.get('verdict') == 'fail':
+            raw_issues = parsed.get('issues')
+            issues = [str(x) for x in raw_issues if x] if isinstance(raw_issues, list) else []
+            return {'verdict': 'fail', 'issues': issues or ['semantic_diff_critic_failed']}
+    except Exception:
+        return {'verdict': 'pass', 'issues': []}
+    return {'verdict': 'pass', 'issues': []}
+
+
 def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_url=None, fetch=None,
              _quiet=False, _return_result=False):
     if cli is None:
@@ -2004,6 +3250,14 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             started_at = time.time()
             if not check:
                 task = stack.enter_context(isolated_worktree(task, run_dir))
+            if not task.get('worktree') and task.get('read_only_files'):
+                explicit_ro = set(task.get('explicit_read_only_files', ()))
+                sibling_editable = _active_locked_or_sibling_editable_files(state, task['task_id'])
+                if sibling_editable:
+                    task['read_only_files'] = [
+                        f for f in task['read_only_files']
+                        if f in explicit_ro or f not in sibling_editable
+                    ]
             tracked = task['files'] + ([task['patch_file']] if task['mode'] == 'patch' else [])
             ro_files = task.get('read_only_files', ())
             ro_hashes_before = _fh(ro_files)
@@ -2021,6 +3275,10 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             capture_files(run_dir, tracked)
             _snapshot_files_for_feedback(run_dir, task['files'], 'before')
             event(run_dir, 'run_started', task_id=task['task_id'], mode=task['mode'])
+            os_sandbox = task.get('os_sandbox', 'off')
+            if not check and os_sandbox in ('test_only', 'strict') and is_seatbelt_available():
+                _stage_test_seatbelt_profile(task, run_dir)
+                event(run_dir, 'seatbelt_sandbox_enabled', mode=os_sandbox)
             try:
                 report_herdr_task(task['task_id'], 'working',
                                   model=task.get('model') if task['mode'] != 'command' else None,
@@ -2074,7 +3332,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             upstream_mode=task.get('upstream_mode', 'openrouter')))
                     base_url = (proxy.base_url if proxy is not None
                                 else ('http://127.0.0.1:9/api/v1' if (check and is_real_cli) else None))
-                    preflight(cli, task, run_dir, base_url=base_url)
+                    preflight(cli, task, run_dir, base_url=base_url, check=check)
                 if check:
                     result['status'] = 'configuration_verified_no_model_call'
                 else:
@@ -2134,24 +3392,74 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                         result['status'] = 'patch_ready_review_required'
                     else:
                         validation_attempted = True
-                        result['test_return_code'] = execute(task['test_argv'], task['directory'],
-                                                            task['test_timeout_seconds'], run_dir / 'test.log')
-                        if result['test_return_code']:
+                        test_env = build_test_env_overrides(task)
+                        result['test_return_code'] = execute(_seatbelt_test_argv(task, run_dir, task['test_argv']),
+                                                            task['directory'],
+                                                            task['test_timeout_seconds'], run_dir / 'test.log',
+                                                            env_overrides=test_env)
+
+                        def _evaluate_diff_critic() -> list[str]:
                             capture_files(run_dir, tracked)
-                            if salvage_candidate is not None:
+                            patch_path = run_dir / 'changes.patch'
+                            patch_text = (
+                                patch_path.read_text(encoding='utf-8', errors='replace')
+                                if patch_path.is_file() else ''
+                            )
+                            blocking: list[str] = []
+                            warnings: list[str] = []
+                            if task.get('anti_tamper_audit', True):
+                                audit = audit_patch_for_reward_hacking(patch_text, task.get('prompt', ''))
+                                blocking.extend(audit.get('blocking_issues', []))
+                                warnings.extend(audit.get('warnings', []))
+                            if task.get('enable_diff_critic') or os.environ.get('HARNESS_DIFF_CRITIC') == '1':
+                                critic = run_semantic_diff_critic(
+                                    task, patch_text, base_url=upstream_url or OPENROUTER_UPSTREAM
+                                )
+                                if critic.get('verdict') == 'fail':
+                                    blocking.extend(critic.get('issues') or ['semantic_diff_critic_failed'])
+                            if warnings:
+                                existing = result.get('critic_warnings') or []
+                                result['critic_warnings'] = list(dict.fromkeys([*existing, *warnings]))
+                            return blocking
+
+                        critic_issues: list[str] = []
+                        if result['test_return_code'] == 0:
+                            critic_issues = _evaluate_diff_critic()
+                            if critic_issues:
+                                with private_log(run_dir / 'test.log') as f:
+                                    f.write('[DIFF_CRITIC_FAILURE]\n' + '\n'.join(critic_issues) + '\n')
+                                event(run_dir, 'diff_critic_rejected', issues=critic_issues)
+
+                        if result['test_return_code'] or critic_issues:
+                            capture_files(run_dir, tracked)
+                            repair_eligible = (
+                                task.get('auto_micro_repair', True)
+                                and task['mode'] == 'model'
+                                and not result.get('micro_repair_attempted')
+                                and (run_dir / 'changes.patch').exists()
+                                and (run_dir / 'changes.patch').stat().st_size > 0
+                                and result.get('cost') is not None
+                                and (salvage_candidate == 'step_limit'
+                                     or result.get('steps', 0) <= task['max_steps'])
+                                and result['cost'] <= min(budget * 0.8, 0.08)
+                            )
+                            if critic_issues and not repair_eligible:
+                                raise GuardError('reward_hacking_detected')
+                            if not critic_issues and salvage_candidate is not None and (
+                                salvage_candidate not in REPAIRABLE_SALVAGE_REASONS
+                                or result['test_return_code'] == 124
+                                or not repair_eligible
+                            ):
                                 raise GuardError(salvage_candidate)
                             repair_salvage_reason = None
-                            if (task.get('auto_micro_repair', True)
-                                    and task['mode'] == 'model'
-                                    and (run_dir / 'changes.patch').exists()
-                                    and (run_dir / 'changes.patch').stat().st_size > 0
-                                    and result.get('cost') is not None
-                                    and result.get('steps', 0) <= task['max_steps']
-                                    and result['cost'] <= min(budget * 0.8, 0.08)):
+                            if repair_eligible:
+                                if salvage_candidate is not None:
+                                    event(run_dir, 'salvage_micro_repair_started', reason=salvage_candidate)
                                 repair_max_steps = compute_repair_max_steps(task)
                                 active_max_steps[0] = repair_max_steps
                                 repair_timeout = compute_repair_timeout_seconds(task)
                                 active_timeout_seconds[0] = repair_timeout
+                                _capture_assertion_locals(task, run_dir, test_env=test_env)
                                 repair_task = dict(
                                     task,
                                     max_steps=repair_max_steps,
@@ -2202,6 +3510,8 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                             event(run_dir, 'micro_repair_salvage_started',
                                                   reason=repair_salvage_reason)
                                         else:
+                                            if salvage_candidate is not None:
+                                                raise GuardError(salvage_candidate) from None
                                             raise
                                 finally:
                                     result['steps'] = primary_steps + (result.get('steps') or 0)
@@ -2229,24 +3539,39 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     targeted_argv = build_targeted_pytest_argv(
                                         task['test_argv'], first_test_log_text)
                                     if targeted_argv is not None:
-                                        rc_fast = execute(targeted_argv, task['directory'],
+                                        test_env = build_test_env_overrides(task)
+                                        rc_fast = execute(_seatbelt_test_argv(task, run_dir, targeted_argv),
+                                                          task['directory'],
                                                           min(30, task['test_timeout_seconds']),
-                                                          run_dir / 'test.log')
+                                                          run_dir / 'test.log',
+                                                          env_overrides=test_env)
                                         if rc_fast not in (0, 4):
                                             result['test_return_code'] = rc_fast
                                             event(run_dir, 'micro_repair_fast_fail',
                                                   return_code=rc_fast)
                                         else:
                                             result['test_return_code'] = execute(
-                                                task['test_argv'], task['directory'],
-                                                task['test_timeout_seconds'], run_dir / 'test.log')
+                                                _seatbelt_test_argv(task, run_dir, task['test_argv']),
+                                                task['directory'],
+                                                task['test_timeout_seconds'], run_dir / 'test.log',
+                                                env_overrides=test_env)
                                     else:
                                         result['test_return_code'] = execute(
-                                            task['test_argv'], task['directory'],
-                                            task['test_timeout_seconds'], run_dir / 'test.log')
+                                            _seatbelt_test_argv(task, run_dir, task['test_argv']),
+                                            task['directory'],
+                                            task['test_timeout_seconds'], run_dir / 'test.log',
+                                            env_overrides=build_test_env_overrides(task))
                             if result['test_return_code']:
-                                raise GuardError(repair_salvage_reason or 'validation_failed')
-                            if repair_salvage_reason is not None:
+                                raise GuardError(salvage_candidate or repair_salvage_reason or 'validation_failed')
+                            post_critic_issues = _evaluate_diff_critic()
+                            if post_critic_issues:
+                                with private_log(run_dir / 'test.log') as f:
+                                    f.write('[DIFF_CRITIC_FAILURE]\n' + '\n'.join(post_critic_issues) + '\n')
+                                event(run_dir, 'diff_critic_rejected', issues=post_critic_issues)
+                                raise GuardError('reward_hacking_detected')
+                            if salvage_candidate is not None:
+                                result['salvaged_from'] = f'salvage_repaired_{salvage_candidate}'
+                            elif repair_salvage_reason is not None:
                                 result['salvaged_from'] = f'micro_repair_{repair_salvage_reason}'
                             try:
                                 if result.get('test_return_code') == 0 and repaired_files:
@@ -2260,8 +3585,27 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     )
                             except Exception:
                                 pass
-                        if ro_files and _fh(ro_files) != ro_hashes_before:
-                            raise GuardError('read_only_file_modified')
+                        if ro_files:
+                            ro_hashes_after = _fh(ro_files)
+                            modified_ro = [
+                                p for p in ro_files
+                                if ro_hashes_after.get(p) != ro_hashes_before.get(p)
+                            ]
+                            if modified_ro:
+                                explicit_ro = set(task.get('explicit_read_only_files', ()))
+                                has_non_explicit = any(p not in explicit_ro for p in modified_ro)
+                                concurrent_owned = (
+                                    _concurrent_sibling_editable_files(
+                                        state, task['task_id'], started_at, time.time()
+                                    )
+                                    if has_non_explicit else set()
+                                )
+                                for ro_path in modified_ro:
+                                    if ro_path in explicit_ro or ro_path not in concurrent_owned:
+                                        raise GuardError('read_only_file_modified')
+                                for ro_path in modified_ro:
+                                    event(run_dir, 'concurrent_sibling_read_only_change_ignored',
+                                          file=ro_path)
                         if task.get('origin_files'):
                             if _fh(task['origin_files']) != task['origin_hashes']:
                                 raise GuardError('worktree_origin_modified_concurrently')
@@ -2271,7 +3615,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     Path(dst).write_bytes(Path(src).read_bytes())
                                 elif Path(dst).exists():
                                     Path(dst).unlink()
-                        if salvage_candidate is not None:
+                        if salvage_candidate is not None and not result.get('salvaged_from'):
                             result['salvaged_from'] = salvage_candidate
                         result['status'] = 'validation_passed_review_required'
             except (GuardError, OSError, ValueError, TypeError, sqlite3.Error) as exc:
@@ -2288,8 +3632,11 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             and not validation_attempted and result['hashes_after'] != result['hashes_before']):
                         validation_attempted = True
                         try:
-                            result['test_return_code'] = execute(task['test_argv'], task['directory'],
-                                task['test_timeout_seconds'], run_dir / 'test.log')
+                            result['test_return_code'] = execute(
+                                _seatbelt_test_argv(task, run_dir, task['test_argv']),
+                                task['directory'],
+                                task['test_timeout_seconds'], run_dir / 'test.log',
+                                env_overrides=build_test_env_overrides(task))
                         except (GuardError, OSError) as exc:
                             result['validation_error'] = str(exc) if isinstance(exc, GuardError) else type(exc).__name__
                 except OSError:

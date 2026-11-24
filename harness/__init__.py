@@ -30,6 +30,12 @@ from .guards import (
     extract_compact_test_failure,
     extract_failing_test_excerpts,
     prune_noisy_tool_outputs,
+    check_yaml_and_jinja_integrity,
+    check_python_class_and_call_integrity,
+    apply_transactional_multiedit,
+    apply_context_patch,
+    extract_runtime_assertion_locals,
+    audit_patch_for_reward_hacking,
 )
 from .proxy import (GEN_ID_RE, OPENROUTER_UPSTREAM, PROVIDER_LATENCY_THRESHOLD_SECONDS,
                     STREAM_COST_RE, GuardError, OpenRouterGuardProxy, openrouter_proxy)
@@ -60,6 +66,9 @@ from .telemetry import (DEFAULT_PHOENIX_ENDPOINT, OPENINFERENCE_SPAN_KINDS,
 from .sandbox import (
     CLI, DB, LIMITS, STATE,
     SALVAGEABLE_BLOCK_REASONS,
+    REPAIRABLE_SALVAGE_REASONS,
+    preflight_test_argv, run_semantic_diff_critic,
+    is_seatbelt_available, build_seatbelt_profile, wrap_argv_with_seatbelt,
     _reconcile_locked, auto_reconcile_from_proxy, build_micro_repair_prompt, heal_directory,
     synthesize_heal_task,
     build_prior_attempt_feedback, build_targeted_pytest_argv, should_auto_escalate,
@@ -115,4 +124,9 @@ __all__ = [
     'run_best_of_2', 'run_group_rollout', 'run_task', 'snapshot', 'stop_group',
     'validate_plan',
     'validate_task', 'verify_db', 'verify_permissions', 'violation',
+    'check_yaml_and_jinja_integrity', 'check_python_class_and_call_integrity',
+    'apply_transactional_multiedit', 'apply_context_patch',
+    'extract_runtime_assertion_locals', 'audit_patch_for_reward_hacking',
+    'REPAIRABLE_SALVAGE_REASONS', 'preflight_test_argv', 'run_semantic_diff_critic',
+    'is_seatbelt_available', 'build_seatbelt_profile', 'wrap_argv_with_seatbelt',
 ]
