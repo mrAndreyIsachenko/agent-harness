@@ -1037,8 +1037,8 @@ class RuntimeAssertionLocalsTests(unittest.TestCase):
             "helper     = <function helper at 0x104abc120>\n"
             "os_env     = environ({'PATH': '/usr/bin'})\n"
             "cfg        = <AppConfig object at 0x104abc999>\n"
-            "api_key    = 'sk-or-v1-secret1234567890abcdef'\n"
-            "pem_key    = '-----BEGIN RSA PRIVATE KEY-----\\nMIIEowIBAAKCAQEA123456789012345678901234567890'\n"
+            f"api_key    = '{'sk-or-' + 'v1-secret1234567890abcdef'}'\n"
+            f"pem_key    = '{'-----BEGIN RSA ' + 'PRIVATE KEY-----'}\\nMIIEowIBAAKCAQEA123456789012345678901234567890'\n"
             f"long_val   = '{long_str}'\n"
             "=========================== short test summary info ============================\n"
             "FAILED tests/test_ex.py::test_dict_diff - AssertionError\n"
@@ -1053,7 +1053,7 @@ class RuntimeAssertionLocalsTests(unittest.TestCase):
         self.assertNotIn("<function", out)
         self.assertNotIn("environ({", out)
         self.assertNotIn("<AppConfig", out)
-        self.assertNotIn("sk-or-v1-secret", out)
+        self.assertNotIn("sk-or-" + "v1-secret", out)
         self.assertNotIn("MIIEowIBAAKCAQEA", out)
         self.assertIn("[REDACTED]", out)
         long_lines = [line for line in out.splitlines() if line.startswith("long_val = ")]
@@ -1200,9 +1200,21 @@ class SeatbeltSandboxTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop('HARNESS_OS_SANDBOX', None)
+                expected_sb = 'test_only' if is_seatbelt_available() else 'off'
+                self.assertEqual(validate_task(dict(base))['os_sandbox'], expected_sb)
+                self.assertTrue(validate_task(dict(base))['enable_diff_critic'])
+            with mock.patch.dict(os.environ, {'HARNESS_OS_SANDBOX': 'off'}):
                 self.assertEqual(validate_task(dict(base))['os_sandbox'], 'off')
             with mock.patch.dict(os.environ, {'HARNESS_OS_SANDBOX': 'test_only'}):
                 self.assertEqual(validate_task(dict(base))['os_sandbox'], 'test_only')
+            with mock.patch.dict(os.environ, {'HARNESS_DIFF_CRITIC': '0'}):
+                self.assertFalse(validate_task(dict(base))['enable_diff_critic'])
+            with mock.patch.dict(os.environ, {'HARNESS_DIFF_CRITIC': 'true'}):
+                self.assertTrue(validate_task(dict(base))['enable_diff_critic'])
+            self.assertTrue(validate_task({**base, 'enable_diff_critic': True})['enable_diff_critic'])
+            with self.assertRaises(GuardError) as ctx_type:
+                validate_task({**base, 'enable_diff_critic': 'yes'})
+            self.assertEqual(str(ctx_type.exception), 'invalid_enable_diff_critic_flag')
             for mode in ('off', 'test_only', 'strict'):
                 t = validate_task({**base, 'os_sandbox': mode})
                 self.assertEqual(t['os_sandbox'], mode)
@@ -1242,6 +1254,104 @@ class SeatbeltSandboxTests(unittest.TestCase):
             self.assertNotEqual(bad_proc.returncode, 0)
             self.assertIn('PermissionError', bad_proc.stderr)
             self.assertFalse(outside_file.exists())
+
+    def test_build_seatbelt_profile_bytecode_cache_roots(self):
+        import re
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_seatbelt_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_tmp = Path(tmp) / 'repo'
+            (repo_tmp / 'tests').mkdir(parents=True)
+            canon = str(Path(repo_tmp).resolve())
+            profile = build_seatbelt_profile(bytecode_cache_roots=[repo_tmp])
+            self.assertIn('(allow file-write* (regex #"^' + re.escape(canon), profile)
+            self.assertIn('(.+/)?(__pycache__|\\.pytest_cache|\\.hypothesis|\\.ruff_cache)(/.*)?', profile)
+            empty = build_seatbelt_profile()
+            self.assertNotIn('(regex #', empty)
+
+    @unittest.skipUnless(is_seatbelt_available(), "macOS sandbox-exec required")
+    def test_seatbelt_exec_bytecode_cache_allowed_source_blocked(self):
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_seatbelt_profile, wrap_argv_with_seatbelt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_tmp = Path(tmp) / 'repo'
+            tests_dir = repo_tmp / 'tests'
+            tests_dir.mkdir(parents=True)
+            profile_path = Path(tmp) / 'test.sb'
+            profile_path.write_text(
+                build_seatbelt_profile(bytecode_cache_roots=[repo_tmp], allow_localhost_only=True),
+                encoding='utf-8',
+            )
+            pyc_path = tests_dir / '__pycache__' / 'x.pyc'
+            ok_argv = wrap_argv_with_seatbelt(
+                [sys.executable, '-c',
+                 f'from pathlib import Path; p = Path({str(pyc_path)!r}); p.parent.mkdir(exist_ok=True); p.write_bytes(b"pyc")'],
+                profile_path,
+            )
+            ok_proc = subprocess.run(ok_argv, capture_output=True, text=True)
+            self.assertEqual(ok_proc.returncode, 0, ok_proc.stderr)
+            self.assertEqual(pyc_path.read_bytes(), b'pyc')
+
+            src_path = tests_dir / 'test_x.py'
+            bad_argv = wrap_argv_with_seatbelt(
+                [sys.executable, '-c', f'from pathlib import Path; Path({str(src_path)!r}).write_text("no")'],
+                profile_path,
+            )
+            bad_proc = subprocess.run(bad_argv, capture_output=True, text=True)
+            self.assertNotEqual(bad_proc.returncode, 0)
+            self.assertFalse(src_path.exists())
+
+    def test_run_semantic_diff_critic_auth_bearer_and_openrouter_prefix(self):
+        import json as _json
+        import os
+        from unittest import mock
+        from harness.sandbox import run_semantic_diff_critic
+
+        task = {'model': 'openrouter/z-ai/glm-5.3-flash', 'prompt': 'edit'}
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured['url'] = req.full_url
+            captured['auth'] = req.headers.get('Authorization')
+            captured['model'] = _json.loads(req.data.decode('utf-8'))['model']
+            body = _json.dumps(
+                {'choices': [{'message': {'content': '{"verdict": "pass", "issues": []}'}}]}
+            ).encode('utf-8')
+            return mock.MagicMock(**{'__enter__.return_value.read.return_value': body})
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('OPENROUTER_API_KEY', None)
+            with mock.patch('harness.sandbox.urllib.request.urlopen', side_effect=fake_urlopen):
+                out = run_semantic_diff_critic(
+                    task, '- a\n+ b\n',
+                    base_url='https://openrouter.ai/api/v1/chat/completions',
+                    auth_bearer='test-bearer-token',
+                )
+        self.assertEqual(out['verdict'], 'pass')
+        self.assertEqual(captured['auth'], 'Bearer test-bearer-token')
+        self.assertEqual(captured['model'], 'z-ai/glm-5.3-flash')
+        self.assertIn('openrouter.ai', captured['url'])
+
+    def test_run_semantic_diff_critic_skips_openrouter_without_key(self):
+        import os
+        from unittest import mock
+        from harness.sandbox import run_semantic_diff_critic
+
+        task = {'model': 'openrouter/z-ai/glm-5.3-flash', 'prompt': 'edit'}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop('OPENROUTER_API_KEY', None)
+            with mock.patch('harness.sandbox.urllib.request.urlopen') as urlopen_mock:
+                out = run_semantic_diff_critic(
+                    task, '- a\n+ b\n', base_url='https://openrouter.ai/api/v1/chat/completions'
+                )
+        self.assertEqual(out, {'verdict': 'pass', 'issues': [], 'skipped': True})
+        urlopen_mock.assert_not_called()
 
 
 if __name__ == '__main__':

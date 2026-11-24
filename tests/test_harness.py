@@ -6726,7 +6726,7 @@ sys.exit(1)
             self.assertEqual(calls['n'], 2)
             test_exec_calls = [
                 c for c in mock_exec.call_args_list
-                if c.args[0] == [sys.executable, '-c', test_code]
+                if list(c.args[0])[-3:] == [sys.executable, '-c', test_code]
             ]
             self.assertEqual(len(test_exec_calls), 1)
             with open(os.path.join(res['artifact'], 'events.jsonl'), 'r', encoding='utf-8') as fh:

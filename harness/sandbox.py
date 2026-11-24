@@ -1149,9 +1149,15 @@ def validate_task(raw):
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
         raise GuardError('invalid_auto_micro_repair_flag')
-    t.setdefault('os_sandbox', os.environ.get('HARNESS_OS_SANDBOX', 'off'))
+    default_sb = 'test_only' if is_seatbelt_available() else 'off'
+    t.setdefault('os_sandbox', os.environ.get('HARNESS_OS_SANDBOX', default_sb))
     if t['os_sandbox'] not in ('off', 'test_only', 'strict'):
         raise GuardError('invalid_os_sandbox')
+    env_critic = os.environ.get('HARNESS_DIFF_CRITIC')
+    default_critic = True if env_critic is None else (env_critic.strip().lower() not in ('0', 'false', 'off', 'no'))
+    t.setdefault('enable_diff_critic', default_critic)
+    if not isinstance(t['enable_diff_critic'], bool):
+        raise GuardError('invalid_enable_diff_critic_flag')
     for key, (default, maximum) in LIMITS.items():
         value = number(t.setdefault(key, default), key)
         if not 0 < value <= maximum or (key == 'max_steps' and type(value) is not int):
@@ -1861,6 +1867,7 @@ _SEATBELT_SYSTEM_WRITABLE_PATHS = (
     '/dev/tty',
     '/dev/dtracehelper',
     '/private/var/folders',
+    '/private/tmp',
 )
 
 
@@ -1880,6 +1887,7 @@ def build_seatbelt_profile(
     denied_read_paths=(),
     allow_localhost_only: bool = True,
     allowed_tcp_ports=(),
+    bytecode_cache_roots=(),
 ) -> str:
     """Build a macOS Seatbelt (SBPL) profile for filesystem and network confinement."""
     lines = [
@@ -1906,6 +1914,20 @@ def build_seatbelt_profile(
                 lines.append(f'(allow file-write* (subpath "{quoted}"))')
             else:
                 lines.append(f'(allow file-write* (literal "{quoted}"))')
+
+    seen_bytecode_roots: set[str] = set()
+    for raw_root in bytecode_cache_roots:
+        if not raw_root:
+            continue
+        canon = os.path.realpath(os.path.expanduser(str(raw_root)))
+        if canon in seen_bytecode_roots:
+            continue
+        seen_bytecode_roots.add(canon)
+        quoted_regex = _sbpl_quote(re.escape(canon))
+        lines.append(
+            '(allow file-write* (regex #"^' + quoted_regex
+            + '/(.+/)?(__pycache__|\\.pytest_cache|\\.hypothesis|\\.ruff_cache)(/.*)?$"))'
+        )
 
     denied_candidates = list(DEFAULT_SEATBELT_DENIED_READ_PATHS)
     for raw_path in denied_read_paths:
@@ -1942,31 +1964,45 @@ def wrap_argv_with_seatbelt(argv: list[str], profile_path: Path) -> list[str]:
 
 def _stage_test_seatbelt_profile(task: dict, run_dir: Path) -> Path:
     """Stage seatbelt-test.sb in run_dir and return its path."""
+    sb_root = sandbox_root_for(run_dir)
+    sb_root.mkdir(parents=True, exist_ok=True)
     writable = [
-        sandbox_root_for(run_dir),
+        sb_root,
         run_dir,
         *_SEATBELT_SYSTEM_WRITABLE_PATHS,
     ]
     if task.get('worktree'):
         writable.append(task['directory'])
+        profile = build_seatbelt_profile(
+            writable_paths=writable,
+            allow_localhost_only=True,
+            bytecode_cache_roots=[task['directory']],
+        )
     else:
         writable.extend(task.get('files', ()))
         writable.append(Path(task['directory']) / '.pytest_cache')
         writable.append(Path(task['directory']) / '__pycache__')
         for f in task.get('files', ()):
             writable.append(Path(f).parent / '__pycache__')
-    profile = build_seatbelt_profile(writable_paths=writable, allow_localhost_only=True)
+        profile = build_seatbelt_profile(
+            writable_paths=writable,
+            allow_localhost_only=True,
+            bytecode_cache_roots=[task['directory']],
+        )
     profile_path = Path(run_dir) / 'seatbelt-test.sb'
-    private_write(profile_path, profile)
+    profile_path.write_text(profile, encoding='utf-8')
+    os.chmod(profile_path, 0o600)
     return profile_path
 
 
 def _stage_worker_seatbelt_profile(task: dict, run_dir: Path, db, *, proxy=None) -> Path:
     """Stage seatbelt-worker.sb in run_dir and return its path."""
+    sb_root = sandbox_root_for(run_dir)
+    sb_root.mkdir(parents=True, exist_ok=True)
     writable = [
         *task.get('files', ()),
         run_dir,
-        sandbox_root_for(run_dir),
+        sb_root,
         *_SEATBELT_SYSTEM_WRITABLE_PATHS,
     ]
     if task.get('mode') == 'patch' and task.get('patch_file'):
@@ -1985,7 +2021,8 @@ def _stage_worker_seatbelt_profile(task: dict, run_dir: Path, db, *, proxy=None)
         allowed_tcp_ports=ports,
     )
     profile_path = Path(run_dir) / 'seatbelt-worker.sb'
-    private_write(profile_path, profile)
+    profile_path.write_text(profile, encoding='utf-8')
+    os.chmod(profile_path, 0o600)
     return profile_path
 
 
@@ -1995,6 +2032,10 @@ def _seatbelt_test_argv(task: dict, run_dir: Path, argv: list[str]) -> list[str]
         profile_path = Path(run_dir) / 'seatbelt-test.sb'
         if not profile_path.is_file():
             profile_path = _stage_test_seatbelt_profile(task, run_dir)
+            try:
+                event(run_dir, 'seatbelt_sandbox_enabled', mode=task.get('os_sandbox'))
+            except Exception:
+                pass
         return wrap_argv_with_seatbelt(argv, profile_path)
     return argv
 
@@ -3169,12 +3210,17 @@ def _concurrent_sibling_editable_files(
     return owned
 
 
-def run_semantic_diff_critic(task: dict, patch_text: str, *, base_url: str | None) -> dict:
+def run_semantic_diff_critic(task: dict, patch_text: str, *, base_url: str | None, auth_bearer: str | None = None) -> dict:
     """H-97 Tier-2 single-shot LLM diff critic (best-effort)."""
     if not base_url or not isinstance(patch_text, str) or not patch_text.strip():
         return {'verdict': 'pass', 'issues': []}
     url = base_url if base_url.rstrip('/').endswith('/chat/completions') else base_url.rstrip('/') + '/chat/completions'
     model = task.get('diff_critic_model') or task.get('model') or 'openrouter/z-ai/glm-5.3-flash'
+    api_key = os.environ.get('OPENROUTER_API_KEY') or auth_bearer
+    if 'openrouter.ai' in url and not api_key:
+        return {'verdict': 'pass', 'issues': [], 'skipped': True}
+    if 'openrouter.ai' in url and model.startswith('openrouter/'):
+        model = model[len('openrouter/'):]
     prompt_text = str(task.get('prompt', '') or '')[:4000]
     diff_excerpt = patch_text[:12000]
     system_msg = (
@@ -3196,7 +3242,6 @@ def run_semantic_diff_critic(task: dict, patch_text: str, *, base_url: str | Non
         'stream': False,
     }).encode('utf-8')
     headers = {'Content-Type': 'application/json'}
-    api_key = os.environ.get('OPENROUTER_API_KEY')
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
     req = urllib.request.Request(url, data=payload, headers=headers, method='POST')
@@ -3411,10 +3456,14 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 audit = audit_patch_for_reward_hacking(patch_text, task.get('prompt', ''))
                                 blocking.extend(audit.get('blocking_issues', []))
                                 warnings.extend(audit.get('warnings', []))
-                            if task.get('enable_diff_critic') or os.environ.get('HARNESS_DIFF_CRITIC') == '1':
+                            if task.get('enable_diff_critic', True) and os.environ.get('HARNESS_DIFF_CRITIC', '1').strip().lower() not in ('0', 'false', 'off', 'no'):
                                 critic = run_semantic_diff_critic(
-                                    task, patch_text, base_url=upstream_url or OPENROUTER_UPSTREAM
+                                    task, patch_text,
+                                    base_url=upstream_url or OPENROUTER_UPSTREAM,
+                                    auth_bearer=getattr(proxy, 'auth_bearer', None),
                                 )
+                                if not critic.get('skipped'):
+                                    event(run_dir, 'diff_critic_evaluated', verdict=critic.get('verdict', 'pass'))
                                 if critic.get('verdict') == 'fail':
                                     blocking.extend(critic.get('issues') or ['semantic_diff_critic_failed'])
                             if warnings:
@@ -3432,16 +3481,21 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
 
                         if result['test_return_code'] or critic_issues:
                             capture_files(run_dir, tracked)
+                            known_spend = (
+                                result.get('cost') if result.get('cost') is not None
+                                else (result.get('observed_cost')
+                                      if salvage_candidate in REPAIRABLE_SALVAGE_REASONS else None)
+                            )
                             repair_eligible = (
                                 task.get('auto_micro_repair', True)
                                 and task['mode'] == 'model'
                                 and not result.get('micro_repair_attempted')
                                 and (run_dir / 'changes.patch').exists()
                                 and (run_dir / 'changes.patch').stat().st_size > 0
-                                and result.get('cost') is not None
+                                and known_spend is not None
                                 and (salvage_candidate == 'step_limit'
                                      or result.get('steps', 0) <= task['max_steps'])
-                                and result['cost'] <= min(budget * 0.8, 0.08)
+                                and known_spend <= min(budget * 0.8, 0.08)
                             )
                             if critic_issues and not repair_eligible:
                                 raise GuardError('reward_hacking_detected')
@@ -3499,7 +3553,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                         pass
                                     try:
                                         model_run(cli, db, repair_task, run_dir, result,
-                                                  max(0.0, budget - primary_cost),
+                                                  max(0.0, budget - (known_spend or 0.0)),
                                                   proxy=proxy, started_ref=started_ref)
                                     except GuardError as exc:
                                         if (str(exc) in SALVAGEABLE_BLOCK_REASONS
