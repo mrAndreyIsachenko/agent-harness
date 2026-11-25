@@ -4477,7 +4477,7 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertEqual(len(seen_repair_tasks), 1)
             repair_task = seen_repair_tasks[0]
             self.assertEqual(repair_task['max_steps'], 8)
-            self.assertEqual(repair_task['timeout_seconds'], 120)
+            self.assertEqual(repair_task['timeout_seconds'], 75)
             self.assertIn('Apply the minimal targeted edit directly to fix the failure above', repair_task['prompt'])
             self.assertIn('[CURRENT_PATCH]', repair_task['prompt'])
             self.assertIn('+VALUE = 1', repair_task['prompt'])
@@ -9043,6 +9043,28 @@ class TestHerdrIntegration(unittest.TestCase):
         self.assertIn('all', payload['projects'])
         self.assertEqual(
             [r['run_id'] for r in payload['recent_runs']], ['run-h1'])
+
+    def test_herdr_dashboard_project_from_task_json_and_dead_pid_filtered(self):
+        runs_dir = Path(self.root) / 'runs'
+        run_a = runs_dir / 'run-taskjson'
+        run_a.mkdir(parents=True)
+        (run_a / 'task.json').write_text(json.dumps(
+            {'directory': '/Users/u/work/medvidi/worktrees/gitops-demo'}))
+        (run_a / 'result.json').write_text(json.dumps({
+            'run_id': 'run-taskjson', 'status': 'success', 'task_id': 't1',
+            'model': 'm', 'steps': 1, 'cost_usd': 0.01,
+        }))
+        run_b = runs_dir / 'run-deadpid'
+        run_b.mkdir(parents=True)
+        (run_b / 'result.json').write_text(json.dumps({
+            'run_id': 'run-deadpid', 'status': 'pending', 'task_id': 't2',
+            'model': 'm', 'steps': 0, 'supervisor_pid': 99999999,
+        }))
+        data = harness_herdr.build_herdr_dashboard_data(self.root)
+        recent = {r['run_id']: r for r in data['recent_runs']}
+        self.assertEqual(recent['run-taskjson']['project'], 'medvidi')
+        self.assertIn('medvidi', data['projects'])
+        self.assertEqual(data['active_runs'], [])
 
     def test_parse_worker_log_steps_and_selected_detail(self):
         run_dir = Path(self.root) / 'runs' / 'run-steps'

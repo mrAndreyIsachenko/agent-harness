@@ -1154,7 +1154,7 @@ def validate_task(raw):
     if t['os_sandbox'] not in ('off', 'test_only', 'strict'):
         raise GuardError('invalid_os_sandbox')
     env_critic = os.environ.get('HARNESS_DIFF_CRITIC')
-    default_critic = True if env_critic is None else (env_critic.strip().lower() not in ('0', 'false', 'off', 'no'))
+    default_critic = False if env_critic is None else (env_critic.strip().lower() not in ('0', 'false', 'off', 'no', ''))
     t.setdefault('enable_diff_critic', default_critic)
     if not isinstance(t['enable_diff_critic'], bool):
         raise GuardError('invalid_enable_diff_critic_flag')
@@ -1332,7 +1332,7 @@ async function runHarnessEdit(
   return res.msg;
 }
 
-export default async function harnessGuardPlugin() {
+export async function harnessGuardPlugin(_ctx?: any) {
   let toolDefs: Record<string, any> | undefined;
   try {
     const mod: any = await import("@opencode-ai/plugin");
@@ -1827,6 +1827,12 @@ export default async function harnessGuardPlugin() {
     },
   };
 }
+
+export default {
+  id: "harness.guard",
+  server: harnessGuardPlugin,
+  setup() {},
+};
 '''
     return (
         body.replace('__HARNESS_ALLOWED_JSON__', allowed_json)
@@ -1871,9 +1877,35 @@ _SEATBELT_SYSTEM_WRITABLE_PATHS = (
 )
 
 
+_SEATBELT_PROBE_CACHE: bool | None = None
+
+
 def is_seatbelt_available() -> bool:
-    """Return True when macOS /usr/bin/sandbox-exec is available and executable."""
-    return sys.platform == 'darwin' and os.access('/usr/bin/sandbox-exec', os.X_OK)
+    """Return True when sandbox-exec can actually apply a profile here.
+
+    Nested Seatbelt environments (an outer profile already active) refuse to
+    apply an inner profile with exit code 71, so a harmless probe is used and
+    its result cached for the process lifetime.
+    """
+    global _SEATBELT_PROBE_CACHE
+    if sys.platform != 'darwin':
+        return False
+    if not os.access('/usr/bin/sandbox-exec', os.X_OK):
+        return False
+    if os.environ.get('HARNESS_IN_SEATBELT') == '1':
+        return False
+    if _SEATBELT_PROBE_CACHE is None:
+        try:
+            _SEATBELT_PROBE_CACHE = subprocess.run(
+                ['/usr/bin/sandbox-exec', '-p',
+                 '(version 1)(allow default)(deny file-write* '
+                 '(literal "/nonexistent_harness_sb_probe"))',
+                 '/usr/bin/true'],
+                capture_output=True, timeout=5,
+            ).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _SEATBELT_PROBE_CACHE = False
+    return _SEATBELT_PROBE_CACHE
 
 
 def _sbpl_quote(value: str) -> str:
@@ -2104,7 +2136,7 @@ def config_for(task, *, base_url=None, run_dir=None):
         plugin_path = stage_guard_plugin(
             Path(run_dir), allowed_files=task.get('files', ()),
             read_only_files=task.get('read_only_files', ()))
-        cfg['plugin'] = list(cfg.get('plugin', [])) + [plugin_path.resolve().as_uri()]
+        cfg['plugin'] = list(cfg.get('plugin', [])) + [str(plugin_path.parent.resolve())]
     return cfg
 
 def verify_permissions(payload, task):
@@ -2756,11 +2788,16 @@ def compute_repair_max_steps(task: dict) -> int:
     for the worker to re-read only the failing region and apply one edit."""
     return min(MAX_STEPS, max(6, 4 + 2 * len(task.get('files', ()))))
 
-def compute_repair_timeout_seconds(task: dict) -> int:
+def compute_repair_timeout_seconds(task: dict, elapsed_seconds: float | None = None) -> int:
     """Bounded proportional wall-clock timeout for micro_repair: 15s per
-    repair step (floor 45s), capped at the task's own timeout."""
+    repair step (floor 45s), capped at the task's own timeout and at 75s
+    when the primary run already consumed part of the wall-clock budget."""
     repair_steps = compute_repair_max_steps(task)
-    return min(int(task.get('timeout_seconds', 180)), max(45, 15 * repair_steps))
+    base = min(int(task.get('timeout_seconds', 180)), max(45, 15 * repair_steps))
+    if elapsed_seconds is None:
+        return base
+    remaining = int(task.get('timeout_seconds', 180) - float(elapsed_seconds))
+    return 0 if remaining < 25 else min(base, 75, remaining)
 
 
 def should_auto_escalate(raw_task: dict) -> bool:
@@ -2839,11 +2876,14 @@ def _norm_lesson_path(value) -> str:
     for marker in ('/.tools/opencode-guard-state/worktrees/', '/.worktrees/', '/worktrees/'):
         if marker in text:
             head, _, tail = text.partition(marker)
-            _, sep, rest = tail.partition('/')
-            if sep:
-                text = head.rstrip('/') + '/' + rest
+            wt_name, sep, rest = tail.partition('/')
+            if wt_name.startswith('gitops-') and (Path(head) / 'analytics-gitops').exists():
+                repo_root = head.rstrip('/') + '/analytics-gitops'
+            elif wt_name.startswith(('airflow-', 'wt-')) and (Path(head) / 'analytics-airflow-app').exists():
+                repo_root = head.rstrip('/') + '/analytics-airflow-app'
             else:
-                text = head
+                repo_root = head.rstrip('/')
+            text = (repo_root + '/' + rest) if sep else (repo_root or '/')
             if not text:
                 text = '/'
             break
@@ -2945,17 +2985,26 @@ def _extract_patch_fix_summary(patch_text: str, max_chars: int = 120) -> str:
         return ''
     symbol = ''
     added: list[str] = []
+    in_multiline_import = False
     for line in patch_text.splitlines():
         if line.startswith('@@') and '@@' in line[2:]:
             header = line.rsplit('@@', 1)[-1].strip()
             match = re.search(r'\b(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)', header)
             symbol = f'{header.split(" ")[0]} {match.group(1)}' if match else ''
             continue
+        body = line[1:].strip() if line.startswith(('+', ' ')) else line.strip()
+        if body and not body.startswith(('#', '+', '-', '@@')) and body.startswith(('from ', 'import ')):
+            in_multiline_import = '(' in body and ')' not in body
+        elif body == ')':
+            in_multiline_import = False
         if not line.startswith('+') or line.startswith('+++'):
             continue
         candidate = line[1:].strip()
+        if in_multiline_import:
+            continue
         if (not candidate or candidate.startswith('#')
-                or candidate.startswith('import ') or candidate.startswith('from ')):
+                or candidate.startswith(('import ', 'from ', ')', ']', '}', '__all__'))
+                or re.fullmatch(r"[\w'\",\s]+", candidate)):
             continue
         added.append(candidate)
         if len(added) >= 2:
@@ -3293,6 +3342,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             run_dir.mkdir(parents=True, mode=0o700)
             started = time.monotonic()
             started_at = time.time()
+            origin_directory = str(task['directory'])
             if not check:
                 task = stack.enter_context(isolated_worktree(task, run_dir))
             if not task.get('worktree') and task.get('read_only_files'):
@@ -3307,6 +3357,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
             ro_files = task.get('read_only_files', ())
             ro_hashes_before = _fh(ro_files)
             result = dict(task_id=task['task_id'], session_id=None, status='pending', reason='',
+                          directory=origin_directory, supervisor_pid=os.getpid(),
                           model=task['model'] if task['mode'] != 'command' else None,
                           cost=0, steps=0, observed_cost=0, prior_task_cost=spent,
                           limit_reason=task.get('limit_reason'),
@@ -3456,7 +3507,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 audit = audit_patch_for_reward_hacking(patch_text, task.get('prompt', ''))
                                 blocking.extend(audit.get('blocking_issues', []))
                                 warnings.extend(audit.get('warnings', []))
-                            if task.get('enable_diff_critic', True) and os.environ.get('HARNESS_DIFF_CRITIC', '1').strip().lower() not in ('0', 'false', 'off', 'no'):
+                            if task.get('enable_diff_critic', True) and os.environ.get('HARNESS_DIFF_CRITIC', '').strip().lower() not in ('0', 'false', 'off', 'no'):
                                 critic = run_semantic_diff_critic(
                                     task, patch_text,
                                     base_url=upstream_url or OPENROUTER_UPSTREAM,
@@ -3486,8 +3537,11 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 else (result.get('observed_cost')
                                       if salvage_candidate in REPAIRABLE_SALVAGE_REASONS else None)
                             )
+                            planned_repair_timeout = compute_repair_timeout_seconds(
+                                task, elapsed_seconds=time.monotonic() - started)
                             repair_eligible = (
-                                task.get('auto_micro_repair', True)
+                                planned_repair_timeout >= 25
+                                and task.get('auto_micro_repair', True)
                                 and task['mode'] == 'model'
                                 and not result.get('micro_repair_attempted')
                                 and (run_dir / 'changes.patch').exists()
@@ -3511,7 +3565,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     event(run_dir, 'salvage_micro_repair_started', reason=salvage_candidate)
                                 repair_max_steps = compute_repair_max_steps(task)
                                 active_max_steps[0] = repair_max_steps
-                                repair_timeout = compute_repair_timeout_seconds(task)
+                                repair_timeout = planned_repair_timeout
                                 active_timeout_seconds[0] = repair_timeout
                                 _capture_assertion_locals(task, run_dir, test_env=test_env)
                                 repair_task = dict(

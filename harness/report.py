@@ -995,7 +995,12 @@ def build_repo_memory_hint(
             reads_before_edit_samples.append(reads)
 
     bullets: list[str] = []
+    _GENERIC_NON_ACTIONABLE_REASONS = frozenset(
+        {"validation_failed", "worker_timeout", "no_change"}
+    )
     for reason, count in blocked_counter.most_common():
+        if reason in _GENERIC_NON_ACTIONABLE_REASONS:
+            continue
         if count >= min_occurrences:
             bullets.append(
                 f"- Recurring block reason: {reason} ({count}x) — avoid repeating this failure mode."

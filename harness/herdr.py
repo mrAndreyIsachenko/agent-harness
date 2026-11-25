@@ -289,6 +289,61 @@ def release_herdr_agent(
     return True
 
 
+import subprocess
+
+
+def _read_run_directory(run_dir, record) -> str:
+    """Resolve a run's directory from the record, falling back to task.json."""
+    if isinstance(record, dict):
+        directory = str(record.get("directory") or "")
+    else:
+        directory = str(getattr(record, "directory", None) or "")
+    if directory:
+        return directory
+    if run_dir is None:
+        return ""
+    task_path = Path(run_dir) / "task.json"
+    if not task_path.is_file():
+        return ""
+    try:
+        data = json.loads(task_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("directory") or "")
+
+
+def _is_run_alive(result: dict, now_ts: float, mtime: float) -> bool:
+    """Best-effort liveness check for a run without ``finished_at``."""
+    if result.get("finished_at"):
+        return False
+    sup_pid = result.get("supervisor_pid")
+    if isinstance(sup_pid, int) and sup_pid > 0:
+        try:
+            os.kill(sup_pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+    # Legacy runs without supervisor_pid: fall back to result.json mtime and,
+    # after a grace period, an optional pgrep on the session id.
+    if (now_ts - mtime) > 120:
+        return False
+    if (now_ts - mtime) > 30 and result.get("session_id"):
+        try:
+            proc = subprocess.run(
+                ["/usr/bin/pgrep", "-f", str(result["session_id"])],
+                capture_output=True,
+                timeout=1,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0
+    return True
+
+
 def _detect_run_project(directory, task_id=None):
     """Best-effort mapping of a run's directory/task_id prefix to a project label."""
     dir_str = str(directory or "")
@@ -296,15 +351,28 @@ def _detect_run_project(directory, task_id=None):
     low_dir, low_tid = dir_str.lower(), tid.lower()
     if "small model lab" in low_dir or low_tid.startswith("sml_"):
         return "Small Model Lab"
-    if "harness" in low_dir or low_tid.startswith("harness_"):
+    if "harness" in low_dir or low_tid.startswith(("harness_", "harness-")):
         return "Harness"
-    if "medvidi" in low_dir or low_tid.startswith("medvidi_"):
+    if ("medvidi" in low_dir
+            or any(key in low_dir for key in (
+                "analytics-gitops",
+                "analytics-airflow-app",
+                "worktrees/gitops-",
+                "worktrees/airflow-",
+            ))
+            or low_tid.startswith((
+                "medvidi_", "gitops", "airflow", "visual-reconcile",
+                "aurora-", "step_journal", "training_",
+            ))):
         return "medvidi"
     if directory:
         try:
             name = Path(directory).name
         except (OSError, ValueError):
             return None
+        name = str(name or "")
+        if name.lower().startswith(("wt-", "gitops-", "airflow-")):
+            return "medvidi"
         return name or None
     return None
 
@@ -367,6 +435,26 @@ def _summarize_filtered_runs(filtered_runs, state_path) -> dict:
     return {"funnel": funnel, "top_blocked_reasons": top_blocked, "top_tool_errors": top_tool}
 
 
+def _herdr_active_fingerprint_mtime_ns(runs_root, cache_entry, run_id=None):
+    """Track mtimes of ``result.json`` for active runs so cached dashboards refresh."""
+    active_mtime_ns = 0
+    payload = cache_entry.get("payload") if isinstance(cache_entry, dict) else None
+    active_runs = payload.get("active_runs", []) if isinstance(payload, dict) else []
+    if not isinstance(active_runs, list):
+        active_runs = []
+    if run_id:
+        active_runs = list(active_runs) + [{"run_id": run_id}]
+    for active in active_runs:
+        if not isinstance(active, dict):
+            continue
+        try:
+            mtime = (runs_root / str(active.get("run_id", "")) / "result.json").stat().st_mtime_ns
+        except OSError:
+            continue
+        active_mtime_ns = max(active_mtime_ns, mtime)
+    return active_mtime_ns
+
+
 def build_herdr_dashboard_data(
     state_dir,
     *,
@@ -387,6 +475,50 @@ def build_herdr_dashboard_data(
     from harness.telemetry import format_trace_tree
 
     state_path = Path(state_dir)
+
+    # Fast-path cache: fingerprint the runs directory so repeat dashboard
+    # refreshes within a short window skip the full scan (H-herdr-cache).
+    cache_path = state_path / ".herdr-dashboard-cache.json"
+    cache_key = "%s:%s:%s" % (days, project or "all", run_id or "")
+    run_count = 0
+    runs_mtime_ns = 0
+    runs_root = state_path / "runs"
+    if runs_root.is_dir():
+        try:
+            runs_mtime_ns = runs_root.stat().st_mtime_ns
+            run_count = len(os.listdir(runs_root))
+        except OSError:
+            run_count = 0
+    try:
+        dashboard_cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        dashboard_cache = {}
+    cache_entry = dashboard_cache.get(cache_key)
+    active_mtime_ns = _herdr_active_fingerprint_mtime_ns(runs_root, cache_entry, run_id)
+    fingerprint = [run_count, runs_mtime_ns, active_mtime_ns]
+    if (
+        isinstance(cache_entry, dict)
+        and cache_entry.get("fingerprint") == fingerprint
+        and (time.time() - _to_float(cache_entry.get("cached_at"))) < 30
+    ):
+        cached_payload = cache_entry.get("payload")
+        if isinstance(cached_payload, dict):
+            refreshed = dict(cached_payload)
+            alive_now = time.time()
+            refreshed["active_runs"] = [
+                active for active in cached_payload.get("active_runs", [])
+                if isinstance(active, dict) and _is_run_alive(
+                    {
+                        "finished_at": active.get("finished_at"),
+                        "supervisor_pid": active.get("supervisor_pid"),
+                        "session_id": active.get("session_id"),
+                    },
+                    alive_now,
+                    alive_now,
+                )
+            ]
+            return refreshed
+
     runs = scan_state_runs(state_path, days=days)
     insights = compute_state_insights(state_path, days=days)
 
@@ -402,7 +534,28 @@ def build_herdr_dashboard_data(
         else:
             rec_dir = getattr(record, "directory", None)
             rec_task = getattr(record, "task_id", None)
-        return _detect_run_project(rec_dir, rec_task)
+        if rec_dir:
+            return _detect_run_project(rec_dir, rec_task)
+        rid = None
+        if isinstance(record, dict):
+            rid = (
+                record.get("run_id")
+                or record.get("id")
+                or Path(str(record.get("run_dir") or record.get("artifact") or "")).name
+            )
+        else:
+            rid = (
+                getattr(record, "run_id", None)
+                or getattr(record, "id", None)
+                or Path(str(getattr(record, "run_dir", "") or "")).name
+            )
+        return _detect_run_project(
+            _read_run_directory(
+                state_path / "runs" / str(rid or ""),
+                record if isinstance(record, dict) else {},
+            ),
+            rec_task,
+        )
 
     projects = ["all"]
     seen_projects: set[str] = set()
@@ -499,18 +652,25 @@ def build_herdr_dashboard_data(
             "micro_repair_used": result.get("micro_repair_used"),
             "started_at": started_at or None,
             "finished_at": finished_at,
-            "project": _detect_run_project(result.get("directory"), result.get("task_id")),
+            "project": _detect_run_project(
+                _read_run_directory(run_dir, result), result.get("task_id")
+            ),
         }
+        if entry["project"] and entry["project"] not in seen_projects:
+            seen_projects.add(entry["project"])
+            projects.append(entry["project"])
         recent_runs.append(entry)
         if status_raw in ("pending", "running", "working") and not finished_at:
             try:
                 mtime = (run_dir / "result.json").stat().st_mtime
             except OSError:
                 mtime = started_at
-            if (now_ts - mtime) <= 600:
+            if _is_run_alive(result, now_ts, mtime):
                 progress = min(100, max(0, int(round((steps_val / max_steps) * 100)))) if max_steps > 0 else None
                 active_runs.append({
                     **entry,
+                    "supervisor_pid": result.get("supervisor_pid"),
+                    "session_id": result.get("session_id"),
                     "progress": progress,
                     "phase": "micro_repair" if result.get("micro_repair_attempted") else "coding",
                 })
@@ -677,7 +837,7 @@ def build_herdr_dashboard_data(
                 "worker_steps": parse_worker_log_steps(run_dir_path, limit=30),
             }
 
-    return {
+    payload = {
         "totals": {
             "runs": total,
             "resolved": resolved,
@@ -705,6 +865,24 @@ def build_herdr_dashboard_data(
         "trace_tree": trace_tree,
         "spans": spans,
     }
+
+    try:
+        active_mtime_ns = _herdr_active_fingerprint_mtime_ns(runs_root, None, run_id)
+        for active in active_runs:
+            try:
+                mtime = (state_path / "runs" / str(active.get("run_id", "")) / "result.json").stat().st_mtime_ns
+            except OSError:
+                continue
+            active_mtime_ns = max(active_mtime_ns, mtime)
+        dashboard_cache[cache_key] = {
+            "fingerprint": [run_count, runs_mtime_ns, active_mtime_ns],
+            "cached_at": time.time(),
+            "payload": payload,
+        }
+        cache_path.write_text(json.dumps(dashboard_cache), encoding="utf-8")
+    except OSError:
+        pass
+    return payload
 
 
 def parse_worker_log_steps(run_dir, limit: int = 30) -> list[dict]:

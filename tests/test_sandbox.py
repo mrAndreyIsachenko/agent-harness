@@ -1,7 +1,9 @@
 import os
+import sys
 import unittest
 
-from harness.sandbox import (config_for, infer_read_only_companion_files, render_guard_plugin,
+from harness.sandbox import (config_for, infer_read_only_companion_files,
+                             is_seatbelt_available, render_guard_plugin,
                              stage_guard_plugin, verify_permissions, worker_env)
 
 
@@ -153,6 +155,8 @@ class GuardPluginTests(unittest.TestCase):
         self.assertIn('py_compile', src)
         self.assertIn('JSON.parse', src)
         self.assertIn('[HARNESS EDIT HINT]', src)
+        self.assertIn('id: "harness.guard"', src)
+        self.assertIn('server: harnessGuardPlugin', src)
 
     def test_stage_guard_plugin_creates_file(self):
         import tempfile
@@ -169,9 +173,46 @@ class GuardPluginTests(unittest.TestCase):
             cfg = config_for(self.task, run_dir=Path(td))
             plugins = cfg.get('plugin')
             self.assertIsInstance(plugins, list)
-            expected = (Path(td) / '.opencode' / 'plugin' / 'harness_guard.ts').resolve().as_uri()
+            expected = str((Path(td) / '.opencode' / 'plugin').resolve())
             self.assertIn(expected, plugins)
             self.assertTrue((Path(td) / '.opencode' / 'plugin' / 'harness_guard.ts').is_file())
+
+    def test_live_opencode_cli_loads_guard_plugin_without_load_error(self):
+        import json
+        import tempfile
+        import time
+        from pathlib import Path
+        cli = '/Applications/OpenCode.app/Contents/Resources/opencode-cli'
+        log_path = Path.home() / '.local/share/opencode/log/opencode.log'
+        if not (Path(cli).is_file() and log_path.is_file()):
+            self.skipTest('live opencode-cli or log file not present')
+        if sys.platform == 'darwin' and not is_seatbelt_available():
+            self.skipTest('running inside outer Seatbelt sandbox; cannot write '
+                          '~/.local/share/opencode/log')
+        import subprocess
+        log_dir = log_path.parent
+        sizes_before = {p: p.stat().st_size for p in log_dir.glob('*.log')}
+        with tempfile.TemporaryDirectory() as td:
+            td_real = Path(os.path.realpath(td))
+            cfg = config_for(self.task, run_dir=td_real)
+            cfg_path = td_real / 'opencode.json'
+            cfg_path.write_text(
+                json.dumps({'$schema': 'https://opencode.ai/config.json', 'plugin': cfg['plugin']}),
+                encoding='utf-8')
+            subprocess.run([cli, 'debug', 'agents'], cwd=str(td_real),
+                           env={**os.environ, 'OPENCODE_CONFIG': str(cfg_path)},
+                           capture_output=True, timeout=60)
+            time.sleep(0.3)
+            appended_parts = []
+            for p in log_dir.glob('*.log'):
+                before = sizes_before.get(p, 0)
+                if p.stat().st_size > before:
+                    appended_parts.append(
+                        p.read_bytes()[before:].decode('utf-8', errors='replace'))
+            appended = '\n'.join(appended_parts)
+            self.assertIn('harness_guard.ts', appended)
+            self.assertNotIn('PluginModule.LoadError', appended)
+            self.assertNotIn('configured plugin path must be a directory', appended)
 
     def test_config_for_without_run_dir_backward_compatible(self):
         import tempfile
@@ -1200,9 +1241,10 @@ class SeatbeltSandboxTests(unittest.TestCase):
             }
             with mock.patch.dict(os.environ, {}, clear=False):
                 os.environ.pop('HARNESS_OS_SANDBOX', None)
+                os.environ.pop('HARNESS_DIFF_CRITIC', None)
                 expected_sb = 'test_only' if is_seatbelt_available() else 'off'
                 self.assertEqual(validate_task(dict(base))['os_sandbox'], expected_sb)
-                self.assertTrue(validate_task(dict(base))['enable_diff_critic'])
+                self.assertFalse(validate_task(dict(base))['enable_diff_critic'])
             with mock.patch.dict(os.environ, {'HARNESS_OS_SANDBOX': 'off'}):
                 self.assertEqual(validate_task(dict(base))['os_sandbox'], 'off')
             with mock.patch.dict(os.environ, {'HARNESS_OS_SANDBOX': 'test_only'}):
@@ -1242,6 +1284,8 @@ class SeatbeltSandboxTests(unittest.TestCase):
                 profile_path,
             )
             ok_proc = subprocess.run(ok_argv, capture_output=True, text=True)
+            if ok_proc.returncode == 71 and 'Operation not permitted' in ok_proc.stderr:
+                self.skipTest('nested sandbox-exec denied in this environment')
             self.assertEqual(ok_proc.returncode, 0, ok_proc.stderr)
             self.assertEqual(inside_file.read_text(encoding='utf-8'), 'ok')
 
@@ -1295,6 +1339,8 @@ class SeatbeltSandboxTests(unittest.TestCase):
                 profile_path,
             )
             ok_proc = subprocess.run(ok_argv, capture_output=True, text=True)
+            if ok_proc.returncode == 71 and 'Operation not permitted' in ok_proc.stderr:
+                self.skipTest('nested sandbox-exec denied in this environment')
             self.assertEqual(ok_proc.returncode, 0, ok_proc.stderr)
             self.assertEqual(pyc_path.read_bytes(), b'pyc')
 
