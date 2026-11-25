@@ -183,15 +183,17 @@ class GuardPluginTests(unittest.TestCase):
         import time
         from pathlib import Path
         cli = '/Applications/OpenCode.app/Contents/Resources/opencode-cli'
-        log_path = Path.home() / '.local/share/opencode/log/opencode.log'
-        if not (Path(cli).is_file() and log_path.is_file()):
-            self.skipTest('live opencode-cli or log file not present')
+        log_dir = Path.home() / '.local/share/opencode/log'
+        if not Path(cli).is_file():
+            self.skipTest('live opencode-cli not present')
         if sys.platform == 'darwin' and not is_seatbelt_available():
             self.skipTest('running inside outer Seatbelt sandbox; cannot write '
                           '~/.local/share/opencode/log')
         import subprocess
-        log_dir = log_path.parent
-        sizes_before = {p: p.stat().st_size for p in log_dir.glob('*.log')}
+        sizes_before = (
+            {p: p.stat().st_size for p in log_dir.glob('*.log')}
+            if log_dir.is_dir() else {}
+        )
         with tempfile.TemporaryDirectory() as td:
             td_real = Path(os.path.realpath(td))
             cfg = config_for(self.task, run_dir=td_real)
@@ -199,20 +201,27 @@ class GuardPluginTests(unittest.TestCase):
             cfg_path.write_text(
                 json.dumps({'$schema': 'https://opencode.ai/config.json', 'plugin': cfg['plugin']}),
                 encoding='utf-8')
-            subprocess.run([cli, 'debug', 'agents'], cwd=str(td_real),
-                           env={**os.environ, 'OPENCODE_CONFIG': str(cfg_path)},
-                           capture_output=True, timeout=60)
+            proc = subprocess.run([cli, 'debug', 'agents', '--standalone', '--print-logs'],
+                                  cwd=str(td_real),
+                                  env={**os.environ, 'OPENCODE_CONFIG': str(cfg_path)},
+                                  capture_output=True, timeout=60)
             time.sleep(0.3)
-            appended_parts = []
-            for p in log_dir.glob('*.log'):
-                before = sizes_before.get(p, 0)
-                if p.stat().st_size > before:
-                    appended_parts.append(
-                        p.read_bytes()[before:].decode('utf-8', errors='replace'))
-            appended = '\n'.join(appended_parts)
-            self.assertIn('harness_guard.ts', appended)
-            self.assertNotIn('PluginModule.LoadError', appended)
-            self.assertNotIn('configured plugin path must be a directory', appended)
+            parts = []
+            for stream in (proc.stdout, proc.stderr):
+                if isinstance(stream, bytes):
+                    parts.append(stream.decode('utf-8', errors='replace'))
+                elif stream:
+                    parts.append(stream)
+            if log_dir.is_dir():
+                for p in log_dir.glob('*.log'):
+                    before = sizes_before.get(p, 0)
+                    if p.stat().st_size > before:
+                        parts.append(
+                            p.read_bytes()[before:].decode('utf-8', errors='replace'))
+            output = '\n'.join(parts)
+            self.assertIn('harness_guard.ts', output)
+            self.assertNotIn('PluginModule.LoadError', output)
+            self.assertNotIn('configured plugin path must be a directory', output)
 
     def test_config_for_without_run_dir_backward_compatible(self):
         import tempfile
@@ -530,6 +539,89 @@ class ConcurrentReadOnlyCompanionTests(unittest.TestCase):
         self.assertEqual(res['status'], 'blocked')
         self.assertEqual(res['reason'], 'read_only_file_modified')
 
+    def test_read_only_public_skeletons_for_test_file_task(self):
+        import ast
+        from harness.guards import build_read_only_public_skeletons
+
+        filler = "\n".join(f"# filler line {i}" for i in range(150))
+        self.mod_file.write_text(
+            'from dataclasses import dataclass\n\n'
+            'class RefModel:\n'
+            '    name: str\n'
+            '    value: int\n'
+            '    _private: str\n\n'
+            '    def __init__(self, name: str, value: int) -> None:\n'
+            '        self.name = name\n\n'
+            '    def public_method(self, x: int = 0) -> int:\n'
+            '        return x\n\n'
+            '    def _helper(self) -> None:\n'
+            '        return None\n\n\n'
+            'async def public_async(s: str) -> str:\n'
+            '    return s\n\n'
+            'def public_fn(a, b="x"):\n'
+            '    return a\n\n'
+            'def _private_fn(a):\n'
+            '    return a\n\n'
+            + filler + '\n',
+            encoding='utf-8',
+        )
+
+        skeleton = build_read_only_public_skeletons([str(self.mod_file)])
+        self.assertTrue(skeleton.startswith('[READ-ONLY PUBLIC SIGNATURES]'))
+        self.assertIn(f'--- {self.mod_file} (', skeleton)
+        self.assertIn('class RefModel(', skeleton)
+        self.assertIn('    name: str', skeleton)
+        self.assertIn('    value: int', skeleton)
+        self.assertNotIn('_private: str', skeleton)
+        self.assertIn('def __init__(self, name: str, value: int', skeleton)
+        self.assertIn('def public_method(self, x: int', skeleton)
+        self.assertNotIn('_helper', skeleton)
+        self.assertIn('async def public_async(s: str)', skeleton)
+        self.assertIn('def public_fn(a, b)', skeleton)
+        self.assertNotIn('_private_fn', skeleton)
+
+        prompts = []
+
+        def fake_model(cli, db, task, run_dir, result, budget, **kwargs):
+            prompts.append(task['prompt'])
+            self.test_file.write_text(
+                'def test_ok():\n    assert 1 == 1\n', encoding='utf-8'
+            )
+            result['cost'] = 0.0
+            result['steps'] = 1
+
+        self.test_file.parent.mkdir(parents=True, exist_ok=True)
+        if not self.test_file.exists():
+            self.test_file.write_text('def test_placeholder(): pass\n', encoding='utf-8')
+        res = self._run_model_task({
+            'task_id': 't_ro_skeleton',
+            'directory': str(self.repo),
+            'files': [str(self.test_file)],
+            'read_only_files': [str(self.mod_file)],
+            'test_argv': ['/usr/bin/true'],
+            'mode': 'model',
+            'prompt': 'edit test only',
+        }, fake_model)
+        self.assertEqual(res['status'], 'validation_passed_review_required')
+        self.assertEqual(len(prompts), 1)
+
+    def test_build_read_only_public_skeletons_includes_return_annotations(self):
+        from harness.guards import build_read_only_public_skeletons
+
+        self.mod_file.write_text(
+            'class WidgetSpec:\n'
+            '    def names(self) -> list[str]:\n'
+            '        return []\n\n'
+            'def compute_widget(count: int) -> dict[str, int]:\n'
+            '    return {}\n',
+            encoding='utf-8',
+        )
+
+        skeleton = build_read_only_public_skeletons([str(self.mod_file)])
+        self.assertTrue(skeleton.startswith('[READ-ONLY PUBLIC SIGNATURES]'))
+        self.assertIn('def compute_widget(count: int) -> dict[str, int]', skeleton)
+        self.assertIn('def names(self) -> list[str]', skeleton)
+
     def test_salvage_micro_repair_succeeds_after_step_limit(self):
         import json
         import sys
@@ -676,6 +768,176 @@ class ConcurrentReadOnlyCompanionTests(unittest.TestCase):
         self.assertEqual(res2['reason'], 'worker_timeout')
         self.assertFalse(res2.get('micro_repair_attempted', False))
 
+    def test_micro_repair_second_round_fixes_test(self):
+        import json
+        import sys
+        from pathlib import Path
+
+        self.test_file.write_text(
+            'from mod import VALUE\n'
+            'def test_val():\n'
+            '    assert VALUE == 2\n',
+            encoding='utf-8',
+        )
+        calls = []
+
+        def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(task['prompt'])
+            if len(calls) == 1:
+                self.mod_file.write_text('VALUE = 98\n', encoding='utf-8')
+            elif len(calls) == 2:
+                self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+            else:
+                self.mod_file.write_text('VALUE = 2\n', encoding='utf-8')
+            result['steps'] = 1
+            result['cost'] = 0.01
+
+        res = self._run_model_task({
+            'task_id': 'h90-two-rounds',
+            'mode': 'model',
+            'directory': str(self.repo),
+            'files': [str(self.mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+            'max_steps': 4,
+            'budget_usd': 0.5,
+            'prompt': 'set VALUE=2',
+        }, fake_model_run)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(res['status'], 'validation_passed_review_required')
+        self.assertEqual(res.get('micro_repair_rounds'), 2)
+        self.assertTrue(res.get('micro_repair_attempted'))
+        self.assertEqual(res['test_return_code'], 0)
+        events = [json.loads(line) for line
+                  in (Path(res['artifact']) / 'events.jsonl').read_text(encoding='utf-8').splitlines()]
+        rounds = [ev.get('round') for ev in events if ev.get('event') == 'micro_repair_started']
+        self.assertEqual(rounds, [1, 2])
+        self.assertTrue((Path(res['artifact']) / 'test_after_repair_1.log').is_file())
+
+    def test_micro_repair_multifile_two_rounds_accumulate_repaired_files(self):
+        import sys
+        from unittest import mock
+
+        mod_a = self.repo / 'mod_a.py'
+        mod_b = self.repo / 'mod_b.py'
+        self.test_file.write_text(
+            'from mod_a import VALUE_A\n'
+            'from mod_b import VALUE_B\n'
+            'def test_vals():\n'
+            '    assert VALUE_A == 2\n'
+            '    assert VALUE_B == 300\n',
+            encoding='utf-8',
+        )
+        mod_a.write_text('VALUE_A = 1\n', encoding='utf-8')
+        mod_b.write_text('VALUE_B = 1\n', encoding='utf-8')
+        calls = []
+
+        def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(task['prompt'])
+            if len(calls) == 1:
+                mod_a.write_text('VALUE_A = 999\n', encoding='utf-8')
+            elif len(calls) == 2:
+                mod_a.write_text('VALUE_A = 2\n', encoding='utf-8')
+            else:
+                mod_b.write_text('VALUE_B = 300\n', encoding='utf-8')
+            result['steps'] = 1
+            result['cost'] = 0.01
+
+        with mock.patch('harness.sandbox.record_repair_lesson') as lesson_mock:
+            res = self._run_model_task({
+                'task_id': 'h90-two-files-two-rounds',
+                'mode': 'model',
+                'directory': str(self.repo),
+                'files': [str(mod_a), str(mod_b)],
+                'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+                'max_steps': 4,
+                'budget_usd': 0.5,
+                'prompt': 'fix VALUE_A and VALUE_B',
+            }, fake_model_run)
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(res['status'], 'validation_passed_review_required')
+        self.assertEqual(res.get('micro_repair_rounds'), 2)
+        self.assertEqual(res['test_return_code'], 0)
+        self.assertEqual(mod_a.read_text(encoding='utf-8'), 'VALUE_A = 2\n')
+        self.assertEqual(mod_b.read_text(encoding='utf-8'), 'VALUE_B = 300\n')
+        lesson_mock.assert_called_once()
+        self.assertEqual(lesson_mock.call_args[0][3], [str(mod_a), str(mod_b)])
+
+    def test_micro_repair_no_change_stops_after_round_1(self):
+        import json
+        import sys
+        from pathlib import Path
+
+        self.test_file.write_text(
+            'from mod import VALUE\n'
+            'def test_val():\n'
+            '    assert VALUE == 2\n',
+            encoding='utf-8',
+        )
+        calls = []
+
+        def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+            result['steps'] = 1
+            result['cost'] = 0.01
+
+        res = self._run_model_task({
+            'task_id': 'h90-no-change',
+            'mode': 'model',
+            'directory': str(self.repo),
+            'files': [str(self.mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+            'max_steps': 4,
+            'budget_usd': 0.5,
+            'prompt': 'set VALUE=2',
+        }, fake_model_run)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(res['status'], 'blocked')
+        self.assertEqual(res.get('micro_repair_rounds'), 1)
+        events = [json.loads(line) for line
+                  in (Path(res['artifact']) / 'events.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertIn('micro_repair_no_change', [ev.get('event') for ev in events])
+
+    def test_micro_repair_spend_threshold_blocks_round_2(self):
+        import sys
+
+        self.test_file.write_text(
+            'from mod import VALUE\n'
+            'def test_val():\n'
+            '    assert VALUE == 2\n',
+            encoding='utf-8',
+        )
+        calls = []
+
+        def fake_model_run(cli, db, task, run_dir, result, budget, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                self.mod_file.write_text('VALUE = 99\n', encoding='utf-8')
+                result['cost'] = 0.01
+            else:
+                self.mod_file.write_text('VALUE = 98\n', encoding='utf-8')
+                result['cost'] = 0.09
+            result['steps'] = 1
+
+        res = self._run_model_task({
+            'task_id': 'h90-spend-cap',
+            'mode': 'model',
+            'directory': str(self.repo),
+            'files': [str(self.mod_file)],
+            'test_argv': [sys.executable, '-m', 'pytest', str(self.test_file)],
+            'max_steps': 4,
+            'budget_usd': 0.5,
+            'prompt': 'set VALUE=2',
+        }, fake_model_run)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(res['status'], 'blocked')
+        self.assertEqual(res.get('micro_repair_rounds'), 1)
+
 
 class TestEnvAndPreflightTests(unittest.TestCase):
     def setUp(self):
@@ -717,6 +979,68 @@ class TestEnvAndPreflightTests(unittest.TestCase):
         self.assertIn(str(self.repo), parts)
         self.assertIn(str(ai_tools), parts)
         self.assertIn(str(ai_mcp), parts)
+
+    def test_build_test_env_overrides_with_run_dir_sets_sandbox_tmp_env(self):
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_test_env_overrides, cleanup_isolation_sandbox, stage_isolation_sandbox
+
+        target = self.repo / 'mod.py'
+        target.write_text('VALUE = 1\n', encoding='utf-8')
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        run_dir = Path(os.path.realpath(td.name))
+
+        sb_env = stage_isolation_sandbox(run_dir)
+        self.addCleanup(cleanup_isolation_sandbox, run_dir)
+        sb_tmp = Path(sb_env['TMPDIR'])
+
+        env = build_test_env_overrides(
+            {'directory': str(self.repo), 'files': [str(target)], 'test_argv': ['/usr/bin/true']},
+            run_dir=run_dir)
+        self.assertEqual(env['TMPDIR'], str(sb_tmp))
+        self.assertEqual(env['TEMP'], str(sb_tmp))
+        self.assertEqual(env['TMP'], str(sb_tmp))
+        self.assertEqual(env['DBT_LOG_PATH'], str(sb_tmp / 'dbt_logs'))
+        self.assertEqual(env['DBT_TARGET_PATH'], str(sb_tmp / 'dbt_target'))
+        self.assertTrue((sb_tmp / 'pytest_cache').is_dir())
+        self.assertNotIn('PYTEST_ADDOPTS', env)
+
+    def test_build_test_env_overrides_with_run_dir_sets_pytest_cache_dir(self):
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_test_env_overrides, cleanup_isolation_sandbox, stage_isolation_sandbox
+
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        run_dir = Path(os.path.realpath(td.name))
+
+        sb_env = stage_isolation_sandbox(run_dir)
+        self.addCleanup(cleanup_isolation_sandbox, run_dir)
+        sb_tmp = Path(sb_env['TMPDIR'])
+        expected = f'-o cache_dir={sb_tmp / "pytest_cache"}'
+
+        env = build_test_env_overrides(
+            {'directory': str(self.repo),
+             'files': [],
+             'test_argv': ['python', '-m', 'pytest', '-q', str(self.repo / 'test_x.py')]},
+            run_dir=run_dir)
+        self.assertEqual(env.get('PYTEST_ADDOPTS'), expected)
+
+        saved = os.environ.get('PYTEST_ADDOPTS')
+        try:
+            os.environ['PYTEST_ADDOPTS'] = '-o cache_dir=/caller/own'
+            preserved = build_test_env_overrides(
+                {'directory': str(self.repo),
+                 'files': [],
+                 'test_argv': ['python', '-m', 'pytest']},
+                run_dir=run_dir)
+            self.assertNotIn('PYTEST_ADDOPTS', preserved)
+        finally:
+            if saved is None:
+                os.environ.pop('PYTEST_ADDOPTS', None)
+            else:
+                os.environ['PYTEST_ADDOPTS'] = saved
 
     def test_preflight_test_argv_rejects_unsupported_flag_unless_script_editable(self):
         import sys
@@ -1053,6 +1377,21 @@ class PolyglotCompanionAndSymbolContextTests(unittest.TestCase):
         self.assertIn(stg_sql, result)
         self.assertIn(stg_yml, result)
 
+    def test_nonexistent_test_file_infers_subpackage_target_and_2hop_contract(self):
+        handler = self._write(
+            'pkg/sub/handler.py',
+            'from contracts import HandlerSchema\n\ndef run():\n    return HandlerSchema\n',
+        )
+        contracts = self._write(
+            'pkg/contracts.py',
+            'class HandlerSchema:\n    pass\n',
+        )
+        # The editable test file does not exist yet (brand-new task).
+        missing_test = os.path.join(self.task_dir, 'pkg', 'tests', 'test_handler.py')
+        result = infer_read_only_companion_files([missing_test], directory=self.task_dir)
+        self.assertIn(handler, result)
+        self.assertIn(contracts, result)
+
 
 class RuntimeAssertionLocalsTests(unittest.TestCase):
     def test_extract_runtime_assertion_locals_parses_diff_strips_noise_redacts_and_bounds(self):
@@ -1299,6 +1638,30 @@ class SeatbeltSandboxTests(unittest.TestCase):
             self.assertIn('PermissionError', bad_proc.stderr)
             self.assertFalse(outside_file.exists())
 
+    def test_stage_test_seatbelt_profile_includes_enclosing_git_repo_root(self):
+        import re
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import _stage_test_seatbelt_profile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / 'repo'
+            task_dir = repo_root / 'services' / 'worker'
+            task_dir.mkdir(parents=True)
+            (repo_root / '.git').mkdir()
+            run_dir = Path(tmp) / 'run'
+            run_dir.mkdir()
+            task = {
+                'task_id': 'sb-repo-root',
+                'directory': str(task_dir),
+                'files': [str(task_dir / 'mod.py')],
+                'mode': 'model',
+            }
+            profile_path = _stage_test_seatbelt_profile(task, run_dir)
+            profile = profile_path.read_text(encoding='utf-8')
+            canon = str(Path(repo_root).resolve())
+            self.assertIn('(allow file-write* (regex #"^' + re.escape(canon), profile)
+
     def test_build_seatbelt_profile_bytecode_cache_roots(self):
         import re
         import tempfile
@@ -1311,9 +1674,58 @@ class SeatbeltSandboxTests(unittest.TestCase):
             canon = str(Path(repo_tmp).resolve())
             profile = build_seatbelt_profile(bytecode_cache_roots=[repo_tmp])
             self.assertIn('(allow file-write* (regex #"^' + re.escape(canon), profile)
-            self.assertIn('(.+/)?(__pycache__|\\.pytest_cache|\\.hypothesis|\\.ruff_cache)(/.*)?', profile)
+            self.assertIn('(.+/)?((__pycache__|\\.pytest_cache|\\.hypothesis|\\.ruff_cache|\\.mypy_cache|logs|generated)(/.*)?|pytest-cache-files-[^/]+(/.*)?)', profile)
             empty = build_seatbelt_profile()
             self.assertNotIn('(regex #', empty)
+
+    def test_seatbelt_profile_allows_generated_logs_and_pytest_cache_dirs(self):
+        import subprocess
+        import sys
+        import tempfile
+        from pathlib import Path
+        from harness.sandbox import build_seatbelt_profile, wrap_argv_with_seatbelt
+
+        with tempfile.TemporaryDirectory() as allowed_tmp, tempfile.TemporaryDirectory() as outside_tmp:
+            profile_path = Path(allowed_tmp) / 'test.sb'
+            profile = build_seatbelt_profile(
+                writable_paths=[allowed_tmp],
+                bytecode_cache_roots=[allowed_tmp],
+                allow_localhost_only=True,
+            )
+            for marker in ('\\.mypy_cache', '|logs', '|generated', 'pytest-cache-files-'):
+                self.assertIn(marker, profile)
+            profile_path.write_text(profile, encoding='utf-8')
+
+            writes = {
+                'logs/dbt.log': 'log',
+                'generated/out.txt': 'gen',
+                '.mypy_cache/x': 'my',
+                'pytest-cache-files-abc/tmp': 'pf',
+            }
+            script = (
+                'from pathlib import Path\n'
+                + ''.join(
+                    f'Path({str(Path(allowed_tmp) / rel)!r}).parent.mkdir(parents=True, exist_ok=True);'
+                    f'Path({str(Path(allowed_tmp) / rel)!r}).write_text({content!r})\n'
+                    for rel, content in writes.items())
+            )
+            ok_argv = wrap_argv_with_seatbelt([sys.executable, '-c', script], profile_path)
+            ok_proc = subprocess.run(ok_argv, capture_output=True, text=True)
+            if ok_proc.returncode == 71 and 'Operation not permitted' in ok_proc.stderr:
+                self.skipTest('nested sandbox-exec denied in this environment')
+            self.assertEqual(ok_proc.returncode, 0, ok_proc.stderr)
+            for rel, content in writes.items():
+                self.assertEqual((Path(allowed_tmp) / rel).read_text(encoding='utf-8'), content)
+
+            outside_file = Path(outside_tmp) / 'blocked.py'
+            bad_argv = wrap_argv_with_seatbelt(
+                [sys.executable, '-c', f'from pathlib import Path; Path({str(outside_file)!r}).write_text("no")'],
+                profile_path,
+            )
+            bad_proc = subprocess.run(bad_argv, capture_output=True, text=True)
+            self.assertNotEqual(bad_proc.returncode, 0)
+            self.assertIn('PermissionError', bad_proc.stderr)
+            self.assertFalse(outside_file.exists())
 
     @unittest.skipUnless(is_seatbelt_available(), "macOS sandbox-exec required")
     def test_seatbelt_exec_bytecode_cache_allowed_source_blocked(self):

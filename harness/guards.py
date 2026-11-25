@@ -37,6 +37,7 @@ __all__ = [
     "audit_patch_for_reward_hacking",
     "build_cross_file_symbol_context",
     "build_file_skeletons",
+    "build_read_only_public_skeletons",
     "check_allowed_files_syntax",
     "check_cot_and_slop_integrity",
     "check_egress_payload",
@@ -2902,6 +2903,155 @@ def build_file_skeletons(files: Iterable[str], *, line_threshold: int = 250) -> 
     if not chunks:
         return ""
     return "[FILE SKELETON MAP -- read only target line ranges]\n" + "\n".join(chunks) + "\n"
+
+
+def _ro_public_args(node) -> str:
+    parts = []
+    args = node.args
+    for arg in list(getattr(args, "posonlyargs", [])) + list(args.args):
+        parts.append(_ro_public_arg(arg))
+    if args.vararg is not None:
+        parts.append("*" + _ro_public_arg(args.vararg))
+    elif args.kwonlyargs:
+        parts.append("*")
+    for arg in args.kwonlyargs:
+        parts.append(_ro_public_arg(arg))
+    if args.kwarg is not None:
+        parts.append("**" + _ro_public_arg(args.kwarg))
+    text = ", ".join(parts)
+    if len(text) > 120:
+        text = text[:117] + "..."
+    return text
+
+
+def _ro_public_arg(arg) -> str:
+    text = arg.arg
+    if arg.annotation is not None:
+        try:
+            annotation_text = ast.unparse(arg.annotation)
+        except Exception:  # pragma: no cover - unparse fallback
+            annotation_text = "<unparseable>"
+        text = f"{arg.arg}: {annotation_text}"
+        if len(text) > 80:
+            text = f"{arg.arg}: <complex annotation>"
+    return text
+
+
+def _ro_public_return(node) -> str:
+    returns = getattr(node, "returns", None)
+    if returns is None:
+        return ""
+    try:
+        ret_text = ast.unparse(returns)
+    except Exception:  # pragma: no cover - unparse fallback
+        ret_text = "<unparseable>"
+    if len(ret_text) > 60:
+        ret_text = "<complex return>"
+    return f" -> {ret_text}"
+
+
+def build_read_only_public_skeletons(
+    read_only_files: Iterable[str],
+    *,
+    excerpts: str = "",
+    short_file_max_lines: int = 150,
+    max_chars: int = 3000,
+) -> str:
+    """Build compact public-signature skeletons for read-only reference files.
+
+    Only ``.py`` files that are not already preloaded in full via ``excerpts``
+    (either short enough to preload entirely or explicitly present there) are
+    summarized. Top-level public functions get ``L{start}-L{end}: def name(args)``
+    lines; top-level public classes additionally list their public annotated
+    fields and public methods (``__init__`` included) one level deep. The output
+    is capped at ``max_chars`` and prefixed with ``[READ-ONLY PUBLIC SIGNATURES]``
+    so the worker reads only the needed ranges instead of re-reading whole
+    reference modules.
+    """
+    chunks: list[str] = []
+    total_chars = 0
+    for path in read_only_files:
+        if total_chars >= max_chars:
+            break
+        if not str(path).endswith(".py"):
+            continue
+        file_path = Path(path)
+        try:
+            if not file_path.is_file():
+                continue
+            text = file_path.read_text()
+        except OSError:
+            continue
+        line_count = len(text.splitlines())
+        if (
+            line_count <= short_file_max_lines
+            and f"--- {path} (" in excerpts
+        ):
+            continue
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, OSError):
+            continue
+        lines: list[str] = []
+        for node in tree.body:
+            name = getattr(node, "name", "")
+            if not name or name.startswith("_"):
+                continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+                lines.append(
+                    f"L{node.lineno}-L{node.end_lineno}: {prefix}def {name}"
+                    f"({_ro_public_args(node)}){_ro_public_return(node)}"
+                )
+            elif isinstance(node, ast.ClassDef):
+                bases = []
+                for base in node.bases:
+                    try:
+                        bases.append(ast.unparse(base))
+                    except Exception:  # pragma: no cover - unparse fallback
+                        bases.append(getattr(base, "id", "<base>"))
+                lines.append(
+                    f"L{node.lineno}-L{node.end_lineno}: class {name}"
+                    f"({', '.join(bases)})"
+                )
+                for sub_node in node.body:
+                    if (
+                        isinstance(sub_node, ast.AnnAssign)
+                        and isinstance(sub_node.target, ast.Name)
+                        and not sub_node.target.id.startswith("_")
+                    ):
+                        try:
+                            annotation_text = ast.unparse(sub_node.annotation)
+                        except Exception:  # pragma: no cover - unparse fallback
+                            annotation_text = "<unparseable>"
+                        lines.append(
+                            f"    {sub_node.target.id}: {annotation_text}"
+                        )
+                    elif isinstance(sub_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        sub_name = sub_node.name
+                        if sub_name.startswith("_") and sub_name != "__init__":
+                            continue
+                        prefix = (
+                            "async " if isinstance(sub_node, ast.AsyncFunctionDef) else ""
+                        )
+                        lines.append(
+                            f"  L{sub_node.lineno}-L{sub_node.end_lineno}: "
+                            f"{prefix}def {sub_name}({_ro_public_args(sub_node)})"
+                            f"{_ro_public_return(sub_node)}"
+                        )
+        if not lines:
+            continue
+        chunk = f"--- {path} ({line_count} lines)\n" + "\n".join(lines)
+        remaining = max_chars - total_chars
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining].rstrip())
+            total_chars = max_chars
+            break
+        chunks.append(chunk)
+        total_chars += len(chunk)
+    if not chunks:
+        return ""
+    return "[READ-ONLY PUBLIC SIGNATURES]\n" + "\n".join(chunks) + "\n"
 
 
 _LINE_RANGE_PATTERNS = (

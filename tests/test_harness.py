@@ -4477,7 +4477,7 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             self.assertEqual(len(seen_repair_tasks), 1)
             repair_task = seen_repair_tasks[0]
             self.assertEqual(repair_task['max_steps'], 8)
-            self.assertEqual(repair_task['timeout_seconds'], 75)
+            self.assertEqual(repair_task['timeout_seconds'], 120)
             self.assertIn('Apply the minimal targeted edit directly to fix the failure above', repair_task['prompt'])
             self.assertIn('[CURRENT_PATCH]', repair_task['prompt'])
             self.assertIn('+VALUE = 1', repair_task['prompt'])
@@ -5080,6 +5080,15 @@ class TestLastStepPatchSalvage(TestSandboxExecutionAndFinopsSettlement):
             {'files': ['a.py', 'b.py'], 'timeout_seconds': 300}), 120)
         self.assertEqual(compute_repair_timeout_seconds(
             {'files': ['a.py', 'b.py', 'c.py'], 'timeout_seconds': 300}), 150)
+        # elapsed_seconds decouples the repair window from remaining task budget
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py'], 'timeout_seconds': 240}, elapsed_seconds=200), 90)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py', 'b.py'], 'timeout_seconds': 240}, elapsed_seconds=200), 120)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py'], 'timeout_seconds': 60}, elapsed_seconds=50), 60)
+        self.assertEqual(compute_repair_timeout_seconds(
+            {'files': ['a.py'], 'timeout_seconds': 240}, elapsed_seconds=420), 0)
 
     def test_micro_repair_adaptive_steps(self):
         from unittest import mock

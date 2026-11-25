@@ -65,6 +65,7 @@ from .finops import (
 )
 from .guards import (audit_patch_for_reward_hacking,
                      build_cross_file_symbol_context, build_file_skeletons,
+                     build_read_only_public_skeletons,
                      build_preloaded_file_excerpts, extract_compact_test_failure,
                      extract_failing_test_excerpts,
                      extract_runtime_assertion_locals)
@@ -188,8 +189,28 @@ def _has_module_in_dir(directory: Path, module_name: str) -> bool:
     return (directory / f'{module_name}.py').is_file() or (directory / module_name / '__init__.py').is_file()
 
 
-def build_test_env_overrides(task: dict) -> dict[str, str]:
-    """Build PYTHONPATH env overrides for test/validation runs."""
+def _find_git_repo_root(directory: str):
+    """Walk up from directory to the nearest enclosing git repo root, stopping at protected ancestors."""
+    try:
+        cand = Path(directory).resolve()
+    except OSError:
+        return None
+    excluded = [
+        Path('/').resolve(),
+        Path('/Users').resolve(),
+        Path('/tmp').resolve(),
+        Path.home().resolve(),
+    ]
+    while True:
+        if (cand / '.git').exists() and cand not in excluded:
+            return str(cand)
+        if cand in excluded or cand.parent == cand:
+            return None
+        cand = cand.parent
+
+
+def build_test_env_overrides(task: dict, *, run_dir: Path | None = None) -> dict[str, str]:
+    """Build PYTHONPATH (and optional isolation-sandbox) env overrides for test runs."""
     directory = str(task.get('directory') or '')
     base = Path(directory) if directory else None
 
@@ -259,7 +280,26 @@ def build_test_env_overrides(task: dict) -> dict[str, str]:
         if norm not in seen:
             seen.add(norm)
             merged.append(entry)
-    return {'PYTHONPATH': os.pathsep.join(merged)} if merged else {}
+    env: dict[str, str] = {'PYTHONPATH': os.pathsep.join(merged)} if merged else {}
+
+    if run_dir is not None:
+        sb_env = stage_isolation_sandbox(run_dir)
+        sb_tmp = Path(sb_env['TMPDIR'])
+        (sb_tmp / 'dbt_logs').mkdir(parents=True, exist_ok=True)
+        (sb_tmp / 'dbt_target').mkdir(parents=True, exist_ok=True)
+        (sb_tmp / 'pytest_cache').mkdir(parents=True, exist_ok=True)
+        env.setdefault('TMPDIR', str(sb_tmp))
+        env.setdefault('TEMP', str(sb_tmp))
+        env.setdefault('TMP', str(sb_tmp))
+        env.setdefault('DBT_LOG_PATH', str(sb_tmp / 'dbt_logs'))
+        env.setdefault('DBT_TARGET_PATH', str(sb_tmp / 'dbt_target'))
+        if any('pytest' in str(arg) for arg in (task.get('test_argv') or ())):
+            pytest_cache = str(sb_tmp / 'pytest_cache')
+            existing = os.environ.get('PYTEST_ADDOPTS', '') or env.get('PYTEST_ADDOPTS', '')
+            if 'cache_dir' not in existing:
+                addopts = (existing + ' ' if existing else '') + f'-o cache_dir={pytest_cache}'
+                env['PYTEST_ADDOPTS'] = addopts
+    return env
 
 
 def _usage_has_required_positional(help_output: str) -> bool:
@@ -893,12 +933,59 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
     result = [str(Path(f).resolve()) for f in existing_read_only]
     seen = set(editable_set) | set(result)
     dir_path = Path(directory).resolve() if directory else None
+    repo_root = _find_git_repo_root(directory) if directory else None
+    roots = []
+    if dir_path is not None:
+        roots.append(dir_path)
+    if repo_root:
+        roots.append(Path(repo_root).resolve())
+    known_roots = roots if roots else [Path.cwd()]
+    unknown_roots = [r for r in known_roots if not str(r).startswith(('/', 'C:\\'))]
+    roots = unknown_roots or known_roots
+
+    # (a) Explicitly mentioned file paths in the prompt (existing files anywhere under the workspace roots).
+    if len(result) < max_files and prompt:
+        for raw in re.findall(r'[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+', prompt):
+            cand_raw = Path(raw.replace('\\', '/'))
+            cands = [cand_raw] if cand_raw.is_absolute() else [r / cand_raw for r in roots]
+            for cand in cands:
+                try:
+                    resolved = cand.resolve()
+                except OSError:
+                    continue
+                if str(resolved) in seen or not resolved.is_file():
+                    continue
+                if not any(resolved == r or resolved.is_relative_to(r) for r in roots):
+                    continue
+                if _is_sensitive_companion_path(resolved):
+                    continue
+                seen.add(str(resolved))
+                result.append(str(resolved))
+                break
+            if len(result) >= max_files:
+                break
     for p in editable_paths:
         if len(result) >= max_files:
             break
-        if not (p.suffix == '.py' and p.name.startswith('test_') and len(p.name) > len('test_.py')):
+        if not (p.suffix == '.py' and len(p.name) > len('test_.py')
+                and (p.name.startswith('test_') or p.name.endswith('_test.py'))):
             continue
-        mod_name = p.name[len('test_'):]
+        if p.name.startswith('test_'):
+            mod_name = p.name[len('test_'):]
+        else:
+            mod_name = p.name[:-len('_test.py')] + '.py'
+
+        def _accept_companion(resolved: Path) -> bool:
+            if str(resolved) in seen or not resolved.is_file():
+                return False
+            if not any(resolved == r or resolved.is_relative_to(r) for r in roots):
+                return False
+            if _is_sensitive_companion_path(resolved):
+                return False
+            seen.add(str(resolved))
+            result.append(str(resolved))
+            return True
+
         candidates = []
         if p.parent.name in ('tests', 'test'):
             candidates.append(p.parent.parent / mod_name)
@@ -906,6 +993,7 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                 candidates.append(dir_path / mod_name)
                 candidates.append(dir_path / 'src' / mod_name)
         candidates.append(p.parent / mod_name)
+        matched_direct = False
         for cand in candidates:
             if len(result) >= max_files:
                 break
@@ -913,14 +1001,35 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                 resolved = cand.resolve()
             except OSError:
                 continue
-            if str(resolved) in seen or not resolved.is_file():
-                continue
-            if dir_path is not None and not resolved.is_relative_to(dir_path):
-                continue
-            if _is_sensitive_companion_path(resolved):
-                continue
-            seen.add(str(resolved))
-            result.append(str(resolved))
+            if _accept_companion(resolved):
+                matched_direct = True
+        if matched_direct or len(result) >= max_files:
+            continue
+        # Bounded depth<=2 scan under the search bases for a module named mod_name.
+        search_bases = [
+            b for b in ([p.parent.parent] if p.parent.name in ('tests', 'test') else [])
+            + ([dir_path] if dir_path else [])
+            if b.is_dir()
+        ]
+        skip_names = ('__pycache__', 'node_modules', 'venv', '.venv', 'tests', 'test', 'build', 'dist')
+        for base in search_bases:
+            if len(result) >= max_files:
+                break
+            for root, dirs, _ in sorted(os.walk(base)):
+                rel = Path(root).relative_to(base)
+                if len(rel.parts) > 2:
+                    dirs[:] = []
+                    continue
+                dirs[:] = sorted(
+                    d for d in dirs if not d.startswith('.') and d not in skip_names)
+                try:
+                    resolved = (Path(root) / mod_name).resolve()
+                except OSError:
+                    continue
+                if _accept_companion(resolved):
+                    break
+            if len(result) >= max_files:
+                break
     # H-79: add existing conftest.py ancestors for test-file targets.
     if len(result) < max_files:
         for p in editable_paths:
@@ -961,16 +1070,25 @@ def infer_read_only_companion_files(files, *, directory='', existing_read_only=(
                 dbt_cache.append(_build_dbt_models_index(dir_path, editable_paths))
             return dbt_cache[0]
 
+        graph_root = Path(repo_root).resolve() if repo_root else dir_path
         hop1: set[Path] = set()
         incoming: dict[Path, set[Path]] = {}
         for src in editable_paths:
-            for tgt in _local_dependency_edges(src, dir_path, _get_dbt_index):
+            for tgt in _local_dependency_edges(src, graph_root, _get_dbt_index):
                 if str(tgt) not in editable_set:
                     hop1.add(tgt)
                     incoming.setdefault(tgt, set()).add(src)
+        # For brand-new or test-file editables, also traverse the dependency
+        # edges of the inferred companion modules so imported contracts are
+        # pulled in via hop2.
+        if any(not p.is_file() or p.name.startswith('test_') or p.name.endswith('_test.py')
+               for p in editable_paths):
+            hop1.update(
+                Path(r) for r in result
+                if r.endswith('.py') and Path(r).is_file())
         hop2: set[Path] = set()
         for h1 in sorted(hop1):
-            for tgt in _local_dependency_edges(h1, dir_path, _get_dbt_index):
+            for tgt in _local_dependency_edges(h1, graph_root, _get_dbt_index):
                 if str(tgt) not in editable_set:
                     if tgt not in hop1:
                         hop2.add(tgt)
@@ -1149,6 +1267,9 @@ def validate_task(raw):
     t.setdefault('auto_micro_repair', True)
     if not isinstance(t['auto_micro_repair'], bool):
         raise GuardError('invalid_auto_micro_repair_flag')
+    t.setdefault('max_repair_rounds', 2)
+    if type(t['max_repair_rounds']) is not int or not 0 <= t['max_repair_rounds'] <= 3:
+        raise GuardError('invalid_max_repair_rounds')
     default_sb = 'test_only' if is_seatbelt_available() else 'off'
     t.setdefault('os_sandbox', os.environ.get('HARNESS_OS_SANDBOX', default_sb))
     if t['os_sandbox'] not in ('off', 'test_only', 'strict'):
@@ -1955,10 +2076,10 @@ def build_seatbelt_profile(
         if canon in seen_bytecode_roots:
             continue
         seen_bytecode_roots.add(canon)
-        quoted_regex = _sbpl_quote(re.escape(canon))
+        quoted_regex = re.escape(canon).replace('"', '\\"')
         lines.append(
             '(allow file-write* (regex #"^' + quoted_regex
-            + '/(.+/)?(__pycache__|\\.pytest_cache|\\.hypothesis|\\.ruff_cache)(/.*)?$"))'
+            + '/(.+/)?((__pycache__|\\.pytest_cache|\\.hypothesis|\\.ruff_cache|\\.mypy_cache|logs|generated)(/.*)?|pytest-cache-files-[^/]+(/.*)?)$"))'
         )
 
     denied_candidates = list(DEFAULT_SEATBELT_DENIED_READ_PATHS)
@@ -1970,8 +2091,6 @@ def build_seatbelt_profile(
     for raw_path in denied_candidates:
         canon = os.path.realpath(os.path.expanduser(str(raw_path)))
         if canon in seen_denied:
-            continue
-        if any(canon == w or canon.startswith(w + os.sep) for w in canonical_writable):
             continue
         seen_denied.add(canon)
         lines.append(f'(deny file-read* (subpath "{_sbpl_quote(canon)}"))')
@@ -2003,12 +2122,16 @@ def _stage_test_seatbelt_profile(task: dict, run_dir: Path) -> Path:
         run_dir,
         *_SEATBELT_SYSTEM_WRITABLE_PATHS,
     ]
+    cache_roots = [task['directory']]
+    repo_root = _find_git_repo_root(task['directory'])
+    if repo_root and Path(repo_root).resolve() != Path(task['directory']).resolve():
+        cache_roots.append(repo_root)
     if task.get('worktree'):
         writable.append(task['directory'])
         profile = build_seatbelt_profile(
             writable_paths=writable,
             allow_localhost_only=True,
-            bytecode_cache_roots=[task['directory']],
+            bytecode_cache_roots=cache_roots,
         )
     else:
         writable.extend(task.get('files', ()))
@@ -2019,7 +2142,7 @@ def _stage_test_seatbelt_profile(task: dict, run_dir: Path) -> Path:
         profile = build_seatbelt_profile(
             writable_paths=writable,
             allow_localhost_only=True,
-            bytecode_cache_roots=[task['directory']],
+            bytecode_cache_roots=cache_roots,
         )
     profile_path = Path(run_dir) / 'seatbelt-test.sb'
     profile_path.write_text(profile, encoding='utf-8')
@@ -2087,23 +2210,30 @@ def config_for(task, *, base_url=None, run_dir=None):
                    {'action': 'read', 'resource': '/tmp/hb-*/**', 'effect': 'allow'}]
     task_dir = task['directory']
     # Allow reads across the task directory (bounded by sensitive-path denies below).
-    permissions += [{'action': 'read', 'resource': task_dir, 'effect': 'allow'},
-                    {'action': 'read', 'resource': f'{task_dir}/**', 'effect': 'allow'}]
+    repo_root = _find_git_repo_root(task_dir)
+    read_roots = [task_dir]
+    if repo_root and Path(repo_root).resolve() != Path(task_dir).resolve():
+        read_roots.append(repo_root)
+    for root in read_roots:
+        permissions += [{'action': 'read', 'resource': root, 'effect': 'allow'},
+                        {'action': 'read', 'resource': f'{root}/**', 'effect': 'allow'}]
     # Deny secrets and credentials under the task directory (last matching rule wins).
     sensitive_patterns = ('.env', '.env.*', '*.pem', '*.key', '*credentials*', '*secret*')
     permissions += [{'action': action,
                      'resource': pattern,
                      'effect': 'deny'}
+                    for root in read_roots
                     for p in sensitive_patterns
-                    for pattern in (f'{task_dir}/{p}', f'{task_dir}/**/{p}')
+                    for pattern in (f'{root}/{p}', f'{root}/**/{p}')
                     for action in ('read', 'edit')]
     # Re-allow safe env templates that would otherwise match the deny patterns.
     safe_env_patterns = ('.env.example', '.env.sample', '.env.template')
     permissions += [{'action': 'read',
                      'resource': pattern,
                      'effect': 'allow'}
+                    for root in read_roots
                     for p in safe_env_patterns
-                    for pattern in (f'{task_dir}/{p}', f'{task_dir}/**/{p}')]
+                    for pattern in (f'{root}/{p}', f'{root}/**/{p}')]
     actions = (
         ('read',)
         if task['mode'] == 'patch'
@@ -2255,6 +2385,10 @@ def model_run(cli, db, task, run_dir, result, budget, *, proxy=None, started_ref
             read_only_files=task.get('read_only_files', []))
     else:
         excerpts = ''
+    if ('[CURRENT_PATCH]' not in task['prompt'] and task.get('read_only_files')
+            and all(Path(f).name.startswith('test_') or Path(f).name.endswith('_test.py')
+                    for f in task['files'])):
+        skeletons += build_read_only_public_skeletons(task['read_only_files'], excerpts=excerpts)
     symbol_context = ''
     if '[CURRENT_PATCH]' not in task['prompt'] and task.get('include_symbol_context', True):
         symbol_context = build_cross_file_symbol_context(
@@ -2790,14 +2924,18 @@ def compute_repair_max_steps(task: dict) -> int:
 
 def compute_repair_timeout_seconds(task: dict, elapsed_seconds: float | None = None) -> int:
     """Bounded proportional wall-clock timeout for micro_repair: 15s per
-    repair step (floor 45s), capped at the task's own timeout and at 75s
-    when the primary run already consumed part of the wall-clock budget."""
+    repair step (floor 45s), capped at the task's own timeout. When the
+    primary run already consumed wall-clock budget, the repair round gets
+    an independent 90-120s window (still capped by the task timeout), and
+    returns 0 once a global fuse (task timeout + 180s) is exceeded."""
     repair_steps = compute_repair_max_steps(task)
-    base = min(int(task.get('timeout_seconds', 180)), max(45, 15 * repair_steps))
+    task_timeout = int(task.get('timeout_seconds', 180))
+    base = min(task_timeout, max(45, 15 * repair_steps))
     if elapsed_seconds is None:
         return base
-    remaining = int(task.get('timeout_seconds', 180) - float(elapsed_seconds))
-    return 0 if remaining < 25 else min(base, 75, remaining)
+    if float(elapsed_seconds) >= task_timeout + 180:
+        return 0
+    return min(task_timeout, max(90, base), 120)
 
 
 def should_auto_escalate(raw_task: dict) -> bool:
@@ -3488,7 +3626,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                         result['status'] = 'patch_ready_review_required'
                     else:
                         validation_attempted = True
-                        test_env = build_test_env_overrides(task)
+                        test_env = build_test_env_overrides(task, run_dir=run_dir)
                         result['test_return_code'] = execute(_seatbelt_test_argv(task, run_dir, task['test_argv']),
                                                             task['directory'],
                                                             task['test_timeout_seconds'], run_dir / 'test.log',
@@ -3537,10 +3675,12 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 else (result.get('observed_cost')
                                       if salvage_candidate in REPAIRABLE_SALVAGE_REASONS else None)
                             )
+                            max_repair_rounds = int(task.get('max_repair_rounds', 2))
                             planned_repair_timeout = compute_repair_timeout_seconds(
                                 task, elapsed_seconds=time.monotonic() - started)
                             repair_eligible = (
                                 planned_repair_timeout >= 25
+                                and max_repair_rounds >= 1
                                 and task.get('auto_micro_repair', True)
                                 and task['mode'] == 'model'
                                 and not result.get('micro_repair_attempted')
@@ -3563,79 +3703,87 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                             if repair_eligible:
                                 if salvage_candidate is not None:
                                     event(run_dir, 'salvage_micro_repair_started', reason=salvage_candidate)
-                                repair_max_steps = compute_repair_max_steps(task)
-                                active_max_steps[0] = repair_max_steps
-                                repair_timeout = planned_repair_timeout
-                                active_timeout_seconds[0] = repair_timeout
-                                _capture_assertion_locals(task, run_dir, test_env=test_env)
-                                repair_task = dict(
-                                    task,
-                                    max_steps=repair_max_steps,
-                                    timeout_seconds=repair_timeout,
-                                    prompt=build_micro_repair_prompt(task, run_dir, originals),
-                                )
-                                primary_steps = result.get('steps', 0)
-                                primary_cost = result.get('cost')
-                                primary_observed = result.get('observed_cost')
-                                primary_sid = result['session_id']
-                                sid2 = 'ses_' + uuid.uuid4().hex[:26]
-                                result['session_id'] = sid2
-                                result['micro_repair_session_id'] = sid2
-                                result['micro_repair_attempted'] = True
                                 try:
                                     if (run_dir / 'test.log').is_file():
                                         shutil.copy2(run_dir / 'test.log',
                                                      run_dir / 'test_before_repair.log')
                                 except OSError:
                                     pass
-                                hashes_before_repair = _fh(task['files'])
-                                first_test_log_text = ''
                                 repaired_files: list[str] = []
-                                if proxy is not None and hasattr(proxy, 'reset_session'):
-                                    proxy.reset_session()
-                                try:
-                                    event(run_dir, 'micro_repair_started', session_id=sid2)
+                                first_test_log_text = ''
+                                for repair_round in range(1, max_repair_rounds + 1):
+                                    repair_max_steps = compute_repair_max_steps(task)
+                                    active_max_steps[0] = repair_max_steps
+                                    repair_timeout = planned_repair_timeout
+                                    active_timeout_seconds[0] = repair_timeout
+                                    _capture_assertion_locals(task, run_dir, test_env=test_env)
+                                    repair_task = dict(
+                                        task,
+                                        max_steps=repair_max_steps,
+                                        timeout_seconds=repair_timeout,
+                                        prompt=build_micro_repair_prompt(task, run_dir, originals),
+                                    )
+                                    primary_steps = result.get('steps', 0)
+                                    primary_cost = result.get('cost')
+                                    primary_observed = result.get('observed_cost')
+                                    primary_sid = result['session_id']
+                                    sid2 = 'ses_' + uuid.uuid4().hex[:26]
+                                    result['session_id'] = sid2
+                                    result['micro_repair_session_id'] = sid2
+                                    result['micro_repair_attempted'] = True
+                                    result['micro_repair_rounds'] = repair_round
+                                    result['steps'] = 0
+                                    result['cost'] = None
+                                    result['observed_cost'] = None
+                                    hashes_before_repair = _fh(task['files'])
+                                    if proxy is not None and hasattr(proxy, 'reset_session'):
+                                        proxy.reset_session()
                                     try:
-                                        report_herdr_task(task['task_id'], 'working',
-                                                          model=task.get('model'),
-                                                          step=result.get('steps', 0),
-                                                          max_steps=task['max_steps'],
-                                                          cost=result.get('cost') if result.get('cost') is not None else result.get('observed_cost'),
-                                                          budget=budget, phase='micro_repair',
-                                                          session_id=sid2)
-                                    except Exception:
-                                        pass
-                                    try:
-                                        model_run(cli, db, repair_task, run_dir, result,
-                                                  max(0.0, budget - (known_spend or 0.0)),
-                                                  proxy=proxy, started_ref=started_ref)
-                                    except GuardError as exc:
-                                        if (str(exc) in SALVAGEABLE_BLOCK_REASONS
-                                                and _fh(task['files']) != hashes_before_repair):
-                                            capture_files(run_dir, tracked)
-                                            _snapshot_files_for_feedback(run_dir, task['files'], 'after')
-                                            repair_salvage_reason = str(exc)
-                                            event(run_dir, 'micro_repair_salvage_started',
-                                                  reason=repair_salvage_reason)
-                                        else:
-                                            if salvage_candidate is not None:
-                                                raise GuardError(salvage_candidate) from None
-                                            raise
-                                finally:
-                                    result['steps'] = primary_steps + (result.get('steps') or 0)
-                                    repair_cost = result.get('cost')
-                                    result['cost'] = (None if primary_cost is None or repair_cost is None
-                                                      else primary_cost + repair_cost)
-                                    repair_observed = result.get('observed_cost')
-                                    result['observed_cost'] = (None if primary_observed is None
-                                                               or repair_observed is None
-                                                               else primary_observed + repair_observed)
-                                    result['session_id'] = primary_sid
-                                if _fh(task['files']) == hashes_before_repair:
-                                    event(run_dir, 'micro_repair_no_change')
-                                else:
-                                    repaired_files = [f for f in task['files']
-                                                      if _fh([f]).get(f) != hashes_before_repair.get(f)]
+                                        event(run_dir, 'micro_repair_started', session_id=sid2, round=repair_round)
+                                        try:
+                                            report_herdr_task(task['task_id'], 'working',
+                                                              model=task.get('model'),
+                                                              step=0,
+                                                              max_steps=task['max_steps'],
+                                                              cost=None,
+                                                              budget=budget, phase='micro_repair',
+                                                              session_id=sid2)
+                                        except Exception:
+                                            pass
+                                        try:
+                                            model_run(cli, db, repair_task, run_dir, result,
+                                                      max(0.0, budget - (known_spend or 0.0)),
+                                                      proxy=proxy, started_ref=started_ref)
+                                        except GuardError as exc:
+                                            if (str(exc) in SALVAGEABLE_BLOCK_REASONS
+                                                    and _fh(task['files']) != hashes_before_repair):
+                                                capture_files(run_dir, tracked)
+                                                _snapshot_files_for_feedback(run_dir, task['files'], 'after')
+                                                repair_salvage_reason = str(exc)
+                                                event(run_dir, 'micro_repair_salvage_started',
+                                                      reason=repair_salvage_reason)
+                                            else:
+                                                if salvage_candidate is not None:
+                                                    raise GuardError(salvage_candidate) from None
+                                                raise
+                                    finally:
+                                        result['steps'] = primary_steps + (result.get('steps') or 0)
+                                        repair_cost = result.get('cost')
+                                        if repair_cost is not None:
+                                            result['cost'] = (None if primary_cost is None
+                                                              else primary_cost + repair_cost)
+                                        repair_observed = result.get('observed_cost')
+                                        if repair_observed is not None:
+                                            result['observed_cost'] = (None if primary_observed is None
+                                                                       else primary_observed + repair_observed)
+                                        result['session_id'] = primary_sid
+                                    if _fh(task['files']) == hashes_before_repair:
+                                        event(run_dir, 'micro_repair_no_change')
+                                        break
+                                    for f in task['files']:
+                                        if (_fh([f]).get(f) != hashes_before_repair.get(f)
+                                                and f not in repaired_files):
+                                            repaired_files.append(f)
                                     # H-56: two-stage fast-fail verification. First
                                     # re-run only the previously failed nodeids; if
                                     # any still fail, skip the full suite.
@@ -3647,7 +3795,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                     targeted_argv = build_targeted_pytest_argv(
                                         task['test_argv'], first_test_log_text)
                                     if targeted_argv is not None:
-                                        test_env = build_test_env_overrides(task)
+                                        test_env = build_test_env_overrides(task, run_dir=run_dir)
                                         rc_fast = execute(_seatbelt_test_argv(task, run_dir, targeted_argv),
                                                           task['directory'],
                                                           min(30, task['test_timeout_seconds']),
@@ -3668,7 +3816,30 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                             _seatbelt_test_argv(task, run_dir, task['test_argv']),
                                             task['directory'],
                                             task['test_timeout_seconds'], run_dir / 'test.log',
-                                            env_overrides=build_test_env_overrides(task))
+                                            env_overrides=build_test_env_overrides(task, run_dir=run_dir))
+                                    if repair_round == 1 and (run_dir / 'test.log').is_file():
+                                        try:
+                                            shutil.copy2(run_dir / 'test.log',
+                                                         run_dir / 'test_after_repair_1.log')
+                                        except OSError:
+                                            pass
+                                    if result['test_return_code'] == 0:
+                                        break
+                                    if result['test_return_code'] == 124:
+                                        break
+                                    if salvage_candidate is not None or repair_salvage_reason is not None:
+                                        break
+                                    if repair_round < max_repair_rounds:
+                                        known_spend = (
+                                            result.get('cost') if result.get('cost') is not None
+                                            else result.get('observed_cost')
+                                        )
+                                        planned_repair_timeout = compute_repair_timeout_seconds(
+                                            task, elapsed_seconds=time.monotonic() - started)
+                                        if (known_spend is None
+                                                or known_spend > min(budget * 0.8, 0.08)
+                                                or planned_repair_timeout < 25):
+                                            break
                             if result['test_return_code']:
                                 raise GuardError(salvage_candidate or repair_salvage_reason or 'validation_failed')
                             post_critic_issues = _evaluate_diff_critic()
@@ -3744,7 +3915,7 @@ def run_task(task_path, *, cli=None, db=None, state=None, check=False, upstream_
                                 _seatbelt_test_argv(task, run_dir, task['test_argv']),
                                 task['directory'],
                                 task['test_timeout_seconds'], run_dir / 'test.log',
-                                env_overrides=build_test_env_overrides(task))
+                                env_overrides=build_test_env_overrides(task, run_dir=run_dir))
                         except (GuardError, OSError) as exc:
                             result['validation_error'] = str(exc) if isinstance(exc, GuardError) else type(exc).__name__
                 except OSError:
