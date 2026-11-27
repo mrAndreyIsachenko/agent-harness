@@ -8426,6 +8426,31 @@ class TestPodCLI(unittest.TestCase):
         self.assertEqual(rc, 0)
         sync.assert_not_called()
 
+    def test_pod_wait_exits_fast_when_vm_stops_and_ssh_unreachable(self):
+        import subprocess
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        out = io.StringIO()
+        ssh_side_effects = [
+            SimpleNamespace(stdout=json.dumps({'status': 'RUNNING'}), returncode=0),
+            SimpleNamespace(stdout='', returncode=255),
+            subprocess.TimeoutExpired(cmd=['ssh'], timeout=15),
+            SimpleNamespace(stdout='', returncode=255),
+        ]
+        with contextlib.redirect_stdout(out):
+            with patch.object(self.pod, '_ssh', side_effect=ssh_side_effects) as ssh_mock, \
+                    patch.object(self.pod, 'sync_pods') as sync, \
+                    patch.object(self.pod.time, 'sleep'):
+                rc = self.pod.wait(
+                    'u@h', '/work', max_wait_sec=36000, local_dir='/nonexistent',
+                    max_unreachable_polls=3,
+                )
+        self.assertEqual(rc, 0)
+        self.assertEqual(ssh_mock.call_count, 4)
+        self.assertIn('unreachable (3 consecutive SSH failures; VM stopped)', out.getvalue())
+        sync.assert_not_called()
+
     def test_cli_pod_preflight_dispatch(self):
         from unittest.mock import patch
         from harness import cli as harness_cli

@@ -22,6 +22,7 @@ from .herdr import report_herdr_task
 __all__ = ["SSH_OPTS", "preflight", "sync_pods", "launch", "wait"]
 
 SSH_OPTS = (
+    "-o", "ConnectTimeout=10",
     "-o", "ServerAliveInterval=30",
     "-o", "ServerAliveCountMax=3",
     "-o", "BatchMode=yes",
@@ -298,17 +299,57 @@ def launch(host: str, workdir: str, session: str, worker_cmd: list[str], *,
 
 def wait(host: str, workdir: str, *, max_wait_sec: int = 180,
          poll_interval_sec: int = 15, local_dir: str | None = None,
-         paths: tuple[str, ...] = ("results", "releases")) -> int:
-    """Blocking status monitor; returns 0 unless the run ends in ERROR."""
+         paths: tuple[str, ...] = ("results", "releases"),
+         max_unreachable_polls: int = 4) -> int:
+    """Blocking status monitor; returns 0 unless the run ends in ERROR.
+
+    Exits early if the remote VM stops/shuts down (``max_unreachable_polls``
+    consecutive SSH transport failures with returncode 255 or timeout) so
+    callers never hang for hours pinging a stopped instance.
+    """
     deadline = time.monotonic() + max_wait_sec
     last_status = None
     printed = 0
+    unreachable_streak = 0
     while True:
+        ssh_unreachable = False
         try:
-            result = _ssh(host, f"cat {workdir}/{STATUS_FILE} 2>/dev/null", check=False)
+            result = _ssh(host, f"cat {workdir}/{STATUS_FILE} 2>/dev/null",
+                          check=False, timeout=15)
             raw = result.stdout.strip()
+            if getattr(result, "returncode", 0) == 255 and not raw:
+                ssh_unreachable = True
         except (subprocess.TimeoutExpired, OSError):
             raw = ""
+            ssh_unreachable = True
+
+        if ssh_unreachable:
+            unreachable_streak += 1
+            if max_unreachable_polls > 0 and unreachable_streak >= max_unreachable_polls:
+                local_status = None
+                if local_dir:
+                    local_sf = os.path.join(local_dir, STATUS_FILE)
+                    try:
+                        with open(local_sf, encoding="utf-8") as fh:
+                            local_status = json.loads(fh.read()).get("status")
+                    except (OSError, ValueError, AttributeError):
+                        local_status = None
+                final = local_status if local_status in ("DONE", "ERROR", "CHECKPOINT") else "HOST_STOPPED"
+                print(f"pod wait: host {host} unreachable ({unreachable_streak} consecutive "
+                      f"SSH failures; VM stopped) — exiting with status={final}")
+                try:
+                    report_herdr_task(
+                        f'pod:{host}',
+                        'error' if final == 'ERROR' else 'done',
+                        phase=f'pod {final}',
+                        reason='pod_error' if final == 'ERROR' else None,
+                    )
+                except Exception:
+                    pass
+                return 1 if final == "ERROR" else 0
+        else:
+            unreachable_streak = 0
+
         status = None
         if raw:
             try:
