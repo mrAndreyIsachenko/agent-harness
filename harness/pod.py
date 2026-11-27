@@ -19,7 +19,7 @@ import time
 
 from .herdr import report_herdr_task
 
-__all__ = ["SSH_OPTS", "preflight", "sync_pods", "launch", "wait"]
+__all__ = ["SSH_OPTS", "preflight", "sync_pods", "launch", "wait", "logs"]
 
 SSH_OPTS = (
     "-o", "ConnectTimeout=10",
@@ -119,12 +119,16 @@ def _rsync_once(host: str, remote_dir: str, local_dir: str,
     for rel in paths:
         result = subprocess.run(
             ["rsync", "-az", "--partial",
+             "--exclude", "external_evals/*/raw/*/samples_*.jsonl",
              f"{host}:{remote_dir.rstrip('/')}/{rel}/", os.path.join(local_dir, rel) + "/"],
             capture_output=True, text=True,
         )
         if result.returncode != 0:
+            err = result.stderr.strip()
+            if result.returncode == 23 and "No such file or directory" in err:
+                continue
             rc = result.returncode
-            print(f"pod sync: rsync {rel} failed: {result.stderr.strip()}")
+            print(f"pod sync: rsync {rel} failed: {err}")
         else:
             print(f"pod sync: {rel} synced")
     return rc
@@ -236,9 +240,13 @@ def build_supervisor_script(workdir: str, worker_cmd: list[str], *,
     marker_re = "|".join(ENGINE_MARKERS)
     checkpoint_hook = on_checkpoint or "true"
     return f"""cd {shlex.quote(workdir)} || exit 1
-export UV_NO_SYNC=1 SKIP_UV_SYNC=1
-mkdir -p results
-status() {{ printf '{{"status": "%s"}}\\n' "$1" > {STATUS_FILE}; }}
+export PYTHONUNBUFFERED=1 UV_NO_SYNC=1 SKIP_UV_SYNC=1
+mkdir -p results results/logs
+if [ -s results/worker.log ]; then
+  cp -f results/worker.log "results/logs/worker_$(date -u +%Y%m%dT%H%M%SZ).log" 2>/dev/null || true
+fi
+: > results/worker.log
+status() {{ printf '{{"status": "%s", "updated_at": "%s"}}\\n' "$1" "$(date -u +%FT%TZ)" > {STATUS_FILE}; }}
 # Staggered start: wait until a peer engine has sized its KV cache or free VRAM
 # is high enough for this worker.
 i=0
@@ -253,8 +261,10 @@ done
 retries=0
 while true; do
   status RUNNING
-  {worker} > results/worker.log 2>&1
+  printf '\\n[supervisor] === attempt %d/%d START %s ===\\n' "$((retries + 1))" "$(( {max_retries} + 1 ))" "$(date -u +%FT%TZ)" >> results/worker.log
+  {worker} >> results/worker.log 2>&1
   rc=$?
+  printf '\\n[supervisor] === attempt %d exit_code=%d %s ===\\n' "$((retries + 1))" "$rc" "$(date -u +%FT%TZ)" >> results/worker.log
   if [ $rc -eq 0 ]; then status DONE; break; fi
   retries=$((retries + 1))
   if [ $retries -gt {max_retries} ]; then status ERROR; break; fi
@@ -284,17 +294,52 @@ def launch(host: str, workdir: str, session: str, worker_cmd: list[str], *,
         on_checkpoint=on_checkpoint,
         max_retries=max_retries,
     )
+    quoted_session = shlex.quote(session)
+    launch_cmd = (
+        f"tmux kill-session -t {quoted_session} 2>/dev/null || true; "
+        f"tmux new-session -d -s {quoted_session} {shlex.quote(script)}"
+    )
     try:
-        _ssh(host, f"tmux new-session -d -s {shlex.quote(session)} {shlex.quote(script)}",
-             timeout=120)
+        _ssh(host, launch_cmd, timeout=120)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         print(f"pod launch: tmux session failed: {exc}")
         return 1
     print(f"pod launch: session {session!r} started on {host} in {workdir} "
-          f"(stagger {stagger_vram_mib}MiB, retries {max_retries})")
+          f"(stagger {stagger_vram_mib}MiB, retries {max_retries})", flush=True)
     if on_checkpoint:
-        print(f"pod launch: on-checkpoint hook: {on_checkpoint}")
+        print(f"pod launch: on-checkpoint hook: {on_checkpoint}", flush=True)
     return 0
+
+
+def logs(host: str, workdir: str, *, lines: int = 60, follow: bool = False) -> int:
+    """Show or follow live worker + lm-eval logs and GPU telemetry on the pod."""
+    wdir = shlex.quote(workdir)
+    header_cmd = (
+        f"cd {wdir} 2>/dev/null || true; "
+        f"echo '=== POD STATUS ==='; cat {STATUS_FILE} 2>/dev/null || echo '(no status file)'; "
+        f"echo '=== GPU & VRAM ==='; "
+        f"nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu "
+        f"--format=csv,noheader 2>/dev/null || echo '(nvidia-smi unavailable)'; "
+        f"echo '=== DISK ==='; df -h {wdir} 2>/dev/null | tail -n 2 || true; "
+        f"echo '=== WORKER LOG (last {int(lines)} lines) ==='; "
+        f"tail -n {int(lines)} results/worker.log 2>/dev/null || echo '(no results/worker.log yet)'; "
+        f"LIVE_EVAL=$(ls -t results/external_evals/*/raw/*/lm_eval_live.log "
+        f"results/external_evals/*/raw/*/*/lm_eval_live.log 2>/dev/null | head -1); "
+        f"if [ -n \"$LIVE_EVAL\" ]; then "
+        f"echo \"=== ACTIVE LM_EVAL ($LIVE_EVAL) ===\"; tail -n 15 \"$LIVE_EVAL\" 2>/dev/null; fi"
+    )
+    if not follow:
+        proc = subprocess.run(["ssh", *SSH_OPTS, host, header_cmd])
+        return proc.returncode
+    follow_cmd = (
+        header_cmd
+        + "; echo '=== FOLLOWING LIVE STREAM (Ctrl+C to detach) ==='; "
+        + "tail -n 0 -F results/worker.log "
+        + "$(ls -t results/external_evals/*/raw/*/lm_eval_live.log "
+        + "results/external_evals/*/raw/*/*/lm_eval_live.log 2>/dev/null | head -2) 2>/dev/null"
+    )
+    proc = subprocess.run(["ssh", *SSH_OPTS, host, follow_cmd])
+    return proc.returncode
 
 
 def wait(host: str, workdir: str, *, max_wait_sec: int = 180,
@@ -309,14 +354,40 @@ def wait(host: str, workdir: str, *, max_wait_sec: int = 180,
     """
     deadline = time.monotonic() + max_wait_sec
     last_status = None
+    last_tail_sig = ""
+    poll_idx = 0
     printed = 0
     unreachable_streak = 0
+    wdir_q = shlex.quote(workdir)
+    probe_cmd = (
+        f"cat {wdir_q}/{STATUS_FILE} 2>/dev/null; "
+        f"printf '\\n__HARNESS_META__\\n'; "
+        f"nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total "
+        f"--format=csv,noheader,nounits 2>/dev/null | head -4 | paste -sd ';' -; "
+        f"printf '\\n__HARNESS_TAIL__\\n'; "
+        f"LIVE_EVAL=$(ls -t {wdir_q}/results/external_evals/*/raw/*/lm_eval_live.log "
+        f"{wdir_q}/results/external_evals/*/raw/*/*/lm_eval_live.log 2>/dev/null | head -1); "
+        f"if [ -n \"$LIVE_EVAL\" ]; then tr '\\r' '\\n' < \"$LIVE_EVAL\" | grep -v '^$' | tail -n 1; fi; "
+        f"tr '\\r' '\\n' < {wdir_q}/results/worker.log 2>/dev/null | grep -v '^$' | tail -n 2"
+    )
     while True:
+        poll_idx += 1
         ssh_unreachable = False
+        gpu_meta = ""
+        live_tail = ""
         try:
-            result = _ssh(host, f"cat {workdir}/{STATUS_FILE} 2>/dev/null",
-                          check=False, timeout=15)
-            raw = result.stdout.strip()
+            result = _ssh(host, probe_cmd, check=False, timeout=15)
+            full_out = result.stdout or ""
+            if "__HARNESS_META__" in full_out:
+                raw_part, rest = full_out.split("__HARNESS_META__", 1)
+                raw = raw_part.strip()
+                if "__HARNESS_TAIL__" in rest:
+                    gpu_part, tail_part = rest.split("__HARNESS_TAIL__", 1)
+                    gpu_meta = gpu_part.strip()
+                    tail_lines = [ln.strip() for ln in tail_part.splitlines() if ln.strip()]
+                    live_tail = tail_lines[-1][:160] if tail_lines else ""
+            else:
+                raw = full_out.strip()
             if getattr(result, "returncode", 0) == 255 and not raw:
                 ssh_unreachable = True
         except (subprocess.TimeoutExpired, OSError):
@@ -336,7 +407,7 @@ def wait(host: str, workdir: str, *, max_wait_sec: int = 180,
                         local_status = None
                 final = local_status if local_status in ("DONE", "ERROR", "CHECKPOINT") else "HOST_STOPPED"
                 print(f"pod wait: host {host} unreachable ({unreachable_streak} consecutive "
-                      f"SSH failures; VM stopped) — exiting with status={final}")
+                      f"SSH failures; VM stopped) — exiting with status={final}", flush=True)
                 try:
                     report_herdr_task(
                         f'pod:{host}',
@@ -358,28 +429,45 @@ def wait(host: str, workdir: str, *, max_wait_sec: int = 180,
                 status = None
 
         if status != last_status:
-            if printed < 25:
-                print(f"pod wait: status={status or 'UNKNOWN'}")
+            if printed < 100:
+                extra = f" | gpu=[{gpu_meta}]" if gpu_meta else ""
+                if live_tail:
+                    extra += f" | {live_tail}"
+                print(f"pod wait: status={status or 'UNKNOWN'}{extra}", flush=True)
                 printed += 1
             last_status = status
+            last_tail_sig = live_tail
             pod_state = {'RUNNING': 'working', 'DONE': 'done', 'CHECKPOINT': 'done',
                          'ERROR': 'error'}.get(status or '', 'working')
             try:
                 report_herdr_task(f'pod:{host}', pod_state,
-                                  phase=f'pod {status or "UNKNOWN"}',
+                                  phase=f'pod {status or "UNKNOWN"}: {live_tail[:60]}'.rstrip(': '),
                                   reason='pod_error' if status == 'ERROR' else None)
             except Exception:
                 pass
+        elif (gpu_meta or live_tail) and (live_tail != last_tail_sig or poll_idx % 4 == 0):
+            ts = time.strftime("%H:%M:%S")
+            gpu_str = f"gpu=[{gpu_meta}]" if gpu_meta else "gpu=n/a"
+            tail_str = f" | {live_tail}" if live_tail else ""
+            print(f"[{ts}] pod wait: {status or 'RUNNING'} | {gpu_str}{tail_str}", flush=True)
+            last_tail_sig = live_tail
+            if local_dir:
+                try:
+                    os.makedirs(os.path.join(local_dir, "results"), exist_ok=True)
+                    with open(os.path.join(local_dir, "results", "pod_live.log"), "a", encoding="utf-8") as lf:
+                        lf.write(f"[{ts}] {status or 'RUNNING'} | {gpu_str}{tail_str}\n")
+                except OSError:
+                    pass
 
         if status in ("CHECKPOINT", "DONE", "ERROR"):
-            if printed < 25:
-                print(f"pod wait: terminal status {status}")
+            if printed < 100:
+                print(f"pod wait: terminal status {status}", flush=True)
             if local_dir:
                 sync_pods(host, workdir, local_dir, paths, once=True)
             return 0 if status != "ERROR" else 1
 
         if time.monotonic() >= deadline:
             print(f"pod wait: timeout after {max_wait_sec}s "
-                  f"(last status={status or 'UNKNOWN'})")
+                  f"(last status={status or 'UNKNOWN'})", flush=True)
             return 0 if status != "ERROR" else 1
         time.sleep(max(1, poll_interval_sec))

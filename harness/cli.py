@@ -525,6 +525,16 @@ def _run_pod_wait(args: argparse.Namespace) -> int:
     )
 
 
+def _run_pod_logs(args: argparse.Namespace) -> int:
+    pod = _pod_module()
+    return pod.logs(
+        args.host,
+        args.workdir,
+        lines=args.lines,
+        follow=args.follow,
+    )
+
+
 def _herdr_module():
     """Lazily import ``harness.herdr`` so the CLI stays importable without it."""
     return importlib.import_module("harness.herdr")
@@ -950,6 +960,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="sync destination triggered on CHECKPOINT/DONE/ERROR",
     )
     pod_wait.set_defaults(handler=_run_pod_wait)
+
+    pod_logs = pod_sub.add_parser("logs", help="inspect or stream live pod logs and GPU status")
+    pod_logs.add_argument("--host", required=True, help="ssh target (user@host)")
+    pod_logs.add_argument("--workdir", required=True, help="remote working directory")
+    pod_logs.add_argument(
+        "-n", "--lines", type=int, default=60,
+        help="number of recent worker.log lines to show (default: %(default)s)",
+    )
+    pod_logs.add_argument(
+        "-f", "--follow", action="store_true",
+        help="follow live worker.log and lm_eval_live.log stream",
+    )
+    pod_logs.set_defaults(handler=_run_pod_logs)
 
     herdr_cmd = subparsers.add_parser(
         "herdr", help="report agent progress to a herdr pane")

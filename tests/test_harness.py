@@ -8451,6 +8451,46 @@ class TestPodCLI(unittest.TestCase):
         self.assertIn('unreachable (3 consecutive SSH failures; VM stopped)', out.getvalue())
         sync.assert_not_called()
 
+    def test_pod_wait_streams_live_gpu_and_tail_heartbeats(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        out = io.StringIO()
+        payload_1 = (
+            '{"status": "RUNNING"}\n__HARNESS_META__\n98, 120000, 143771\n'
+            '__HARNESS_TAIL__\n[tenet] mmlu_pro 120/1008\n'
+        )
+        payload_2 = (
+            '{"status": "RUNNING"}\n__HARNESS_META__\n99, 121000, 143771\n'
+            '__HARNESS_TAIL__\n[tenet] mmlu_pro 340/1008\n'
+        )
+        payload_3 = '{"status": "DONE"}\n__HARNESS_META__\n0, 400, 143771\n__HARNESS_TAIL__\ndone\n'
+        with contextlib.redirect_stdout(out):
+            with patch.object(
+                self.pod, '_ssh',
+                side_effect=[
+                    SimpleNamespace(stdout=payload_1, returncode=0),
+                    SimpleNamespace(stdout=payload_2, returncode=0),
+                    SimpleNamespace(stdout=payload_3, returncode=0),
+                ],
+            ), patch.object(self.pod, 'sync_pods', return_value=0), \
+                    patch.object(self.pod.time, 'sleep'):
+                rc = self.pod.wait('u@h', '/work', max_wait_sec=60, local_dir=None)
+        self.assertEqual(rc, 0)
+        rendered = out.getvalue()
+        self.assertIn('mmlu_pro 120/1008', rendered)
+        self.assertIn('mmlu_pro 340/1008', rendered)
+        self.assertIn('terminal status DONE', rendered)
+
+    def test_cli_pod_logs_dispatch(self):
+        from unittest.mock import patch
+        from harness import cli as harness_cli
+
+        with patch.object(self.pod, 'logs', return_value=0) as lg:
+            rc = harness_cli.main(['pod', 'logs', '--host', 'u@h', '--workdir', '/w', '-n', '30', '-f'])
+        self.assertEqual(rc, 0)
+        lg.assert_called_once_with('u@h', '/w', lines=30, follow=True)
+
     def test_cli_pod_preflight_dispatch(self):
         from unittest.mock import patch
         from harness import cli as harness_cli
